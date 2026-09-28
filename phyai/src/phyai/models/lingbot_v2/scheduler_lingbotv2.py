@@ -2,27 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 import torch
 
+from phyai.utils.profile import event_scope
 from phyai.layers.attention import (
-    ARAttnMetadata,
-    AttnLayout,
     AttnMode,
-    DiffusionAttnMetadata,
-)
-from phyai.models.lingbot_v2.configuration_lingbotv2 import LingBotVLA2Config
-from phyai.models.lingbot_v2.model_runner_lingbotv2 import (
-    LingBotV2ExpertRunner,
-    LingBotV2PrefixForwardBatch,
-    LingBotV2PrefixRunner,
-    LingBotV2VisionForwardBatch,
-    LingBotV2VisionRunner,
+    AttnLayout,
+    PagedAttnMetadata,
 )
 from phyai.runtime.schedule import Scheduler
-from phyai.utils.profile import event_scope
+from phyai.models.lingbot_v2.model_runner_lingbotv2 import (
+    LingBotV2ExpertRunner,
+    LingBotV2PrefixRunner,
+    LingBotV2VisionRunner,
+    LingBotV2PrefixForwardBatch,
+    LingBotV2VisionForwardBatch,
+)
+from phyai.models.lingbot_v2.configuration_lingbotv2 import LingBotVLA2Config
 
 if TYPE_CHECKING:
     from phyai.models.lingbot_v2.modeling_lingbotv2 import LingBotV2Model
@@ -318,7 +317,7 @@ class LingBotV2WS1Scheduler(Scheduler):
                 batch_size + 1, dtype=torch.int32, device=self.device
             )
             prefix_indptr[1:] = torch.cumsum(real_lens, dim=0)
-            prefix_metadata = ARAttnMetadata(
+            prefix_metadata = PagedAttnMetadata(
                 mode=AttnMode.PREFILL,
                 layout=AttnLayout.RAGGED_3D,
                 batch_size=batch_size,
@@ -481,9 +480,9 @@ class LingBotV2WS1Scheduler(Scheduler):
                 batch_index, :language_length
             ]
             fake_ids[batch_index, cursor : cursor + language_length] = (
-                request.input_ids[
-                    batch_index, :language_length
-                ].to(device=self.device, dtype=torch.int64)
+                request.input_ids[batch_index, :language_length].to(
+                    device=self.device, dtype=torch.int64
+                )
             )
             cursor += language_length
             packed[
@@ -543,7 +542,7 @@ class LingBotV2WS1Scheduler(Scheduler):
         state_indptr[1:] = torch.cumsum(visible_lens + 1, dim=0)
         action_indptr = torch.zeros_like(state_indptr)
         action_indptr[1:] = torch.cumsum(visible_lens + self.suffix_len, dim=0)
-        state_metadata = DiffusionAttnMetadata(
+        state_metadata = PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=batch_size,
@@ -567,7 +566,7 @@ class LingBotV2WS1Scheduler(Scheduler):
             write_indices=state_write,
             position_ids=state_position_ids,
         )
-        action_metadata = DiffusionAttnMetadata(
+        action_metadata = PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=batch_size,

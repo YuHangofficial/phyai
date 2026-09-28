@@ -1,8 +1,7 @@
-"""Backend resolution priority tests (explicit > env > auto)."""
+"""Backend resolution priority: explicit > env > auto."""
 
 from __future__ import annotations
 
-import os
 import warnings
 
 import pytest
@@ -13,81 +12,51 @@ from phyai.vgpu.exceptions import VGPUNotApplicableError
 
 @pytest.fixture(autouse=True)
 def _clean_backend_state(monkeypatch):
-    """Restore registry state and current pointer between tests."""
+    """Install fake backends and restore registry state and current pointer."""
     saved_backends = dict(backend_mod._BACKENDS)
     saved_current = backend_mod._CURRENT
+    saved_probe = backend_mod._flashinfer_available
     monkeypatch.delenv("PHYAI_VGPU_BACKEND", raising=False)
+    backend_mod._BACKENDS.clear()
+    backend_mod._BACKENDS["flashinfer"] = type(
+        "FakeFlashInfer", (), {"name": "flashinfer"}
+    )
+    backend_mod._BACKENDS["torch"] = type("FakeTorch", (), {"name": "torch"})
     yield
     backend_mod._BACKENDS.clear()
     backend_mod._BACKENDS.update(saved_backends)
     backend_mod._CURRENT = saved_current
+    backend_mod._flashinfer_available = saved_probe
 
 
-class _FakeFlashInfer:
-    name = "flashinfer"
+def _fallback_warnings(w) -> list:
+    return [x for x in w if "falling back" in str(x.message)]
 
 
-class _FakeTorch:
-    name = "torch"
-
-
-def _install_fakes(*, flashinfer_available: bool = True) -> None:
-    """Replace registry and toggle the auto-detection probe."""
-    backend_mod._BACKENDS.clear()
-    backend_mod._BACKENDS["flashinfer"] = _FakeFlashInfer
-    backend_mod._BACKENDS["torch"] = _FakeTorch
-    backend_mod._flashinfer_available = lambda: flashinfer_available  # type: ignore[assignment]
-
-
-def test_explicit_overrides_env(monkeypatch):
-    _install_fakes()
+def test_explicit_beats_env_beats_auto(monkeypatch):
+    backend_mod._flashinfer_available = lambda: True
     monkeypatch.setenv("PHYAI_VGPU_BACKEND", "torch")
-    b = backend_mod.resolve("flashinfer")
-    assert b.name == "flashinfer"
+    assert backend_mod.resolve("flashinfer").name == "flashinfer"
+    assert backend_mod.resolve(None).name == "torch"
+    monkeypatch.delenv("PHYAI_VGPU_BACKEND")
+    assert backend_mod.resolve(None).name == "flashinfer"
 
 
-def test_env_overrides_auto(monkeypatch):
-    _install_fakes()
-    monkeypatch.setenv("PHYAI_VGPU_BACKEND", "torch")
-    b = backend_mod.resolve(None)
-    assert b.name == "torch"
-
-
-def test_auto_picks_flashinfer_when_available():
-    _install_fakes(flashinfer_available=True)
-    b = backend_mod.resolve(None)
-    assert b.name == "flashinfer"
-
-
-def test_auto_falls_back_to_torch_with_warning():
-    _install_fakes(flashinfer_available=False)
+def test_auto_falls_back_to_torch_with_one_warning_and_an_explicit_choice_never_warns():
+    backend_mod._flashinfer_available = lambda: False
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        b = backend_mod.resolve(None)
-    assert b.name == "torch"
-    fallback_warns = [x for x in w if "falling back" in str(x.message)]
-    assert len(fallback_warns) == 1
-
-
-def test_explicit_torch_does_not_warn():
-    """Explicit choice should never trigger the fallback warning."""
-    _install_fakes(flashinfer_available=False)
+        assert backend_mod.resolve(None).name == "torch"
+    assert len(_fallback_warnings(w)) == 1
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        b = backend_mod.resolve("torch")
-    assert b.name == "torch"
-    fallback_warns = [x for x in w if "falling back" in str(x.message)]
-    assert not fallback_warns
+        assert backend_mod.resolve("torch").name == "torch"
+    assert not _fallback_warnings(w)
 
 
-def test_unknown_backend_name_raises():
-    _install_fakes()
+def test_unknown_names_and_uninitialized_access_are_errors():
     with pytest.raises(VGPUNotApplicableError):
         backend_mod.resolve("nonexistent")
-
-
-def test_get_backend_without_init_raises():
-    _install_fakes()
     backend_mod._CURRENT = None
     with pytest.raises(RuntimeError, match="no active backend"):
         backend_mod.get_backend()

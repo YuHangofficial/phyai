@@ -1,8 +1,8 @@
-"""FlashInferKernel capability tests.
+"""Capability tests for the FlashInfer GEMM entry points.
 
-The capability tests only exercise Python predicates so hardware gating stays
-stable on CPU-only CI. The numeric test is CUDA-gated and compares FlashInfer's
-FP4 GEMM with an explicit dequantized reference.
+The capability tests only exercise Python predicates, independent of the
+GPU generation present. The numeric test needs sm_100+ and compares
+FlashInfer's FP4 GEMM with an explicit dequantized reference.
 """
 
 from __future__ import annotations
@@ -11,73 +11,81 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from phyai.layers.linear.backend import KernelProbe
-from phyai.layers.linear.backends.flashinfer import FlashInferKernel
-from phyai.layers.quant import Nvfp4Spec
-from phyai.layers.quant.base import AllocationRequest
-from phyai.parallel.state import Mode
+from phyai.layers.linear.backends.flashinfer import gemm_nvfp4
+from phyai.layers.quant import AllocationRequest, Nvfp4Spec
 from phyai.weights.shards import replicated
-
-CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 def _sm() -> int:
-    if not torch.cuda.is_available():
-        return 0
     maj, mnr = torch.cuda.get_device_capability()
     return maj * 10 + mnr
 
 
-def _probe(spec_id: str, *, M=16, N=128, K=128, sm=100) -> KernelProbe:
-    return KernelProbe(
-        spec_id=spec_id,
-        M_bucket=M.bit_length(),
-        N=N,
-        K=K,
-        in_dtype=torch.bfloat16,
-        out_dtype=torch.bfloat16,
-        sm=sm,
-        mode=Mode.EAGER,
+def _gemm_eligible(signature: dict, *, device: str, K: int = 128):
+    """Kernel ids the catalog considers eligible for one GEMM call."""
+
+    from phyai.kernel.bootstrap import get_kernel_selector
+    from phyai.kernel.types import KernelQuery, PhysicalSignature
+
+    selector = get_kernel_selector()
+    spec = selector.catalog.op("gemm")
+    query = selector.normalize(
+        KernelQuery.build(
+            "gemm",
+            device=device,
+            dtype={"input": "bf16", "output": "bf16"},
+            quant=PhysicalSignature(**signature),
+            shape={"M": 16, "N": 128, "K": K},
+        )
     )
+    facts = selector.facts_for(query, spec)
+    eligible, _ = selector.assess(spec, facts, query.mode)
+    return {item.kernel_id for item in eligible}
 
 
 def _build_layer(spec, N, K, device, weight):
+    """Allocate and load one quantized layer, the way a real Linear would."""
+
     layer = torch.nn.Module()
     layer.spec = spec
-
     spec.allocate(
         layer,
-        AllocationRequest(
-            weight_shape=(N, K),
-            logical_widths=[N],
-            device=device,
-        ),
+        AllocationRequest(weight_shape=(N, K), logical_widths=[N], device=device),
     )
-
     spec.load_weight(layer, weight, None, replicated())
     spec.process_after_loading(layer)
     return layer
 
 
-def test_flashinfer_can_handle_nvfp4_sm100_only():
-    k = FlashInferKernel()
-    assert not k.can_handle(_probe("nvfp4_block_16_128x4", sm=90))
-    if k.can_handle(_probe("bf16", sm=100)):
-        assert k.can_handle(_probe("nvfp4_block_16_128x4", sm=100))
+NVFP4_128X4 = {
+    "format": "nvfp4",
+    "layout": "128x4",
+    "block_shape": (1, 16),
+    "granularity": "block",
+    "scale_dtype": "fp8_e4m3",
+}
+
+
+def test_flashinfer_nvfp4_is_sm100_only():
+    assert "flashinfer.gemm.nvfp4_128x4" not in _gemm_eligible(
+        NVFP4_128X4, device="nvidia:SM90"
+    )
+    assert "flashinfer.gemm.nvfp4_128x4" in _gemm_eligible(
+        NVFP4_128X4, device="nvidia:SM100"
+    )
 
 
 def test_flashinfer_rejects_nvfp4_unaligned_k():
-    k = FlashInferKernel()
-    assert not k.can_handle(_probe("nvfp4_block_16_128x4", sm=100, K=120))
+    assert "flashinfer.gemm.nvfp4_128x4" not in _gemm_eligible(
+        NVFP4_128X4, device="nvidia:SM100", K=120
+    )
 
 
-@CUDA
 def test_flashinfer_numeric_accuracy():
     if _sm() < 100:
-        pytest.skip(f"NVFP4 requires sm_100+ GPU")
+        pytest.skip("NVFP4 requires sm_100+ GPU")
 
     torch.manual_seed(0)
-    k = FlashInferKernel()
     N, K = 128, 128
     weight = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
     x = torch.randn((1, K), dtype=torch.bfloat16, device="cuda")
@@ -86,7 +94,7 @@ def test_flashinfer_numeric_accuracy():
     spec = Nvfp4Spec(scale_layout="128x4")
     layer = _build_layer(spec, N, K, "cuda", weight)
 
-    y_flashinfer = k.apply(layer, x, None)
+    y_flashinfer = gemm_nvfp4(layer, x, None)
 
     bf16_rel_err = (
         y_flashinfer.float() - y_bf16.float()
@@ -99,10 +107,9 @@ def test_flashinfer_numeric_accuracy():
 
 def test_flashinfer_numeric_accuracy_with_bias():
     if _sm() < 100:
-        pytest.skip(f"NVFP4 requires sm_100+ GPU")
+        pytest.skip("NVFP4 requires sm_100+ GPU")
 
     torch.manual_seed(0)
-    k = FlashInferKernel()
     N, K = 128, 128
     weight = torch.randn((N, K), dtype=torch.bfloat16, device="cuda")
     bias = torch.randn((N,), dtype=torch.bfloat16, device="cuda")
@@ -112,7 +119,7 @@ def test_flashinfer_numeric_accuracy_with_bias():
     spec = Nvfp4Spec(scale_layout="128x4")
     layer = _build_layer(spec, N, K, "cuda", weight)
 
-    y_flashinfer = k.apply(layer, x, bias)
+    y_flashinfer = gemm_nvfp4(layer, x, bias)
 
     bf16_rel_err = (
         y_flashinfer.float() - y_bf16.float()

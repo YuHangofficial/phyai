@@ -14,11 +14,14 @@ ever see ``weight_shape`` plus a list of per-logical-matrix widths.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Mapping, Protocol
 
 import torch
 import torch.nn as nn
+
+from phyai.kernel.types import PhysicalSignature
 
 
 @dataclass(frozen=True)
@@ -65,9 +68,44 @@ class WeightSpec(Protocol):
     spec_id: str
     weight_dtype: torch.dtype
 
+    @property
+    def physical_signature(self) -> PhysicalSignature: ...
+
     def allocate(self, layer: nn.Module, request: AllocationRequest) -> None: ...
 
     def process_after_loading(self, layer: nn.Module) -> None: ...
 
 
-__all__ = ["AllocationRequest", "WeightSpec"]
+def physical_signature_for_spec(spec: object) -> PhysicalSignature:
+    """Best-effort bridge for third-party specs that predate the property.
+
+    Built-in specs expose a typed property; this fallback keeps custom
+    WeightSpec implementations usable while they migrate.
+    """
+
+    value = getattr(spec, "physical_signature", None)
+    if isinstance(value, PhysicalSignature):
+        return value
+    spec_id = str(getattr(spec, "spec_id", "bf16")).lower()
+    if spec_id == "bf16":
+        return PhysicalSignature(format="bf16", storage_dtype="bf16")
+    if spec_id.startswith("fp8"):
+        granularity = spec_id.removeprefix("fp8_")
+        block_shape = None
+        block_match = re.fullmatch(r"block_(\d+)_(\d+)", granularity)
+        if block_match:
+            block_shape = (int(block_match.group(1)), int(block_match.group(2)))
+            granularity = "block"
+        return PhysicalSignature(
+            format="fp8_e4m3",
+            granularity=granularity,
+            block_shape=block_shape,
+            storage_dtype="fp8_e4m3",
+        )
+    if spec_id.startswith("nvfp4"):
+        layout = "128x4" if "128x4" in spec_id else "linear"
+        return PhysicalSignature(format="nvfp4", layout=layout, storage_dtype="uint8")
+    return PhysicalSignature(format=spec_id)
+
+
+__all__ = ["AllocationRequest", "WeightSpec", "physical_signature_for_spec"]

@@ -17,7 +17,11 @@ Public surface::
 
 from __future__ import annotations
 
-from phyai.layers.quant.base import AllocationRequest, WeightSpec
+from phyai.layers.quant.base import (
+    AllocationRequest,
+    WeightSpec,
+    physical_signature_for_spec,
+)
 from phyai.layers.quant.bf16 import Bf16Spec
 from phyai.layers.quant.fp8 import Fp8Spec
 from phyai.layers.quant.granularity import Granularity
@@ -27,6 +31,7 @@ from phyai.layers.quant.nvfp4 import Nvfp4Spec
 __all__ = [
     "AllocationRequest",
     "WeightSpec",
+    "physical_signature_for_spec",
     "Granularity",
     "Bf16Spec",
     "Fp8Spec",

@@ -1,35 +1,31 @@
-"""Regression test for the flashinfer per-call driver leak.
+"""Document the flashinfer per-call driver leak — loudly, until it is fixed.
 
-flashinfer's ``split_device_green_ctx`` leaks driver-level memory on
-every call that is not recovered by ``cuStreamDestroy +
-cuGreenCtxDestroy``, ``empty_cache``, or ``gc.collect``. This test acts
-as a future-proofing guard: when flashinfer or NVIDIA fixes the upstream
-issue this test will start failing, prompting us to relax the warning in
-the user-facing docstrings.
+flashinfer's ``split_device_green_ctx`` leaks ~16 MiB of driver-level
+memory on every call — unrecoverable by ``cuStreamDestroy +
+cuGreenCtxDestroy``, ``empty_cache``, or ``gc.collect``. Measured linear
+at 16-18 MiB/iteration on 0.6.12 AND 0.6.17, so the "vGPUs must be
+long-lived" posture in :mod:`phyai.vgpu` stands.
 
-We only run a handful of iterations (so the test stays fast) and assert
-either:
-  - leak is observable above a small tolerance (current behaviour), OR
-  - leak is below the tolerance (upstream fixed — the test fails so we
-    know to update the docs / status).
+This test asserts the leak is STILL THERE. When an upstream release
+finally fixes it, the test fails on purpose: that is the signal to relax
+the long-lived-only warnings in ``vgpu.py`` and flip this assertion into
+a fixed-behaviour regression guard.
 
-The assertion is structured as ``xfail``-style: we ``pytest.xfail`` when
-leak is detected and ``fail`` if leak appears resolved.
+Measurement note: nvidia-smi's ``--id=`` takes a PHYSICAL index and
+ignores ``CUDA_VISIBLE_DEVICES``, while ``cuda:0`` is a VISIBLE index.
+An earlier version of this test hardcoded ``--id=0`` and was validated
+under ``CUDA_VISIBLE_DEVICES=7`` — it watched an idle card while the
+leak landed on another, and "passed". Hence ``_physical_index`` below.
 """
 
 from __future__ import annotations
 
 import gc
+import os
 import subprocess
 
 import pytest
 import torch
-
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="phyai.vgpu requires CUDA",
-)
 
 
 def _flashinfer_available() -> bool:
@@ -40,11 +36,30 @@ def _flashinfer_available() -> bool:
     return True
 
 
-def _smi_mem_used_mib(device_idx: int = 0) -> int:
+def _physical_index(visible_idx: int) -> int:
+    """Map a torch (visible) device index to nvidia-smi's physical index.
+
+    ``CUDA_VISIBLE_DEVICES`` reorders what torch sees; nvidia-smi does not
+    honour it. UUID-based mapping would be cleaner, but torch's reported
+    device UUID does not match NVML's under the CUDA compat driver this
+    box runs, so parse the mask instead.
+    """
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if mask is None:
+        return visible_idx
+    entries = [item.strip() for item in mask.split(",") if item.strip()]
+    if visible_idx >= len(entries) or not entries[visible_idx].isdigit():
+        pytest.skip(
+            f"cannot map cuda:{visible_idx} through CUDA_VISIBLE_DEVICES={mask!r}"
+        )
+    return int(entries[visible_idx])
+
+
+def _smi_mem_used_mib(physical_idx: int) -> int:
     out = subprocess.check_output(
         [
             "nvidia-smi",
-            f"--id={device_idx}",
+            f"--id={physical_idx}",
             "--query-gpu=memory.used",
             "--format=csv,noheader,nounits",
         ],
@@ -53,7 +68,7 @@ def _smi_mem_used_mib(device_idx: int = 0) -> int:
     return int(out)
 
 
-def test_flashinfer_split_leaks_or_upstream_fixed():
+def test_flashinfer_split_still_leaks_driver_memory():
     if not _flashinfer_available():
         pytest.skip("flashinfer required")
 
@@ -64,11 +79,13 @@ def test_flashinfer_split_leaks_or_upstream_fixed():
     except (FileNotFoundError, subprocess.CalledProcessError):
         pytest.skip("nvidia-smi not available")
 
+    physical = _physical_index(0)
+
     # Prime the primary context.
     _ = torch.zeros(1, device="cuda:0")
     torch.cuda.synchronize()
 
-    base_smi = _smi_mem_used_mib(0)
+    base_smi = _smi_mem_used_mib(physical)
 
     iters = 5
     from flashinfer.green_ctx import split_device_green_ctx
@@ -84,22 +101,16 @@ def test_flashinfer_split_leaks_or_upstream_fixed():
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
-    end_smi = _smi_mem_used_mib(0)
+    end_smi = _smi_mem_used_mib(physical)
     delta = end_smi - base_smi
 
-    if delta >= 32:
-        # Leak still present -> expected, document it explicitly.
-        pytest.xfail(
-            f"known flashinfer leak: 5 iter split_device_green_ctx "
-            f"caused {delta} MiB driver-side growth. "
-            f"vGPU must remain long-lived."
-        )
-    else:
-        # If we ever land here, flashinfer or driver fixed it — the tests
-        # fail loudly so we can update the warning text.
-        pytest.fail(
-            f"unexpected: only {delta} MiB driver growth across {iters} "
-            f"split_device_green_ctx iterations. The upstream leak may "
-            f"have been fixed — please update FlashInferBackend's "
-            f"docstring."
-        )
+    # ~16 MiB/call on 0.6.12 and 0.6.17 alike; 5 calls land at ~80 MiB.
+    # Half that is far above nvidia-smi jitter and far below a real leak,
+    # so crossing the bound means upstream behaviour genuinely changed.
+    assert delta >= 40, (
+        f"split_device_green_ctx grew driver memory by only {delta} MiB over "
+        f"{iters} iterations — the upstream leak appears to be FIXED. "
+        f"Celebrate, then: relax the long-lived-only warnings in "
+        f"phyai/src/phyai/vgpu/vgpu.py and flip this test into a "
+        f"fixed-behaviour regression guard (assert delta < 32)."
+    )

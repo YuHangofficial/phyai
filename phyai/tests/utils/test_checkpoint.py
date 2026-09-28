@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from safetensors.torch import save_file
 import torch
+from safetensors.torch import save_file
 
 from phyai.models.configuration import PretrainedConfig
 from phyai.utils.checkpoint import (
@@ -25,260 +25,174 @@ class _TinyConfig(PretrainedConfig):
     name: str = "tiny"
 
 
+def _index(tmp_path: Path, weight_map: dict) -> None:
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+
+
 # --------------------------------------------------------------------------- #
 # find_safetensors                                                            #
 # --------------------------------------------------------------------------- #
 
 
-def test_find_safetensors_single_file(tmp_path: Path):
+def test_single_file_and_glob_fallback_return_absolute_paths(tmp_path: Path):
     (tmp_path / "model.safetensors").write_bytes(b"")  # empty placeholder
-    out = find_safetensors(tmp_path)
-    assert len(out) == 1
-    assert out[0].name == "model.safetensors"
-    assert out[0].is_absolute()
+    out = find_safetensors(str(tmp_path))  # str is accepted too
+    assert [p.name for p in out] == ["model.safetensors"] and out[0].is_absolute()
+
+    other = tmp_path / "glob"
+    other.mkdir()
+    (other / "weights-a.safetensors").write_bytes(b"")
+    (other / "weights-b.safetensors").write_bytes(b"")
+    # No index, no canonical name: the glob picks up *.safetensors in order.
+    assert [p.name for p in find_safetensors(other)] == [
+        "weights-a.safetensors",
+        "weights-b.safetensors",
+    ]
 
 
-def test_find_safetensors_index_two_shards(tmp_path: Path):
+def test_index_json_is_authoritative_and_deduplicates_shards(tmp_path: Path):
     save_file({"a": torch.zeros(2)}, str(tmp_path / "model-00001-of-00002.safetensors"))
-    save_file({"b": torch.zeros(2)}, str(tmp_path / "model-00002-of-00002.safetensors"))
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": 8},
-                "weight_map": {
-                    "a": "model-00001-of-00002.safetensors",
-                    "b": "model-00002-of-00002.safetensors",
-                },
-            }
-        )
+    save_file(
+        {"b": torch.zeros(2), "c": torch.zeros(2)},
+        str(tmp_path / "model-00002-of-00002.safetensors"),
+    )
+    (tmp_path / "model.safetensors").write_bytes(b"")  # the index wins over it
+    _index(
+        tmp_path,
+        {
+            "a": "model-00001-of-00002.safetensors",
+            "b": "model-00002-of-00002.safetensors",
+            "c": "model-00002-of-00002.safetensors",
+        },
     )
     out = find_safetensors(tmp_path)
     assert [p.name for p in out] == [
         "model-00001-of-00002.safetensors",
         "model-00002-of-00002.safetensors",
     ]
-    for p in out:
-        assert p.is_absolute()
+    assert all(p.is_absolute() for p in out)
 
 
-def test_find_safetensors_index_deduplicates_shared_shards(tmp_path: Path):
-    """Multiple keys pointing at the same shard collapse to one entry."""
-    save_file(
-        {"a": torch.zeros(2), "b": torch.zeros(2)},
-        str(tmp_path / "shared.safetensors"),
-    )
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": 8},
-                "weight_map": {
-                    "a": "shared.safetensors",
-                    "b": "shared.safetensors",
-                },
-            }
-        )
-    )
-    out = find_safetensors(tmp_path)
-    assert [p.name for p in out] == ["shared.safetensors"]
-
-
-def test_find_safetensors_index_prefers_over_single(tmp_path: Path):
-    """index.json wins even when model.safetensors is also present."""
-    save_file({"x": torch.zeros(2)}, str(tmp_path / "shard-00001.safetensors"))
-    (tmp_path / "model.safetensors").write_bytes(b"")
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"x": "shard-00001.safetensors"}})
-    )
-    out = find_safetensors(tmp_path)
-    assert [p.name for p in out] == ["shard-00001.safetensors"]
-
-
-def test_find_safetensors_index_missing_shard_raises(tmp_path: Path):
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"k": "ghost.safetensors"}})
-    )
-    with pytest.raises(FileNotFoundError, match="ghost.safetensors"):
+@pytest.mark.parametrize(
+    "index, error, message",
+    [
+        (
+            {"weight_map": {"k": "ghost.safetensors"}},
+            FileNotFoundError,
+            "ghost.safetensors",
+        ),
+        ({"weight_map": {}}, ValueError, "weight_map"),
+        ({"meta": {}}, ValueError, "weight_map"),
+    ],
+)
+def test_a_broken_index_is_an_error(tmp_path: Path, index, error, message):
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+    with pytest.raises(error, match=message):
         find_safetensors(tmp_path)
 
 
-def test_find_safetensors_index_empty_weight_map_raises(tmp_path: Path):
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {}})
-    )
-    with pytest.raises(ValueError, match="weight_map"):
-        find_safetensors(tmp_path)
-
-
-def test_find_safetensors_index_no_weight_map_key_raises(tmp_path: Path):
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"meta": {}}))
-    with pytest.raises(ValueError, match="weight_map"):
-        find_safetensors(tmp_path)
-
-
-def test_find_safetensors_glob_fallback(tmp_path: Path):
-    """No index, no canonical name -> glob picks up *.safetensors files."""
-    (tmp_path / "weights-a.safetensors").write_bytes(b"")
-    (tmp_path / "weights-b.safetensors").write_bytes(b"")
-    out = find_safetensors(tmp_path)
-    assert [p.name for p in out] == ["weights-a.safetensors", "weights-b.safetensors"]
-
-
-def test_find_safetensors_no_shards_raises(tmp_path: Path):
+def test_folders_without_shards_and_non_folders_are_errors(tmp_path: Path):
     (tmp_path / "config.json").write_text("{}")
     with pytest.raises(FileNotFoundError, match="no safetensors shards"):
         find_safetensors(tmp_path)
-
-
-def test_find_safetensors_missing_dir_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError, match="does not exist"):
         find_safetensors(tmp_path / "nope")
-
-
-def test_find_safetensors_file_path_raises(tmp_path: Path):
     (tmp_path / "model.safetensors").write_bytes(b"")
     with pytest.raises(NotADirectoryError, match="folder"):
         find_safetensors(tmp_path / "model.safetensors")
 
 
-def test_find_safetensors_accepts_str(tmp_path: Path):
-    (tmp_path / "model.safetensors").write_bytes(b"")
-    out = find_safetensors(str(tmp_path))
-    assert len(out) == 1
+# --------------------------------------------------------------------------- #
+# find_checkpoint_files                                                       #
+# --------------------------------------------------------------------------- #
 
 
-def test_find_checkpoint_files_prefers_canonical_safetensors(tmp_path: Path):
+def test_checkpoint_files_prefer_canonical_safetensors_then_the_first_pytorch_format(
+    tmp_path: Path,
+):
     (tmp_path / "model.safetensors").write_bytes(b"")
     (tmp_path / "extra.safetensors").write_bytes(b"")
     (tmp_path / "pytorch_model.bin").write_bytes(b"")
+    assert [p.name for p in find_checkpoint_files(tmp_path)] == ["model.safetensors"]
 
-    out = find_checkpoint_files(tmp_path)
+    torch_only = tmp_path / "torch"
+    torch_only.mkdir()
+    for name in ("model.pth", "model.pt", "model.bin"):
+        (torch_only / name).write_bytes(b"")
+    assert [p.name for p in find_checkpoint_files(torch_only)] == ["model.bin"]
 
-    assert [path.name for path in out] == ["model.safetensors"]
-
-
-def test_find_checkpoint_files_prefers_first_pytorch_format(tmp_path: Path):
-    (tmp_path / "model.pth").write_bytes(b"")
-    (tmp_path / "model.pt").write_bytes(b"")
-    (tmp_path / "model.bin").write_bytes(b"")
-
-    out = find_checkpoint_files(tmp_path)
-
-    assert [path.name for path in out] == ["model.bin"]
-
-
-def test_find_checkpoint_files_collects_selected_format_shards(tmp_path: Path):
-    (tmp_path / "weights-00002-of-00002.pth").write_bytes(b"")
-    (tmp_path / "weights-00001-of-00002.pth").write_bytes(b"")
-
-    out = find_checkpoint_files(tmp_path)
-
-    assert [path.name for path in out] == [
+    sharded = tmp_path / "sharded"
+    sharded.mkdir()
+    (sharded / "weights-00002-of-00002.pth").write_bytes(b"")
+    (sharded / "weights-00001-of-00002.pth").write_bytes(b"")
+    out = find_checkpoint_files(sharded)
+    assert [p.name for p in out] == [
         "weights-00001-of-00002.pth",
         "weights-00002-of-00002.pth",
     ]
-    assert all(path.is_absolute() for path in out)
+    assert all(p.is_absolute() for p in out)
 
 
-def test_find_checkpoint_files_ignores_training_state(tmp_path: Path):
-    (tmp_path / "training_args.bin").write_bytes(b"")
-    (tmp_path / "optimizer.bin").write_bytes(b"")
-    (tmp_path / "scheduler.pt").write_bytes(b"")
-    (tmp_path / "model.pt").write_bytes(b"")
+def test_checkpoint_files_ignore_training_state_and_honour_a_safetensors_index(
+    tmp_path: Path,
+):
+    for name in ("training_args.bin", "optimizer.bin", "scheduler.pt", "model.pt"):
+        (tmp_path / name).write_bytes(b"")
+    assert [p.name for p in find_checkpoint_files(tmp_path)] == ["model.pt"]
 
-    out = find_checkpoint_files(tmp_path)
-
-    assert [path.name for path in out] == ["model.pt"]
-
-
-def test_find_checkpoint_files_safetensors_index_is_authoritative(tmp_path: Path):
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"x": "missing.safetensors"}})
-    )
-    (tmp_path / "model.pth").write_bytes(b"")
-
+    indexed = tmp_path / "indexed"
+    indexed.mkdir()
+    _index(indexed, {"x": "missing.safetensors"})
+    (indexed / "model.pth").write_bytes(b"")
     with pytest.raises(FileNotFoundError, match="missing.safetensors"):
-        find_checkpoint_files(tmp_path)
+        find_checkpoint_files(indexed)
 
-
-def test_find_checkpoint_files_no_model_weights_raises(tmp_path: Path):
-    (tmp_path / "optimizer.pth").write_bytes(b"")
-
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "optimizer.pth").write_bytes(b"")
     with pytest.raises(FileNotFoundError, match="no supported model weight files"):
-        find_checkpoint_files(tmp_path)
+        find_checkpoint_files(empty)
 
 
 # --------------------------------------------------------------------------- #
-# load_config                                                                 #
+# load_config / resolve_checkpoint                                            #
 # --------------------------------------------------------------------------- #
 
 
-def test_load_config_basic(tmp_path: Path):
-    (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 32, "name": "x"}))
-    cfg = load_config(tmp_path, _TinyConfig)
-    assert cfg.hidden_size == 32
-    assert cfg.name == "x"
-
-
-def test_load_config_unknown_keys_dropped(tmp_path: Path):
+def test_load_config_reads_known_keys_and_drops_unknown_ones(tmp_path: Path):
     (tmp_path / "config.json").write_text(
-        json.dumps({"hidden_size": 8, "totally_unrelated": [1, 2, 3]})
+        json.dumps({"hidden_size": 32, "name": "x", "totally_unrelated": [1]})
     )
     cfg = load_config(tmp_path, _TinyConfig)
-    assert cfg.hidden_size == 8
-    assert cfg.name == "tiny"  # default — silent drop, fall back
-
-
-def test_load_config_missing_file_raises(tmp_path: Path):
-    with pytest.raises(FileNotFoundError, match="config file not found"):
-        load_config(tmp_path, _TinyConfig)
-
-
-def test_load_config_custom_filename(tmp_path: Path):
+    assert (cfg.hidden_size, cfg.name) == (32, "x")
     (tmp_path / "geometry.json").write_text(json.dumps({"hidden_size": 7}))
-    cfg = load_config(tmp_path, _TinyConfig, filename="geometry.json")
-    assert cfg.hidden_size == 7
+    assert load_config(tmp_path, _TinyConfig, filename="geometry.json").hidden_size == 7
+    assert (
+        load_config(tmp_path, _TinyConfig, filename="geometry.json").name == "tiny"
+    )  # default
 
-
-def test_load_config_dir_validation(tmp_path: Path):
-    # Nonexistent path is resolved first: it is neither local nor a valid repo
-    # id, so resolve_checkpoint raises before _ensure_dir is reached.
+    with pytest.raises(FileNotFoundError, match="config file not found"):
+        load_config(tmp_path / "no_config", _TinyConfig) if (
+            tmp_path / "no_config"
+        ).mkdir() is None else None
+    # A nonexistent path is resolved first: neither local nor a valid repo id.
     with pytest.raises(FileNotFoundError, match="not a valid HuggingFace repo id"):
-        load_config(tmp_path / "ghost", _TinyConfig)
+        load_config(tmp_path / "ghost" / "sub", _TinyConfig)
 
 
-# --------------------------------------------------------------------------- #
-# resolve_checkpoint                                                          #
-# --------------------------------------------------------------------------- #
-
-
-def test_resolve_checkpoint_local_dir_returns_path(tmp_path: Path):
-    out = resolve_checkpoint(tmp_path)
-    assert out == tmp_path
-    assert out.is_dir()
-
-
-def test_resolve_checkpoint_local_file_returns_path(tmp_path: Path):
+def test_resolve_checkpoint_returns_local_paths_and_downloads_repo_ids(
+    tmp_path: Path, monkeypatch
+):
+    assert resolve_checkpoint(tmp_path) == tmp_path
+    assert resolve_checkpoint(str(tmp_path)) == tmp_path
     f = tmp_path / "model.safetensors"
     f.write_bytes(b"")
-    out = resolve_checkpoint(f)
-    assert out == f
-    assert out.is_file()
-
-
-def test_resolve_checkpoint_local_str_path(tmp_path: Path):
-    out = resolve_checkpoint(str(tmp_path))
-    assert isinstance(out, Path)
-    assert out == tmp_path
-
-
-def test_resolve_checkpoint_typo_path_raises_filenotfound(tmp_path: Path):
-    """A nonexistent path containing '/' is rejected offline (no network)."""
+    assert resolve_checkpoint(f) == f
     with pytest.raises(FileNotFoundError, match="not a valid HuggingFace repo id"):
-        resolve_checkpoint(tmp_path / "ghost" / "sub")
+        resolve_checkpoint(tmp_path / "ghost" / "sub")  # offline, no network
 
-
-def test_resolve_checkpoint_repo_id_forwarded(tmp_path: Path, monkeypatch):
-    """A non-local source is treated as a repo id and downloaded."""
     seen: dict[str, object] = {}
 
     def fake_snapshot_download(**kwargs):
@@ -286,24 +200,12 @@ def test_resolve_checkpoint_repo_id_forwarded(tmp_path: Path, monkeypatch):
         return str(tmp_path)
 
     monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
-    out = resolve_checkpoint("nvidia/Cosmos3-Nano", revision="abc123")
-    assert out == tmp_path
-    assert seen["repo_id"] == "nvidia/Cosmos3-Nano"
-    assert seen["repo_type"] == "model"
-    assert seen["revision"] == "abc123"
-
-
-def test_load_config_from_repo_id(tmp_path: Path, monkeypatch):
-    """load_config resolves a repo id, then parses config.json from the cache."""
+    assert resolve_checkpoint("nvidia/Cosmos3-Nano", revision="abc123") == tmp_path
+    assert (seen["repo_id"], seen["repo_type"], seen["revision"]) == (
+        "nvidia/Cosmos3-Nano",
+        "model",
+        "abc123",
+    )
     (tmp_path / "config.json").write_text(json.dumps({"hidden_size": 64}))
-    seen: dict[str, object] = {}
-
-    def fake_snapshot_download(**kwargs):
-        seen.update(kwargs)
-        return str(tmp_path)
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
-    cfg = load_config("org/model", _TinyConfig, revision="r1")
-    assert cfg.hidden_size == 64
-    assert seen["repo_id"] == "org/model"
-    assert seen["revision"] == "r1"
+    assert load_config("org/model", _TinyConfig, revision="r1").hidden_size == 64
+    assert (seen["repo_id"], seen["revision"]) == ("org/model", "r1")

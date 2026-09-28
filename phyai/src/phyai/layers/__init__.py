@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from phyai.layers.activation import Snake1d
-from phyai.layers.layer_norm import AdaRMSNorm, GemmaRMSNorm, LayerNorm, RMSNorm
+from phyai.layers.layer_norm import (
+    AdaRMSNorm,
+    GatedRMSNorm,
+    GemmaRMSNorm,
+    LayerNorm,
+    RMSNorm,
+)
 from phyai.layers.rotary_embedding import (
     ROPE_INV_FREQ_FNS,
     InterleavedMRotaryEmbedding,
@@ -17,6 +23,7 @@ from phyai.layers.transformer_block import TransformerBlock
 
 __all__ = [
     "AdaRMSNorm",
+    "GatedRMSNorm",
     "GemmaRMSNorm",
     "LayerNorm",
     "TransformerBlock",

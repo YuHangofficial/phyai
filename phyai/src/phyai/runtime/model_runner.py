@@ -18,8 +18,8 @@ Lifecycle (driven by the scheduler):
    workspace).
 4. ``plan_inference`` — eager metadata staging hook. Called by the
    scheduler outside any captured region with the per-stack metadata
-   describing the next forward step (``ARAttnMetadata`` /
-   ``DiffusionAttnMetadata`` / ``AttnMetadata`` depending on which
+   describing the next forward step (``PagedAttnMetadata`` /
+   ``PagedAttnMetadata`` / ``AttnMetadata`` depending on which
    attention stack the runner drives). Runners forward this to their
    backend's ``replay_metadata`` (graph mode) or
    ``init_forward_metadata`` (eager mode). Default: no-op for runners
@@ -68,7 +68,7 @@ class ModelRunner(abc.ABC):
         ``replay_metadata`` (graph mode) or ``init_forward_metadata``
         (eager mode) on the runner's backend instance. The concrete
         runner's signature narrows ``meta`` to its per-stack metadata
-        type (``ARAttnMetadata`` / ``DiffusionAttnMetadata`` / etc.).
+        type (``PagedAttnMetadata`` / ``PagedAttnMetadata`` / etc.).
 
         Default: no-op. Runners that don't drive attention (e.g.
         vision tower) inherit the no-op directly.

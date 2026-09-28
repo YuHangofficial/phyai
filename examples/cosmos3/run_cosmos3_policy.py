@@ -1,4 +1,4 @@
-"""End-to-end Cosmos3 action/policy demo.
+"""End-to-end Cosmos3 action and policy demo on one or more GPUs.
 
 Drives the ``cosmos3_policy`` engine plugin on a Cosmos3-Nano checkpoint:
 preprocesses an observation (single ``--image`` or a multi-frame ``--video``) +
@@ -218,10 +218,27 @@ def main() -> None:
     )
     parser.add_argument("--no-prompt-metadata", action="store_true")
     parser.add_argument("--out", default=".cache/cosmos3_policy_out")
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--cfg",
+        type=int,
+        default=1,
+        help="CFG rank-group size (1 or 2).",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=1800.0,
+        help="Seconds to wait for managed workers to load the model.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required.")
+    if args.cfg not in (1, 2):
+        raise SystemExit("--cfg must be 1 or 2.")
+    if args.tp < 1:
+        raise SystemExit("--tp must be positive.")
     if (args.image is None) == (args.video is None):
         raise SystemExit("pass exactly one of --image or --video.")
 
@@ -237,13 +254,27 @@ def main() -> None:
     else:
         cond_frames = default_cond
 
-    from phyai.engine import Engine, EngineArgs
-    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai import DeploymentConfig, Engine, EngineArgs
+    from phyai.engine_config import (
+        DeviceConfig,
+        EngineConfig,
+        AttentionParallelConfig,
+        DenseParallelConfig,
+        OuterParallelConfig,
+        ParallelConfig,
+        RuntimeConfig,
+    )
     from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
     from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+    from phyai.server import WorkerSupervisorConfig
     from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
 
-    device = "cuda"
+    # The engine picks the executor: cfg=tp=1 runs inline; anything else spawns
+    # one managed worker per rank on the first visible GPUs (select physical
+    # GPUs with CUDA_VISIBLE_DEVICES on this launcher).
+    deployment = DeploymentConfig(
+        process_config=WorkerSupervisorConfig(startup_timeout_s=args.startup_timeout),
+    )
     dtype = torch.bfloat16
 
     out_dir = Path(args.out).parent
@@ -261,13 +292,22 @@ def main() -> None:
                 decode_video=True,
             ),
             config=EngineConfig(
-                device=DeviceConfig(target=device, params_dtype=dtype),
+                device=DeviceConfig(target="cuda", params_dtype=dtype),
+                parallel=ParallelConfig(
+                    outer=OuterParallelConfig(cfg_size=args.cfg),
+                    dense=DenseParallelConfig(tp_size=args.tp),
+                    attention=AttentionParallelConfig(tp_size=args.tp),
+                ),
                 runtime=RuntimeConfig(use_cuda_graph=False),
             ),
-        )
+        ),
+        deployment=deployment,
     )
 
     try:
+        # Managed workers receive requests over a process pipe, so inputs are
+        # built on the CPU; the inline engine takes them on the GPU directly.
+        request_device = "cpu" if engine.mode != "inline" else "cuda"
         print("[processor] preprocessing ...")
         processor = Cosmos3PolicyProcessor(
             tokenizer_name_or_path=f"{args.checkpoint}/text_tokenizer",
@@ -287,7 +327,7 @@ def main() -> None:
             action_stats_path=args.action_stats_path,
             action_normalization=args.action_normalization,
             negative_prompt=args.negative_prompt,
-            device=device,
+            device=request_device,
             params_dtype=dtype,
         )
 
@@ -308,21 +348,17 @@ def main() -> None:
             processed.video_shape[0], processed.video_shape[1], processed.video_shape[2]
         )
         request = Cosmos3ActionRequest(
-            text_ids=processed.text_ids.to(device),
-            text_mask=processed.text_mask.to(device),
-            neg_text_ids=processed.neg_text_ids.to(device),
-            neg_text_mask=processed.neg_text_mask.to(device),
+            text_ids=processed.text_ids,
+            text_mask=processed.text_mask,
+            neg_text_ids=processed.neg_text_ids,
+            neg_text_mask=processed.neg_text_mask,
             video_shape=video_shape,
             mode=processed.mode,
             domain_id=processed.domain_id,
             action_chunk=processed.action_chunk,
             raw_action_dim=processed.raw_action_dim,
-            cond_video_pixels=processed.pixel_values.to(device=device, dtype=dtype),
-            cond_action=(
-                processed.cond_action.to(device=device, dtype=dtype)
-                if processed.cond_action is not None
-                else None
-            ),
+            cond_video_pixels=processed.pixel_values,
+            cond_action=processed.cond_action,
             cond_frame_indexes=processed.cond_frame_indexes,
             fps=args.fps,
             num_inference_steps=args.steps,
@@ -333,7 +369,9 @@ def main() -> None:
         print(
             f"[run] mode={args.mode} domain={args.domain_name} "
             f"latent={video_shape} clean_frames={list(cond_frames)} "
-            f"steps={args.steps} action_chunk={args.action_chunk_size}x{args.raw_action_dim}"
+            f"steps={args.steps} action_chunk={args.action_chunk_size}x"
+            f"{processed.raw_action_dim} cfg={args.cfg} tp={args.tp} "
+            f"executor={engine.mode}"
         )
         result = engine.step(request)
 

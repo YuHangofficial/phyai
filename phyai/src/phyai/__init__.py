@@ -1,23 +1,4 @@
-"""phyai — Physical AI. Main library.
-
-Top-level convenience surface. The engine entry points are re-exported
-here so callers can write ``from phyai import Engine, EngineConfig``
-without remembering which submodule each lives in.
-
-The re-exports are **lazy** (PEP 562 ``__getattr__``). ``phyai.engine``
-and ``phyai.engine_config`` transitively import torch, flashinfer, and
-every registered model plugin — several seconds and hundreds of MiB.
-Binding them eagerly here would make even a bare ``import phyai`` (e.g.
-to read :data:`__version__`) pay that whole cost. Deferring to first
-attribute access keeps ``import phyai`` near-instant while
-``from phyai import Engine`` still works.
-
-The functional subpackages (:mod:`phyai.parallel`, :mod:`phyai.layers`,
-:mod:`phyai.vgpu`, :mod:`phyai.cache`, :mod:`phyai.runtime`,
-:mod:`phyai.weights`, :mod:`phyai.payload`, :mod:`phyai.utils`) are
-addressed by their full path
-(``import phyai.parallel as P``) and are intentionally not hoisted here.
-"""
+"""PhyAI. Main library."""
 
 from __future__ import annotations
 
@@ -31,18 +12,25 @@ except PackageNotFoundError:  # raw source tree, not installed
     __version__ = "0.0.0+unknown"
 
 
-# Re-export name -> defining submodule. Resolved lazily on first access.
+# note(chenghua): Re-export name -> defining submodule. Resolved lazily on first access.
 _LAZY: dict[str, str] = {
     # phyai.engine
     "Engine": "phyai.engine",
     "EngineArgs": "phyai.engine",
+    "DeploymentConfig": "phyai.server.deployment",
+    "EngineUnavailableError": "phyai.server.lifecycle",
     "Entry": "phyai.engine",
     "EntryArgs": "phyai.engine",
     # phyai.engine_config
     "BackendConfig": "phyai.engine_config",
     "DeviceConfig": "phyai.engine_config",
     "EngineConfig": "phyai.engine_config",
+    "KernelConfig": "phyai.engine_config",
     "ParallelConfig": "phyai.engine_config",
+    "OuterParallelConfig": "phyai.engine_config",
+    "DenseParallelConfig": "phyai.engine_config",
+    "AttentionParallelConfig": "phyai.engine_config",
+    "MoeParallelConfig": "phyai.engine_config",
     "RuntimeConfig": "phyai.engine_config",
     "get_engine_config": "phyai.engine_config",
     "init_engine_config": "phyai.engine_config",
@@ -53,11 +41,18 @@ _LAZY: dict[str, str] = {
 # so ``from phyai import Engine`` resolves under mypy / pyright / autocomplete.
 if TYPE_CHECKING:
     from phyai.engine import Engine, EngineArgs, Entry, EntryArgs
+    from phyai.server.deployment import DeploymentConfig
+    from phyai.server.lifecycle import EngineUnavailableError
     from phyai.engine_config import (
         BackendConfig,
         DeviceConfig,
         EngineConfig,
+        KernelConfig,
         ParallelConfig,
+        OuterParallelConfig,
+        DenseParallelConfig,
+        AttentionParallelConfig,
+        MoeParallelConfig,
         RuntimeConfig,
         get_engine_config,
         init_engine_config,
@@ -84,13 +79,20 @@ __all__ = [
     # engine
     "Engine",
     "EngineArgs",
+    "DeploymentConfig",
+    "EngineUnavailableError",
     "Entry",
     "EntryArgs",
     # engine config
     "EngineConfig",
+    "KernelConfig",
     "BackendConfig",
     "DeviceConfig",
     "ParallelConfig",
+    "OuterParallelConfig",
+    "DenseParallelConfig",
+    "AttentionParallelConfig",
+    "MoeParallelConfig",
     "RuntimeConfig",
     "get_engine_config",
     "set_engine_config",

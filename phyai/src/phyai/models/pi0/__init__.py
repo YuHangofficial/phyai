@@ -8,8 +8,8 @@ The package ships the full pi0 inference path:
   parameter-only :class:`PI0Model` container).
 * :mod:`model_runner_pi0` -- the three runners (vision / LLM / expert)
   that wrap captured CUDA graphs around the modeling code.
-* :mod:`scheduler_ws1_pi0` -- single-card (world_size=1) end-to-end
-  inference orchestrator with pi0's prefix/state/action mask.
+* :mod:`scheduler_pi0` -- per-replica inference orchestrator with PI0's
+  prefix/state/action mask.
 
 Training is not in scope here; this package is inference-only.
 """

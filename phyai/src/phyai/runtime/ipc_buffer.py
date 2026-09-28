@@ -61,7 +61,6 @@ Model process::
 from __future__ import annotations
 
 import ctypes
-import logging
 import multiprocessing.resource_tracker as resource_tracker
 import os
 import uuid
@@ -71,9 +70,10 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from phyai.utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +562,16 @@ def _new_shm_name() -> str:
     return f"phyai_ipc_{uuid.uuid4().hex[:12]}"
 
 
+def _page_size() -> int:
+    """Return the host page size used for CUDA host registration."""
+    return int(os.sysconf("SC_PAGE_SIZE")) if hasattr(os, "sysconf") else 4096
+
+
+def _page_align(nbytes: int) -> int:
+    page = _page_size()
+    return ((int(nbytes) + page - 1) // page) * page
+
+
 class HostShmBuffer:
     """Host POSIX shared-memory buffer accessible from multiple processes.
 
@@ -625,13 +635,27 @@ class HostShmBuffer:
         if nbytes <= 0:
             raise ValueError(f"nbytes must be positive, got {nbytes}")
         chosen = name or _new_shm_name()
-        shm = shared_memory.SharedMemory(name=chosen, create=True, size=int(nbytes))
+        allocation_size = _page_align(nbytes) if cuda_register else int(nbytes)
+        shm = shared_memory.SharedMemory(
+            name=chosen,
+            create=True,
+            size=allocation_size,
+        )
         # Linux POSIX shm zero-initialises but be explicit.
-        shm.buf[: int(nbytes)] = b"\x00" * int(nbytes)
+        shm.buf[:allocation_size] = b"\x00" * allocation_size
 
         cuda_registered = False
-        if cuda_register:
-            cuda_registered = _do_cuda_host_register(shm, int(nbytes))
+        try:
+            if cuda_register:
+                cuda_registered = _do_cuda_host_register(shm, int(nbytes))
+        except BaseException:
+            # Registration happens after creation; do not leak an unnamed
+            # POSIX object when the CUDA driver rejects the mapping.
+            try:
+                shm.close()
+            finally:
+                shm.unlink()
+            raise
 
         logger.debug(
             "HostShmBuffer.create: name=%s nbytes=%d cuda_register=%s",
@@ -677,8 +701,12 @@ class HostShmBuffer:
             logger.debug("resource_tracker.unregister failed: %s", e)
 
         cuda_registered = False
-        if cuda_register:
-            cuda_registered = _do_cuda_host_register(shm, int(handle.nbytes))
+        try:
+            if cuda_register:
+                cuda_registered = _do_cuda_host_register(shm, int(handle.nbytes))
+        except BaseException:
+            shm.close()
+            raise
 
         logger.debug(
             "HostShmBuffer.attach: name=%s nbytes=%d cuda_register=%s",
@@ -820,8 +848,7 @@ def _do_cuda_host_register(shm: shared_memory.SharedMemory, nbytes: int) -> bool
     ``cudaHostUnregister`` at close. Raises on hard failure.
     """
     cuda_rt = _import_cuda_runtime()
-    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
-    aligned = ((nbytes + page - 1) // page) * page
+    aligned = _page_align(nbytes)
     if aligned > shm.size:
         # Caller passed an `nbytes` larger than the shm block was created
         # with; refuse to silently extend.

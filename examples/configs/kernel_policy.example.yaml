@@ -1,0 +1,69 @@
+schema: phyai.kernel/v1
+profile: static
+defaults:
+  fallback: reference
+rules:
+  - id: sm100-nvfp4-gemm
+    priority: 100
+    match:
+      op: gemm
+      device:
+        vendor: nvidia
+        arch: ">=sm100"
+      quant:
+        format: nvfp4
+        layout: 128x4
+      shape.M: "<=8"
+    prefer:
+      - flashinfer.gemm.nvfp4_128x4
+      - torch.gemm.nvfp4_linear
+
+  - id: sm90-fp8-gemm
+    priority: 90
+    match:
+      op: gemm
+      device: { vendor: nvidia, arch: ">=sm90" }
+      quant.format: fp8_e4m3
+    prefer:
+      - flashinfer.gemm.fp8_block
+      - torch.gemm.fp8_per_channel
+      - torch.gemm.fp8_block
+  - id: ragged-prefill
+    priority: 60
+    match:
+      op: attention
+      attrs.layout: ragged
+    prefer:
+      - flashinfer.attention
+  - id: pin-fa2-prefill
+    priority: 50
+    match:
+      op: attention_paged
+      role: expert
+      model.family: pi05
+    restrict_to: "flashinfer.attention_paged.fa2"
+  - id: fp32-affine-layernorm
+    priority: 40
+    match:
+      op: layernorm
+      device.vendor: nvidia
+      when:
+        if: { attrs.bias: true }
+        then: { dtype.bias: fp32 }
+    prefer:
+      - flashinfer.layernorm
+      - phyai_kernel.layernorm
+
+overrides:
+  - id: force-reference-attention-for-debug
+    priority: 1000
+    match:
+      op: attention
+      model.tags: [reference, debug]
+    use: eager.attention
+  - id: force-torch-gemm
+    priority: 900
+    match:
+      op: gemm
+      model.tags: [no-flashinfer]
+    restrict_to: "torch.gemm.*"

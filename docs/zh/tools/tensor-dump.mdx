@@ -146,7 +146,7 @@ stack（视觉 encoder、PaliGemma 语言模型、动作 expert），外加一�
 视觉塔每个相机跑一次、动作 expert 每个 Euler 去噪步跑一次，每次调用都会被保留：
 第一次以裸名字为 key，之后的加 `::callN` 后缀。
 
-```
+```text
 model.paligemma_lm.layers.0.o_proj
 model.expert_stack.layers.0.attn          # Euler 步 0
 model.expert_stack.layers.0.attn::call1   # Euler 步 1

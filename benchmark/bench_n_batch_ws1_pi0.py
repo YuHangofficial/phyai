@@ -69,7 +69,7 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi0.configuration_pi0 import PI0Config
 from phyai.models.pi0.main_pi0 import PI0Args
-from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request
+from phyai.models.pi0.scheduler_pi0 import PI0Request
 from phyai.utils import load_config
 from phyai.utils.profile import (
     add_profile_cli_args,

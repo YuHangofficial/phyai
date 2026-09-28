@@ -162,7 +162,7 @@ camera, the action expert runs once per Euler denoise step — every
 invocation is preserved: the first is keyed by the bare name, later ones get
 a `::callN` suffix.
 
-```
+```text
 model.paligemma_lm.layers.0.o_proj
 model.expert_stack.layers.0.attn          # Euler step 0
 model.expert_stack.layers.0.attn::call1   # Euler step 1

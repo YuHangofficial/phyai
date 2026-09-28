@@ -1,10 +1,9 @@
-"""Torch backend deliberately rejects multi-shard splitting.
+"""The torch backend deliberately rejects multi-shard splitting.
 
-The torch backend supports only single-shard ``create_single``: ATen
-exposes no public split / remainder API, and two back-to-back
-``GreenContext.create`` calls produce streams that nearly serialise
-rather than running disjoint. We assert ``BackendCapabilityError``
-rather than letting callers obtain non-disjoint shards.
+ATen exposes no public split / remainder API, and two back-to-back
+``GreenContext.create`` calls produce streams that nearly serialise rather
+than running disjoint, so the backend raises ``BackendCapabilityError`` instead
+of handing callers non-disjoint shards. Single-shard ``create_single`` works.
 """
 
 from __future__ import annotations
@@ -16,39 +15,21 @@ import phyai.vgpu as V
 from phyai.vgpu.exceptions import BackendCapabilityError
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="phyai.vgpu requires CUDA",
-)
-
-
-def test_torch_backend_split_by_count_raises():
+def test_torch_backend_refuses_every_split_but_creates_a_single_vgpu():
     V.init(device="cuda:0", backend="torch")
-    with pytest.raises(BackendCapabilityError) as ei:
+    with pytest.raises(BackendCapabilityError) as excinfo:
         V.split_device("cuda:0", num_groups=2, min_count=16)
-    msg = str(ei.value)
-    assert "torch backend" in msg
-    assert "flashinfer" in msg
-
-
-def test_torch_backend_split_by_sm_counts_raises():
-    V.init(device="cuda:0", backend="torch")
+    assert "torch backend" in str(excinfo.value) and "flashinfer" in str(excinfo.value)
     with pytest.raises(BackendCapabilityError):
         V.split_device_by_sm_count("cuda:0", sm_counts=[16, 16])
 
-
-def test_torch_backend_create_single_works():
-    """The torch backend should still let users create a single vGPU."""
-    V.init(device="cuda:0", backend="torch")
     a = V.vGPU(name="solo", sm_count=64, backend="torch")
     try:
-        assert a.shard.sm_count == 64
-        assert a.shard.backend == "torch"
+        assert (a.shard.sm_count, a.shard.backend) == (64, "torch")
         assert isinstance(a.stream, torch.cuda.Stream)
         with a.activate():
             x = torch.randn(1024, 1024, device="cuda:0", dtype=torch.bfloat16)
-            y = torch.randn(1024, 1024, device="cuda:0", dtype=torch.bfloat16)
-            _ = x @ y
+            _ = x @ x
         torch.cuda.synchronize()
     finally:
         a.close()

@@ -1,4 +1,4 @@
-"""End-to-end Cosmos3 generation demo — text-to-video [+ audio] (T2V / T2AV).
+"""End-to-end Cosmos3 generation on one or more GPUs.
 
 Drives the ``cosmos3`` engine plugin on a Cosmos3-Nano checkpoint: tokenizes a
 prompt, runs the diffusion model, and decodes the result to a single mp4 (with an
@@ -58,15 +58,15 @@ import torch
 
 
 @contextlib.contextmanager
-def _timed(label: str, store: dict):
+def _timed(label: str, store: dict[str, float], *, synchronize_cuda: bool = False):
     """Time a region in seconds (CUDA-synchronized) into ``store[label]``."""
-    if torch.cuda.is_available():
+    if synchronize_cuda:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     try:
         yield
     finally:
-        if torch.cuda.is_available():
+        if synchronize_cuda:
             torch.cuda.synchronize()
         store[label] = time.perf_counter() - t0
 
@@ -107,21 +107,52 @@ def main() -> None:
         help="Also generate a joint audio stream (T2AV).",
     )
     parser.add_argument("--out", default=".cache/cosmos3_t2v")
+    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--cfg",
+        type=int,
+        default=1,
+        help="CFG rank-group size (1 or 2).",
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=1800.0,
+        help="Seconds to wait for managed workers to load the model.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required.")
+    if args.cfg not in (1, 2):
+        raise SystemExit("--cfg must be 1 or 2.")
+    if args.tp < 1:
+        raise SystemExit("--tp must be positive.")
 
-    from phyai.engine import Engine, EngineArgs
-    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai import DeploymentConfig, Engine, EngineArgs
+    from phyai.engine_config import (
+        DeviceConfig,
+        EngineConfig,
+        AttentionParallelConfig,
+        DenseParallelConfig,
+        OuterParallelConfig,
+        ParallelConfig,
+        RuntimeConfig,
+    )
     from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
     from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+    from phyai.server import WorkerSupervisorConfig
     from phyai_utils_tools.models.cosmos3 import (
         Cosmos3GenerationPostProcessor,
         Cosmos3Processor,
     )
 
-    device = "cuda"
+    # The engine picks the executor: cfg=tp=1 runs inline; anything else spawns
+    # one managed worker per rank on the first visible GPUs (select physical
+    # GPUs with CUDA_VISIBLE_DEVICES on this launcher).
+    deployment = DeploymentConfig(
+        process_config=WorkerSupervisorConfig(startup_timeout_s=args.startup_timeout),
+    )
     dtype = torch.bfloat16
     use_karras = {"auto": None, "true": True, "false": False}[args.use_karras_sigmas]
 
@@ -139,13 +170,23 @@ def main() -> None:
                     load_sound=(True if args.sound else None),
                 ),
                 config=EngineConfig(
-                    device=DeviceConfig(target=device, params_dtype=dtype),
+                    device=DeviceConfig(target="cuda", params_dtype=dtype),
+                    parallel=ParallelConfig(
+                        outer=OuterParallelConfig(cfg_size=args.cfg),
+                        dense=DenseParallelConfig(tp_size=args.tp),
+                        attention=AttentionParallelConfig(tp_size=args.tp),
+                    ),
                     runtime=RuntimeConfig(use_cuda_graph=False),
                 ),
-            )
+            ),
+            deployment=deployment,
         )
 
     try:
+        # Managed workers receive requests over a process pipe, so inputs are
+        # built on the CPU; the inline engine takes them on the GPU directly.
+        managed = engine.mode != "inline"
+        request_device = "cpu" if managed else "cuda"
         with _timed("preprocess", timings):
             # Native-aligned prompt: metadata-appended positive + structured negative
             # (built by the processor; see the native-parity note in the docstring).
@@ -158,7 +199,9 @@ def main() -> None:
                 append_metadata=True,
             )
             cond, uncond = processor.tokenize_pair(
-                args.prompt, negative_prompt=args.negative_prompt, device=device
+                args.prompt,
+                negative_prompt=args.negative_prompt,
+                device=request_device,
             )
             video_shape = pixel_to_latent_shape(
                 args.num_frames, args.height, args.width
@@ -182,9 +225,10 @@ def main() -> None:
 
         print(
             f"[run] T2{'AV' if args.sound else 'V'} latent={video_shape} "
-            f"steps={args.steps} guidance={args.guidance_scale} shift={args.flow_shift}"
+            f"steps={args.steps} guidance={args.guidance_scale} "
+            f"cfg={args.cfg} tp={args.tp} mode={engine.mode}"
         )
-        with _timed("inference", timings):
+        with _timed("inference", timings, synchronize_cuda=not managed):
             result = engine.step(request)
 
         postprocessor = Cosmos3GenerationPostProcessor(fps=args.fps)

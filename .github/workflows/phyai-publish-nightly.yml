@@ -2,7 +2,7 @@
 # a PEP 503 "simple" wheel index on GitHub Pages, so users can:
 #
 #   uv pip install phyai \
-#     --extra-index-url https://membodied.github.io/phyai/simple/ \
+#     --extra-index-url https://mingti-org.github.io/phyai/simple/ \
 #     --prerelease=allow
 #
 # Job graph:
@@ -40,16 +40,19 @@ concurrency:
 
 permissions:
   contents: read
+  # The skip-when-unchanged gate reads this workflow's own run history.
+  actions: read
 
 jobs:
   # One source of truth for the version, so build-ext and build-index can't
   # disagree if the run straddles UTC midnight.
   setup:
     name: compute nightly version
-    if: github.repository == 'MEmbodied/phyai'
+    if: github.repository == 'mingti-org/phyai'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      publish: ${{ steps.gate.outputs.publish }}
     steps:
       # fetch-depth: 0 brings the full history + tags so the base version can be
       # derived from the latest git tag.
@@ -57,6 +60,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # A scheduled run skips when HEAD is exactly what the last successful
+      # run already built — republishing identical content under a new dev
+      # date wastes CI minutes and index entries. SHA equality (rather than a
+      # "commits in the last 24h" window) cannot silently drop a commit when
+      # the cron fires late, and it fails open: any API hiccup publishes.
+      # A manual workflow_dispatch always publishes.
+      - name: Skip when HEAD is already published
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PUBLISH=true
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            LAST=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/phyai-publish-nightly.yml/runs?status=success&per_page=1" \
+              --jq '.workflow_runs[0].head_sha // empty' || true)
+            if [ -n "$LAST" ] && [ "$LAST" = "${{ github.sha }}" ]; then
+              echo "HEAD ${LAST} was already built by the last successful run; skipping."
+              PUBLISH=false
+            fi
+          fi
+          echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
 
       # Base version = latest git tag; UTC date makes each nightly unique; patch
       # is bumped by one so the dev build sorts ABOVE the last release per PEP 440
@@ -80,6 +106,9 @@ jobs:
   build-ext:
     name: build phyai-ext (manylinux_2_28)
     needs: setup
+    # When setup decides nothing changed, this skip cascades: build-index and
+    # deploy `needs` this job, and a skipped dependency skips them too.
+    if: needs.setup.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

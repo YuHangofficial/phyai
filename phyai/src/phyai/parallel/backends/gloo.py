@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 
 from phyai.parallel.backend import Op, Topology
+from phyai.parallel.backends.rank import group_rank_to_global
 from phyai.parallel.state import Mode
 
 
@@ -68,6 +69,8 @@ class GlooBackend:
         world_size: int,
         topology: Topology,
         pg: dist.ProcessGroup | None = None,
+        mesh_name: str | None = None,
+        group: str | None = None,
         **extra: object,
     ) -> bool:
         if op not in self._OPS:
@@ -83,6 +86,9 @@ class GlooBackend:
 
     def supports_capture(self) -> bool:
         return False
+
+    def close(self) -> None:
+        return None
 
     # ------------------------------------------------------------------
     # execute
@@ -144,7 +150,7 @@ class GlooBackend:
 
     def _broadcast(self, pg, *, input, output, src, **_):
         output.copy_(input)
-        dist.broadcast(output, src=src, group=pg)
+        dist.broadcast(output, src=group_rank_to_global(pg, src), group=pg)
         return output
 
     def _all_to_all(self, pg, *, input, output, in_splits, out_splits, **_):
@@ -166,11 +172,11 @@ class GlooBackend:
         return output
 
     def _send(self, pg, *, input, dst, **_):
-        dist.send(input.contiguous(), dst=dst, group=pg)
+        dist.send(input.contiguous(), dst=group_rank_to_global(pg, dst), group=pg)
         return None
 
     def _recv(self, pg, *, output, src, **_):
-        dist.recv(output, src=src, group=pg)
+        dist.recv(output, src=group_rank_to_global(pg, src), group=pg)
         return output
 
     def _barrier(self, pg, **_):

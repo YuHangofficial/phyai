@@ -67,31 +67,28 @@ def _execute(
     *,
     op: Op,
     mesh_name: str,
-    axis: str,
-    tensor: Tensor | None,
-    output: Tensor | None,
+    group: str,
+    tensor: Tensor,
+    output: Tensor,
     extra_key: tuple = (),
     **kwargs,
-) -> Tensor | None:
+) -> Tensor:
     """Common dispatch + execute body shared by every primitive."""
     mesh = resolve_mesh(mesh_name)
     backend = get_dispatcher().select(
         op=op,
         mesh=mesh,
-        axis=axis,
+        group=group,
         tensor=tensor,
         extra_key=extra_key,
     )
     return backend.execute(
         op=op,
-        pg=mesh.axis_group(axis),
+        pg=mesh.group(group),
         input=tensor,
         output=output,
         _mesh_name=mesh.name,
-        _axis=axis,
-        _device=tensor.device
-        if tensor is not None
-        else (output.device if output is not None else torch.device("cuda")),
+        _group=group,
         **kwargs,
     )
 
@@ -105,18 +102,18 @@ def _execute(
 def _all_reduce_op(
     x: Tensor,
     mesh_name: str,
-    axis: str,
+    group: str,
     reduce_op: int,
 ) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    if mesh.axis_size(axis) <= 1:
+    if mesh.group_size(group) <= 1:
         # ws=1: AR is identity. Skip dispatcher entirely.
         return x.clone()
     output = torch.empty_like(x)
     return _execute(
         op=Op.ALL_REDUCE,
         mesh_name=mesh_name,
-        axis=axis,
+        group=group,
         tensor=x,
         output=output,
         extra_key=(reduce_op,),
@@ -125,19 +122,19 @@ def _all_reduce_op(
 
 
 @_all_reduce_op.register_fake
-def _(x: Tensor, mesh_name: str, axis: str, reduce_op: int) -> Tensor:
+def _(x: Tensor, mesh_name: str, group: str, reduce_op: int) -> Tensor:
     return torch.empty_like(x)
 
 
 def all_reduce(
     x: Tensor,
     *,
-    axis: str,
+    group: str,
     op: dist.ReduceOp = dist.ReduceOp.SUM,
     mesh: "str | Mesh" = "model",
 ) -> Tensor:
-    """All-reduce ``x`` along ``axis`` of ``mesh``."""
-    return torch.ops.phyai.all_reduce.default(x, _name(mesh), axis, int(op))
+    """All-reduce ``x`` along ``group`` of ``mesh``."""
+    return torch.ops.phyai.all_reduce.default(x, _name(mesh), group, int(op))
 
 
 # =============================================================================
@@ -149,11 +146,11 @@ def all_reduce(
 def _all_gather_op(
     x: Tensor,
     mesh_name: str,
-    axis: str,
+    group: str,
     dim: int,
 ) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    ws = mesh.axis_size(axis)
+    ws = mesh.group_size(group)
     if ws <= 1:
         return x.clone()
     out_shape = list(x.shape)
@@ -162,7 +159,7 @@ def _all_gather_op(
     return _execute(
         op=Op.ALL_GATHER,
         mesh_name=mesh_name,
-        axis=axis,
+        group=group,
         tensor=x,
         output=output,
         extra_key=(dim,),
@@ -171,9 +168,9 @@ def _all_gather_op(
 
 
 @_all_gather_op.register_fake
-def _(x: Tensor, mesh_name: str, axis: str, dim: int) -> Tensor:
+def _(x: Tensor, mesh_name: str, group: str, dim: int) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    ws = mesh.axis_size(axis)
+    ws = mesh.group_size(group)
     out_shape = list(x.shape)
     out_shape[dim] *= ws
     return torch.empty(out_shape, dtype=x.dtype, device=x.device)
@@ -182,13 +179,13 @@ def _(x: Tensor, mesh_name: str, axis: str, dim: int) -> Tensor:
 def all_gather(
     x: Tensor,
     *,
-    axis: str,
+    group: str,
     dim: int = -1,
     mesh: "str | Mesh" = "model",
 ) -> Tensor:
     if dim < 0:
         dim += x.ndim
-    return torch.ops.phyai.all_gather.default(x, _name(mesh), axis, dim)
+    return torch.ops.phyai.all_gather.default(x, _name(mesh), group, dim)
 
 
 # =============================================================================
@@ -200,12 +197,12 @@ def all_gather(
 def _reduce_scatter_op(
     x: Tensor,
     mesh_name: str,
-    axis: str,
+    group: str,
     dim: int,
     reduce_op: int,
 ) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    ws = mesh.axis_size(axis)
+    ws = mesh.group_size(group)
     if ws <= 1:
         return x.clone()
     if x.shape[dim] % ws != 0:
@@ -219,7 +216,7 @@ def _reduce_scatter_op(
     return _execute(
         op=Op.REDUCE_SCATTER,
         mesh_name=mesh_name,
-        axis=axis,
+        group=group,
         tensor=x,
         output=output,
         extra_key=(dim, reduce_op),
@@ -229,9 +226,9 @@ def _reduce_scatter_op(
 
 
 @_reduce_scatter_op.register_fake
-def _(x: Tensor, mesh_name: str, axis: str, dim: int, reduce_op: int) -> Tensor:
+def _(x: Tensor, mesh_name: str, group: str, dim: int, reduce_op: int) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    ws = mesh.axis_size(axis)
+    ws = mesh.group_size(group)
     out_shape = list(x.shape)
     out_shape[dim] //= ws
     return torch.empty(out_shape, dtype=x.dtype, device=x.device)
@@ -240,7 +237,7 @@ def _(x: Tensor, mesh_name: str, axis: str, dim: int, reduce_op: int) -> Tensor:
 def reduce_scatter(
     x: Tensor,
     *,
-    axis: str,
+    group: str,
     dim: int = 0,
     op: dist.ReduceOp = dist.ReduceOp.SUM,
     mesh: "str | Mesh" = "model",
@@ -250,7 +247,7 @@ def reduce_scatter(
     return torch.ops.phyai.reduce_scatter.default(
         x,
         _name(mesh),
-        axis,
+        group,
         dim,
         int(op),
     )
@@ -265,19 +262,24 @@ def reduce_scatter(
 def _all_to_all_op(
     x: Tensor,
     mesh_name: str,
-    axis: str,
+    group: str,
     in_splits: Optional[list[int]],
     out_splits: Optional[list[int]],
 ) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    ws = mesh.axis_size(axis)
+    ws = mesh.group_size(group)
+    if (in_splits is None) != (out_splits is None):
+        # An uneven exchange cannot infer its receive layout from the send
+        # side alone: how much each peer sends *to this rank* is their
+        # decision. Require both split lists together (or neither).
+        raise ValueError(
+            "all_to_all: in_splits and out_splits must be given together "
+            "(uneven exchange) or both omitted (even exchange)."
+        )
     if ws <= 1:
         return x.clone()
     if out_splits is not None:
         out_n0 = sum(out_splits)
-    elif in_splits is not None:
-        # Same-size each rank when no out_splits specified
-        out_n0 = x.shape[0]
     else:
         if x.shape[0] % ws != 0:
             raise ValueError(
@@ -289,7 +291,7 @@ def _all_to_all_op(
     return _execute(
         op=Op.ALL_TO_ALL,
         mesh_name=mesh_name,
-        axis=axis,
+        group=group,
         tensor=x,
         output=output,
         # Only the even/uneven distinction is plausibly selection-relevant
@@ -305,16 +307,17 @@ def _all_to_all_op(
 def _(
     x: Tensor,
     mesh_name: str,
-    axis: str,
+    group: str,
     in_splits: Optional[list[int]],
     out_splits: Optional[list[int]],
 ) -> Tensor:
-    mesh = resolve_mesh(mesh_name)
-    ws = mesh.axis_size(axis)
-    if out_splits is not None:
-        out_n0 = sum(out_splits)
-    else:
-        out_n0 = x.shape[0]
+    resolve_mesh(mesh_name).group_size(group)
+    if (in_splits is None) != (out_splits is None):
+        raise ValueError(
+            "all_to_all: in_splits and out_splits must be given together "
+            "(uneven exchange) or both omitted (even exchange)."
+        )
+    out_n0 = x.shape[0] if out_splits is None else sum(out_splits)
     out_shape = (out_n0,) + tuple(x.shape[1:])
     return torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
@@ -322,7 +325,7 @@ def _(
 def all_to_all(
     x: Tensor,
     *,
-    axis: str,
+    group: str,
     in_splits: Optional[list[int]] = None,
     out_splits: Optional[list[int]] = None,
     mesh: "str | Mesh" = "model",
@@ -330,7 +333,7 @@ def all_to_all(
     return torch.ops.phyai.all_to_all.default(
         x,
         _name(mesh),
-        axis,
+        group,
         in_splits,
         out_splits,
     )
@@ -345,17 +348,17 @@ def all_to_all(
 def _broadcast_op(
     x: Tensor,
     mesh_name: str,
-    axis: str,
+    group: str,
     src: int,
 ) -> Tensor:
     mesh = resolve_mesh(mesh_name)
-    if mesh.axis_size(axis) <= 1:
+    if mesh.group_size(group) <= 1:
         return x.clone()
     output = torch.empty_like(x)
     return _execute(
         op=Op.BROADCAST,
         mesh_name=mesh_name,
-        axis=axis,
+        group=group,
         tensor=x,
         output=output,
         extra_key=(src,),
@@ -364,18 +367,18 @@ def _broadcast_op(
 
 
 @_broadcast_op.register_fake
-def _(x: Tensor, mesh_name: str, axis: str, src: int) -> Tensor:
+def _(x: Tensor, mesh_name: str, group: str, src: int) -> Tensor:
     return torch.empty_like(x)
 
 
 def broadcast(
     x: Tensor,
     *,
-    axis: str,
+    group: str,
     src: int = 0,
     mesh: "str | Mesh" = "model",
 ) -> Tensor:
-    return torch.ops.phyai.broadcast.default(x, _name(mesh), axis, src)
+    return torch.ops.phyai.broadcast.default(x, _name(mesh), group, src)
 
 
 # =============================================================================
@@ -391,29 +394,28 @@ def broadcast(
 def send(
     x: Tensor,
     *,
-    axis: str,
+    group: str,
     dst: int,
     mesh: "str | Mesh" = "model",
 ) -> None:
     mesh_obj = resolve_mesh(mesh)
-    if mesh_obj.axis_size(axis) <= 1:
+    if mesh_obj.group_size(group) <= 1:
         return  # ws=1: nothing to send
     backend = get_dispatcher().select(
         op=Op.SEND,
         mesh=mesh_obj,
-        axis=axis,
+        group=group,
         tensor=x,
         extra_key=(dst,),
     )
     backend.execute(
         op=Op.SEND,
-        pg=mesh_obj.axis_group(axis),
+        pg=mesh_obj.group(group),
         input=x,
         output=None,
         dst=dst,
         _mesh_name=mesh_obj.name,
-        _axis=axis,
-        _device=x.device,
+        _group=group,
     )
 
 
@@ -421,7 +423,7 @@ def recv(
     shape: tuple[int, ...] | list[int],
     dtype: torch.dtype,
     *,
-    axis: str,
+    group: str,
     src: int,
     device: torch.device | str | None = None,
     mesh: "str | Mesh" = "model",
@@ -430,50 +432,49 @@ def recv(
     if device is None:
         device = current_device()
     output = torch.empty(tuple(shape), dtype=dtype, device=device)
-    if mesh_obj.axis_size(axis) <= 1:
-        # ws=1: no peer to receive from. Caller's bug if they reach this,
-        # but we tolerate it by returning the zeroed buffer.
-        return output
+    if mesh_obj.group_size(group) <= 1:
+        # ws=1: no peer exists.  Returning a deterministic zero tensor is
+        # safer than exposing ``torch.empty`` contents when a caller reaches
+        # this defensive path.
+        return torch.zeros_like(output)
     backend = get_dispatcher().select(
         op=Op.RECV,
         mesh=mesh_obj,
-        axis=axis,
+        group=group,
         tensor=output,
         extra_key=(src,),
     )
     backend.execute(
         op=Op.RECV,
-        pg=mesh_obj.axis_group(axis),
+        pg=mesh_obj.group(group),
         input=None,
         output=output,
         src=src,
         _mesh_name=mesh_obj.name,
-        _axis=axis,
-        _device=output.device,
+        _group=group,
     )
     return output
 
 
 def barrier(
     *,
-    axis: str = "world",
+    group: str = "world",
     mesh: "str | Mesh" = "model",
 ) -> None:
     mesh_obj = resolve_mesh(mesh)
-    if mesh_obj.axis_size(axis) <= 1:
+    if mesh_obj.group_size(group) <= 1:
         return
     backend = get_dispatcher().select(
         op=Op.BARRIER,
         mesh=mesh_obj,
-        axis=axis,
+        group=group,
         tensor=None,
     )
     backend.execute(
         op=Op.BARRIER,
-        pg=mesh_obj.axis_group(axis),
+        pg=mesh_obj.group(group),
         input=None,
         output=None,
         _mesh_name=mesh_obj.name,
-        _axis=axis,
-        _device=current_device(),
+        _group=group,
     )

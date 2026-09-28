@@ -21,9 +21,9 @@ from phyai.models.gr00t_n17.modeling_gr00t_n17 import (
     GR00TN17BackboneOutput,
     GR00TN17Model,
 )
-from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import (
+from phyai.models.gr00t_n17.scheduler_gr00t_n17 import (
     GR00TN17Request,
-    GR00TN17WS1Scheduler,
+    GR00TN17Scheduler,
 )
 
 
@@ -41,6 +41,6 @@ __all__ = [
     "GR00TN17Model",
     "GR00TN17Request",
     "GR00TN17VLSelfAttentionConfig",
-    "GR00TN17WS1Scheduler",
+    "GR00TN17Scheduler",
     "gr00t_n17_weight_remap",
 ]

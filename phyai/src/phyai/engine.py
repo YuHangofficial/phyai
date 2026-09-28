@@ -1,113 +1,161 @@
-"""Process-level engine that drives a single registered model plugin.
-
-The :class:`Engine` is a thin programmatic dispatcher; it does *not*
-parse argv or read environment variables. A future server (HTTP /
-gRPC / RPC / ...) is expected to wrap this engine, translate external
-requests into a model-specific request object, and call
-:meth:`Engine.step`. Until that server lands, the intended caller is
-in-process Python (tests, scripts, notebooks).
-
-Three concepts:
-
-* :class:`EntryArgs` — empty dataclass base. Each plugin declares a
-  subclass with its own fields (e.g. ``PI05Args(checkpoint_dir=...)``).
-  EntryArgs are programmatic: typed, defaulted, IDE-friendly. No
-  argparse, no string parsing.
-* :class:`Entry` — ABC every plugin inherits. Defines :meth:`setup`
-  (build model + scheduler from args), :meth:`step` (one inference
-  round; request / response shapes are plugin-defined), and
-  :meth:`close` (release GPU resources).
-* :class:`Engine` — owns the plugin registry, applies
-  :class:`~phyai.engine_config.EngineConfig` so every downstream model
-  constructor picks up the same defaults, and orchestrates a fixed
-  sequence of discrete ``init_*`` functions
-  (:func:`~phyai.engine_config.init_engine_config`,
-  :func:`~phyai.utils.cuda.init_cuda`,
-  :func:`~phyai.utils.cuda.init_cublas`,
-  :func:`~phyai.parallel.dist.init_dist`,
-  :func:`phyai.parallel.init`,
-  :func:`phyai.layers.linear.init`) in :meth:`__init__`. Each ``init_*``
-  is independently callable so tests / advanced users can opt into
-  pieces without committing to the full sequence.
-
-Plugin discovery is explicit: this module imports each plugin's
-``main_*`` module at the bottom of the file, which in turn invokes
-``@Engine.register`` at class-definition time. To add a new model,
-add one import line at the bottom of this file.
-"""
+"""Process-level engine for registered model plugins."""
 
 from __future__ import annotations
 
 import abc
-import logging
-from dataclasses import dataclass, replace
-from typing import Any, ClassVar
+import os
+import time
+from concurrent.futures import Future
+from typing import Any, ClassVar, Generator
+from datetime import timedelta
+from contextlib import contextmanager
+from dataclasses import replace, dataclass
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
-import phyai.layers.linear as L
 import phyai.parallel as P
-from phyai.engine_config import EngineConfig, init_engine_config
+from phyai.utils import get_logger
+from phyai.utils.cuda import init_cuda, format_gib, init_cublas, available_memory_bytes
+from phyai.kernel.call import freeze_kernel_choices
+from phyai.layers.attention.utils import release_global_fi_workspaces
+from phyai.kernel.types import ModelContext
+from phyai.engine_config import EngineConfig, ParallelConfig, init_engine_config
+from phyai.parallel.config import DOMAINS, MODEL_DOMAINS
+from phyai.parallel.layout import build_rank_layout
+from phyai.server.deployment import DeploymentConfig, build_dispatcher
+from phyai.server.lifecycle import EngineUnavailableError
 from phyai.parallel.dist import init_dist
+from phyai.utils.logging import configure_logging
+from phyai.utils.env_setup import init_env, set_ulimit, init_process_debug
+from phyai.kernel.bootstrap import reset_kernel_selector, initialize_kernel_system
+from phyai.utils.torch_setup import init_seed, disable_grad, init_threads
 from phyai.runtime.tensor_dump import (
     TensorDumper,
     load_filter_fn,
     register_tensor_dumper,
 )
-from phyai.utils import this_rank_log
-from phyai.utils.cuda import init_cublas, init_cuda
+
+logger = get_logger(__name__)
 
 
-logger = logging.getLogger(__name__)
+def _runtime_replica_world_size(parallel: ParallelConfig) -> int:
+    """Return the physical rank pool for this process or launcher."""
+    launcher_world = os.environ.get("WORLD_SIZE")
+    if dist.is_initialized():
+        actual = dist.get_world_size()
+        if launcher_world is not None and int(launcher_world) != actual:
+            raise ValueError("WORLD_SIZE does not match the initialized process group.")
+        return actual
+    if launcher_world is None:
+        return parallel.infer_replica_world_size()
+    try:
+        world = int(launcher_world)
+    except ValueError as error:
+        raise ValueError("WORLD_SIZE must be an integer launcher value.") from error
+    if world < 1:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world}.")
+    return world
 
 
 def _force_eager_for_dump(cfg: EngineConfig) -> EngineConfig:
-    """Return ``cfg`` with ``use_cuda_graph`` forced off for tensor dumping.
-
-    The forward-hook tensor dumper records module outputs from Python
-    callbacks, which never run during a captured CUDA-graph replay. So
-    activation capture is only possible in eager mode — when a dump
-    directory is configured the engine routes the config through here
-    before building any runner. Returns ``cfg`` unchanged when it is
-    already eager (so the caller can detect whether a flip happened by
-    identity).
-    """
+    """Disable CUDA graphs in ``cfg`` when tensor dumping is enabled."""
     if not cfg.runtime.use_cuda_graph:
         return cfg
     return cfg.replace(runtime=replace(cfg.runtime, use_cuda_graph=False))
 
 
+def _force_eager_without_cuda(cfg: EngineConfig) -> EngineConfig:
+    """Disable CUDA graphs in ``cfg`` when the target is not CUDA."""
+    if not cfg.runtime.use_cuda_graph:
+        return cfg
+    if torch.device(cfg.device.target).type == "cuda":
+        return cfg
+    return cfg.replace(runtime=replace(cfg.runtime, use_cuda_graph=False))
+
+
+def _resolve_engine_config(args: "EngineArgs") -> EngineConfig:
+    """Resolve config without performing CUDA or distributed initialization."""
+    resolved = EngineConfig.from_env(base=args.config)
+    if resolved.runtime.debug_tensor_dump_dir is not None:
+        forced = _force_eager_for_dump(resolved)
+        if forced is not resolved:
+            logger.warning(
+                "Tensor dump enabled (debug_tensor_dump_dir=%s): forcing "
+                "use_cuda_graph=False.",
+                resolved.runtime.debug_tensor_dump_dir,
+            )
+        resolved = forced
+    return _force_eager_without_cuda(resolved)
+
+
 @dataclass
 class EntryArgs:
-    """Base for every plugin's args dataclass.
-
-    Empty on purpose — every field is plugin-specific, declared by the
-    concrete subclass (``PI05Args``, future ``GR00TArgs``, ...). The
-    base exists so :class:`EngineArgs.plugin_args` has a meaningful
-    type annotation and ``isinstance`` checks compose cleanly.
-    """
+    """Base class for plugin argument dataclasses."""
 
 
 class Entry(abc.ABC):
-    """Per-model plugin: build, run, release.
-
-    A subclass must declare two class-level attributes:
-
-    * ``name`` — short ASCII id; used for :attr:`EngineArgs.plugin`
-      lookups and diagnostic strings.
-    * ``args_cls`` — the concrete :class:`EntryArgs` subclass this
-      entry expects in :meth:`setup`. The engine validates the runtime
-      type before dispatching.
-
-    Lifecycle: one :meth:`setup` per engine construction, then
-    arbitrarily many :meth:`step` calls, then one :meth:`close`. The
-    engine holds the entry instance for as long as it lives.
-    """
+    """Interface for a model plugin's setup, inference, and cleanup."""
 
     name: ClassVar[str]
     args_cls: ClassVar[type[EntryArgs]]
+    # Logical parallel domains this plugin actually uses. Empty means
+    # single-rank only, so unsupported topology cannot silently duplicate a
+    # complete model on every rank.
+    parallel_domains: ClassVar[frozenset[str]] = frozenset()
+
+    @classmethod
+    def validate_parallel(
+        cls, parallel: "ParallelConfig", replica_world_size: int | None = None
+    ) -> None:
+        """Reject parallel domains this plugin does not implement.
+
+        Plugins declare the domains they implement through
+        :attr:`parallel_domains` and may override this method to add tighter
+        constraints (calling ``super`` first). Resolution is against the
+        launcher's physical rank pool.
+
+        A multi-rank ``pipeline`` or ``cfg`` dimension must be declared. A
+        model domain the plugin does not declare may only follow a declared
+        one: it stays TP-only and its TP groups have the same members as a
+        declared domain's TP groups, so the plugin's layers see one layout
+        without implementing anything for that domain.
+        """
+        world = (
+            parallel.infer_replica_world_size()
+            if replica_world_size is None
+            else replica_world_size
+        )
+        resolved = parallel.resolve(world)
+        unsupported: dict[str, str] = {}
+        for name, size in (
+            ("pipeline", resolved.outer.pipeline_size),
+            ("cfg", resolved.outer.cfg_size),
+        ):
+            if size > 1 and name not in cls.parallel_domains:
+                unsupported[name] = f"size {size}"
+        if resolved.scope_size > 1:
+            declared = [name for name in MODEL_DOMAINS if name in cls.parallel_domains]
+            if not declared:
+                unsupported["model_scope"] = f"size {resolved.scope_size}"
+            else:
+                layout = build_rank_layout(resolved)
+                declared_tp = {layout.groups_for(f"{name}_tp") for name in declared}
+                for name in MODEL_DOMAINS:
+                    if name in cls.parallel_domains:
+                        continue
+                    if not resolved.domain(name).is_tp_only:
+                        unsupported[name] = "uses more than tensor parallelism"
+                    elif layout.groups_for(f"{name}_tp") not in declared_tp:
+                        unsupported[name] = (
+                            f"tp groups differ from {', '.join(declared)}"
+                        )
+        if unsupported:
+            raise ValueError(
+                f"plugin {cls.name!r} supports parallel domains "
+                f"{sorted(cls.parallel_domains)!r}; unsupported: {unsupported!r}."
+            )
 
     @abc.abstractmethod
     def setup(self, args: EntryArgs) -> None:
@@ -122,68 +170,27 @@ class Entry(abc.ABC):
         return None
 
     def dump_targets(self) -> dict[str, nn.Module]:
-        """Modules to attach the debug tensor dumper to.
-
-        Returns a mapping of *root name* to ``nn.Module``; the engine
-        registers forward hooks on every leaf submodule of each, so each
-        :meth:`step` records that module's activations to disk (see
-        :class:`~phyai.runtime.tensor_dump.TensorDumper`). The root name
-        prefixes every recorded operator key
-        (``{"model": m}`` -> ``model.<...>.o_proj``).
-
-        Default: ``{}`` — the plugin opts out of tensor dumping and the
-        engine simply never builds a dumper. Plugins that want it override
-        this to expose their top-level model module(s). Only consulted
-        when :attr:`RuntimeConfig.debug_tensor_dump_dir` is set; returning
-        an empty mapping while a dump dir is configured is reported once
-        as a warning so a mis-wired plugin doesn't fail silently.
-        """
+        """Return the root modules that should be included in tensor dumps."""
         return {}
 
 
 @dataclass
 class EngineArgs:
-    """Plugin selection + optional engine config override.
-
-    Mandatory fields: which plugin to run and the typed arg bundle the
-    plugin's :meth:`Entry.setup` consumes. Engine-wide defaults
-    (device, dtype, backends, parallelism, runtime knobs) live on
-    :class:`~phyai.engine_config.EngineConfig`.
-
-    ``config`` is used as the *base* the ``PHYAI_*`` env vars overlay on
-    top of: the engine resolves the effective config via
-    :meth:`EngineConfig.from_env(base=config) <EngineConfig.from_env>`,
-    so any set env var overrides the matching field while every unset
-    field carries over from ``config`` verbatim. Leave ``config`` as
-    ``None`` to start from :meth:`EngineConfig.auto` (host-appropriate
-    defaults) before the same env overlay. This means an env var is
-    always honoured — even when an explicit ``config`` is supplied —
-    which is what makes ``PHYAI_*`` usable as a run-time toggle (e.g.
-    flipping on tensor dump for one run without editing the caller).
-    """
+    """Select a plugin and provide its arguments and optional config."""
 
     plugin: str
     plugin_args: EntryArgs
     config: EngineConfig | None = None
 
 
-class Engine:
-    """Thin in-process dispatcher around one registered :class:`Entry`."""
+class EngineCore:
+    """In-process model runtime used by every GPU worker."""
 
     _plugins: ClassVar[dict[str, type[Entry]]] = {}
 
     @classmethod
     def register(cls, entry_cls: type[Entry]) -> type[Entry]:
-        """Register a plugin entry class. Use as a decorator at class definition.
-
-        ::
-
-            @Engine.register
-            class PI05Entry(Entry):
-                name = "pi05"
-                args_cls = PI05Args
-                ...
-        """
+        """Register a plugin entry class and return it unchanged."""
         if not isinstance(entry_cls, type) or not issubclass(entry_cls, Entry):
             raise TypeError(
                 f"Engine.register expected an Entry subclass, got {entry_cls!r}."
@@ -201,6 +208,13 @@ class Engine:
             raise ValueError(
                 f"plugin name {name!r} is already registered to {existing.__name__}."
             )
+        valid_domains = set(DOMAINS)
+        unknown_domains = set(entry_cls.parallel_domains) - valid_domains
+        if unknown_domains:
+            raise ValueError(
+                f"{entry_cls.__name__}.parallel_domains contains unknown domains "
+                f"{sorted(unknown_domains)!r}; valid domains: {sorted(valid_domains)!r}."
+            )
         cls._plugins[name] = entry_cls
         return entry_cls
 
@@ -209,76 +223,19 @@ class Engine:
         """Return all registered plugin names in registration order."""
         return tuple(cls._plugins.keys())
 
+    @classmethod
+    def plugin_class(cls, name: str) -> type[Entry]:
+        """Resolve one preinstalled plugin without importing wire-provided code."""
+        try:
+            return cls._plugins[name]
+        except KeyError as error:
+            raise ValueError(
+                f"unknown plugin {name!r}; registered: {list(cls._plugins)!r}."
+            ) from error
+
     def __init__(self, args: EngineArgs) -> None:
-        # Resolve EngineConfig and seed the process singleton so every
-        # model constructor downstream picks up the requested
-        # device / dtype / backends without explicit plumbing.
-        # ``from_env(base=args.config)`` makes the explicit config the
-        # base and overlays any set ``PHYAI_*`` env var on top, so a
-        # var like PHYAI_DEBUG_TENSOR_DUMP_DIR is honoured even when the
-        # caller passed a config (env = run-time toggle). ``args.config``
-        # is None -> the base falls back to ``auto()`` inside from_env.
-        # When a tensor-dump directory ends up set, force eager *before*
-        # installing the singleton: the dumper's forward hooks can't
-        # fire inside a captured CUDA-graph replay, and the pi05
-        # scheduler reads ``use_cuda_graph`` off this singleton at
-        # setup time, so the flip has to land before any runner builds.
-        resolved = EngineConfig.from_env(base=args.config)
-        self._dump_enabled = resolved.runtime.debug_tensor_dump_dir is not None
-        if self._dump_enabled:
-            forced = _force_eager_for_dump(resolved)
-            if forced is not resolved:
-                this_rank_log(
-                    logger,
-                    logging.WARNING,
-                    "Tensor dump enabled (debug_tensor_dump_dir=%s): forcing "
-                    "use_cuda_graph=False. Forward hooks cannot fire during a "
-                    "captured CUDA-graph replay, so activation capture runs "
-                    "eager-only (slower than the normal graph path).",
-                    resolved.runtime.debug_tensor_dump_dir,
-                )
-            resolved = forced
-        self.config: EngineConfig = init_engine_config(resolved)
-        self._dumper: TensorDumper | None = None
-
-        device_type = torch.device(self.config.device.target).type
-
-        # Per-concern bootstrap. Each ``init_*`` is independently
-        # callable; this method is the only orchestrator. Saved
-        # default dtype is restored in :meth:`close`.
-        self._saved_default_dtype: torch.dtype = init_cuda(
-            self.config.device.target, self.config.device.params_dtype
-        )
-        init_cublas()
-        parallel = self.config.parallel
-        self._owns_pg: bool = init_dist(
-            world_size=parallel.world_size, device_type=device_type
-        )
-
-        # phyai mesh + linear dispatcher. Both are process-level
-        # singletons; building them here means model constructors
-        # don't have to. The mesh is always 6-axis
-        # (dp / cfg / ep / sp / cp / tp); axes the user didn't size stay
-        # at ``1`` and short-circuit through the collective ops without
-        # any process-group traffic, while existing model code that
-        # addresses ``axis="tp"`` keeps working unchanged. ``cfg`` sits
-        # just outside ``tp`` so each CFG-parallel group is a contiguous
-        # tensor-parallel block.
-        P.init(
-            layout=(
-                parallel.dp_size,
-                parallel.cfg_size,
-                parallel.ep_size,
-                parallel.sp_size,
-                parallel.cp_size,
-                parallel.tp_size,
-            ),
-            mesh_dim_names=("dp", "cfg", "ep", "sp", "cp", "tp"),
-            device=device_type,
-        )
-        L.init()
-
-        # Resolve the requested plugin and validate the args bundle.
+        # Resolve the plugin contract before touching CUDA or distributed state.
+        # Invalid public arguments should fail without allocating a process group.
         entry_cls = self._plugins.get(args.plugin)
         if entry_cls is None:
             raise ValueError(
@@ -290,33 +247,136 @@ class Engine:
                 f"{entry_cls.args_cls.__name__}; got "
                 f"{type(args.plugin_args).__name__}."
             )
-
-        # Instantiate the entry and run setup. The entry owns its
-        # model / scheduler / runners from this point on.
         self.args = args
-        self.entry: Entry = entry_cls()
-        self.entry.setup(args.plugin_args)
+        self.entry: Entry | None = None
+        self._owns_pg = False
+        self._closed = False
 
-        # If tensor dumping is on, attach the dumper to the modules the
-        # plugin exposes. Built after setup() so the model + weights are
-        # fully constructed; the runners were already forced eager in
-        # step 1, so the leaf forward hooks will actually fire.
+        # 1. Resolve the effective engine configuration.
+        resolved = _resolve_engine_config(args)
+        world_size = _runtime_replica_world_size(resolved.parallel)
+        entry_cls.validate_parallel(resolved.parallel, world_size)
+        self._dump_enabled = resolved.runtime.debug_tensor_dump_dir is not None
+        if self._dump_enabled:
+            forced = _force_eager_for_dump(resolved)
+            if forced is not resolved:
+                logger.warning_rank0(
+                    "Forward hooks cannot fire during CUDA-graph replay; "
+                    "activation capture runs eager-only."
+                )
+            resolved = forced
+        resolved = _force_eager_without_cuda(resolved)
+
+        device_type = torch.device(resolved.device.target).type
+
+        # 2. Initialize logging and the process environment.
+        configure_logging()
+        init_env(world_size=world_size, device_type=device_type)
+        set_ulimit()
+        init_process_debug()
+
+        self.config: EngineConfig = init_engine_config(resolved)
+        self._replica_world_size = world_size
+        self._dumper: TensorDumper | None = None
+        self._t_start = time.perf_counter()
+
+        # 3. Initialize PyTorch process state.
+        with self._stage("torch_setup"):
+            init_threads(
+                device_type=device_type, num_threads=self.config.runtime.num_threads
+            )
+            init_seed(self.config.runtime.seed)
+            disable_grad()
+
+        # 4. Initialize CUDA and cuBLAS.
+        with self._stage("cuda"):
+            init_cuda(self.config.device.target, self.config.device.params_dtype)
+            init_cublas()
+
+        # 5. Initialize the distributed process group.
+        with self._stage("dist"):
+            self._owns_pg: bool = init_dist(
+                world_size=world_size,
+                device_type=device_type,
+                timeout=timedelta(seconds=self.config.runtime.dist_timeout_s),
+                require_launcher=world_size > 1,
+                device=self.config.device.target,
+            )
+
+        # 6. Initialize the parallel groups and warm their communicators.
+        with self._stage("mesh"):
+            mesh = P.init(
+                self.config.parallel,
+                replica_world_size=world_size,
+                device=device_type,
+            )
+
+        process_title = f"phyai::{args.plugin}"
+        for group in mesh.distinct_groups():
+            process_title += f"_{group.upper()}{mesh.group_rank(group)}"
+        init_process_debug(title=process_title)
+
+        if world_size > 1:
+            # Create communicators before any graph capture.
+            with self._stage("collectives_warmup"):
+                warmed = P.warmup_collectives()
+            if warmed:
+                logger.info_rank0("warmed collectives on groups %s", warmed)
+
+        # 7. Initialize kernel selection.
+        with self._stage("kernel"):
+            self.kernel_selector = initialize_kernel_system(
+                self.config.kernel,
+                device=self.config.device.target,
+                model=ModelContext(family=args.plugin),
+            )
+
+        # 8. Initialize the selected model plugin.
+        self.entry = entry_cls()
+        with self._stage("plugin_setup"):
+            self.entry.setup(args.plugin_args)
+
+        # 9. Finalize kernel choices and attach debugging hooks.
+        if self.config.runtime.freeze_kernel_choices:
+            freeze_kernel_choices()
+
         if self._dump_enabled:
             self._dumper = self._build_dumper()
 
-    def _build_dumper(self) -> TensorDumper | None:
-        """Construct the tensor dumper from the entry's dump targets.
+        free_now = available_memory_bytes(self.config.device.target)
+        logger.info_rank0(
+            "Engine ready (plugin=%s). total=%.2fs free=%s GiB",
+            args.plugin,
+            time.perf_counter() - self._t_start,
+            format_gib(free_now),
+        )
 
-        Returns ``None`` (and warns) when the plugin exposes no dump
-        targets, so a mis-wired plugin surfaces loudly instead of
-        silently recording nothing.
-        """
+    @contextmanager
+    def _stage(self, name: str) -> Generator[None]:
+        """Time a bootstrap stage and log its device-memory change."""
+        free_before = available_memory_bytes(self.config.device.target)
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - t0
+            free_after = available_memory_bytes(self.config.device.target)
+            logger.info_rank0(
+                "init stage=%s elapsed=%.2fs used=%s GiB free=%s GiB",
+                name,
+                elapsed,
+                format_gib(max(0, free_before - free_after)),
+                format_gib(free_after),
+            )
+
+    def _build_dumper(self) -> TensorDumper | None:
+        """Build a tensor dumper from the plugin's dump targets."""
+        if self.entry is None:
+            raise RuntimeError("cannot build a tensor dumper before plugin setup.")
         runtime = self.config.runtime
         targets = self.entry.dump_targets()
         if not targets:
-            this_rank_log(
-                logger,
-                logging.WARNING,
+            logger.warning_rank0(
                 "Tensor dump is enabled but plugin %r exposes no dump_targets(); "
                 "nothing will be recorded. Override Entry.dump_targets() to return "
                 "the model module(s) to capture.",
@@ -331,77 +391,218 @@ class Engine:
         )
 
     def _resolve_dump_filter(self):
-        """Turn the two runtime dump-filter knobs into a single filter spec.
-
-        ``debug_tensor_dump_filter_fn`` (a ``"module:func"`` path) wins and
-        is resolved to a callable; otherwise the regex tuple
-        ``debug_tensor_dump_filter`` (or ``None`` -> record everything) is
-        passed through. The two are already validated mutually exclusive on
-        :class:`~phyai.engine_config.RuntimeConfig`.
-        """
+        """Resolve the configured tensor-dump filter."""
         runtime = self.config.runtime
         if runtime.debug_tensor_dump_filter_fn is not None:
             return load_filter_fn(runtime.debug_tensor_dump_filter_fn)
         return runtime.debug_tensor_dump_filter
 
     def step(self, request: Any) -> Any:
-        """Run one inference round; forwards to the registered entry.
-
-        When tensor dumping is active, the activations recorded during
-        this round are flushed to a single ``pass{N}.pt`` file once the
-        entry returns.
-        """
+        """Run one inference round and flush tensor dumps when enabled."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed EngineCore.")
+        if self.entry is None:
+            raise RuntimeError("EngineCore plugin has not been initialized.")
         result = self.entry.step(request)
         if self._dumper is not None:
             self._dumper.flush_pass()
         return result
 
     def close(self) -> None:
-        """Release the plugin entry's resources, then tear down distributed
-        state if the engine was the one to bring it up."""
+        """Release plugin resources and process-level runtime services."""
+        if self._closed:
+            return
+        self._closed = True
+        close_error: BaseException | None = None
         if self._dumper is not None:
-            self._dumper.detach()
+            try:
+                self._dumper.detach()
+            except BaseException as error:
+                close_error = error
             self._dumper = None
-        self.entry.close()
-        if self._owns_pg and dist.is_initialized():
-            dist.destroy_process_group()
+        if self.entry is not None:
+            try:
+                self.entry.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            self.entry = None
+        try:
+            # Release the collective backends P.init built (direct NCCL
+            # communicators, bootstrap groups, the mesh/dispatcher
+            # singletons) before the torch process group goes away.
+            # Single-rank engines register nothing that needs releasing and
+            # may share a process with sibling engines, so they leave the
+            # process-level registry alone.
+            if self._replica_world_size > 1:
+                P.shutdown()
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        try:
+            if self._owns_pg and dist.is_initialized():
+                dist.destroy_process_group()
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        finally:
             self._owns_pg = False
-        torch.set_default_dtype(self._saved_default_dtype)
+            try:
+                reset_kernel_selector()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+            try:
+                release_global_fi_workspaces()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is not None:
+            raise close_error
+
+
+class Engine:
+    """Public facade over inline, managed, distributed, and external execution."""
+
+    _plugins: ClassVar[dict[str, type[Entry]]] = EngineCore._plugins
+
+    @classmethod
+    def register(cls, entry_cls: type[Entry]) -> type[Entry]:
+        """Register a model plugin for both the facade and EngineCore."""
+        return EngineCore.register(entry_cls)
+
+    @classmethod
+    def registered(cls) -> tuple[str, ...]:
+        """Return registered model plugin names in registration order."""
+        return EngineCore.registered()
+
+    def __init__(
+        self,
+        args: EngineArgs,
+        *,
+        deployment: DeploymentConfig | None = None,
+    ) -> None:
+        if not isinstance(args, EngineArgs):
+            raise TypeError(f"Engine expects EngineArgs, got {type(args).__name__}.")
+        if deployment is not None and not isinstance(deployment, DeploymentConfig):
+            raise TypeError(
+                "deployment must be a DeploymentConfig, got "
+                f"{type(deployment).__name__}."
+            )
+        deployment_config = deployment or DeploymentConfig()
+        resolved = _resolve_engine_config(args)
+        resolved_args = replace(args, config=resolved)
+        entry_cls = self._plugins.get(args.plugin)
+        if entry_cls is None:
+            raise ValueError(
+                f"unknown plugin {args.plugin!r}; registered: {list(self._plugins)!r}."
+            )
+        if not isinstance(args.plugin_args, entry_cls.args_cls):
+            raise TypeError(
+                f"plugin {entry_cls.name!r} expects "
+                f"{entry_cls.args_cls.__name__}; got "
+                f"{type(args.plugin_args).__name__}."
+            )
+        world_size = _runtime_replica_world_size(resolved.parallel)
+        entry_cls.validate_parallel(resolved.parallel, world_size)
+        if not 0 <= deployment_config.output_rank < world_size:
+            raise ValueError(
+                f"output_rank={deployment_config.output_rank} is outside the model "
+                f"replica world_size={world_size}."
+            )
+        self.args = resolved_args
+        self.config = resolved
+        self.deployment = deployment_config
+        self._closed = False
+        self._mode, self._dispatcher = build_dispatcher(
+            EngineCore,
+            resolved_args,
+            world_size,
+            deployment_config,
+        )
+        self._core = self._dispatcher.core
+        if deployment_config.auto_start:
+            try:
+                self._dispatcher.setup()
+            except BaseException:
+                self._dispatcher.close()
+                raise
+
+    @property
+    def entry(self) -> Entry | None:
+        """Return the local plugin entry, or ``None`` for managed parents."""
+        return None if self._core is None else self._core.entry
+
+    @property
+    def mode(self) -> str:
+        """Return the resolved execution mode: inline, local, or external."""
+        return self._mode
+
+    def step(self, request: Any) -> Any:
+        """Run one request synchronously through the selected backend."""
+        if self._closed:
+            raise EngineUnavailableError("cannot execute on a closed Engine.")
+        return self._dispatcher.step(request)
+
+    def setup(self) -> None:
+        """Ensure a managed worker group is started; inline engines are ready."""
+        if self._closed:
+            raise EngineUnavailableError("cannot set up a closed Engine.")
+        self._dispatcher.setup()
+
+    def submit(self, request: Any) -> Future[Any]:
+        """Submit a request and return a backend-independent Future.
+
+        On the inline backend a queued (not yet started) request can still be
+        cancelled through ``Future.cancel()``; managed backends dispatch to
+        worker pipes immediately, so their futures are never cancellable.
+        """
+        if self._closed:
+            future: Future[Any] = Future()
+            future.set_exception(
+                EngineUnavailableError("cannot execute on a closed Engine.")
+            )
+            return future
+        return self._dispatcher.submit(request)
+
+    def close(self) -> None:
+        """Close the selected backend exactly once."""
+        if self._closed:
+            return
+        self._closed = True
+        self._dispatcher.close()
+
+    def __enter__(self) -> "Engine":
+        self.setup()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
 
 __all__ = [
     "EngineArgs",
     "Engine",
+    "DeploymentConfig",
+    "EngineUnavailableError",
     "Entry",
     "EntryArgs",
 ]
 
 
-# ---------------------------------------------------------------------- #
-# Plugin discovery — explicit imports at module bottom.                  #
-#                                                                        #
-# Each ``main_*`` module decorates its Entry subclass with               #
-# ``@Engine.register``; importing the module triggers registration.      #
-# Add one import line per new model. Imports go at the bottom because    #
-# plugin modules ``from phyai.engine import Engine, Entry, EntryArgs``;  #
-# this module's symbols must be defined first.                           #
-# ---------------------------------------------------------------------- #
+# Import plugin modules after defining Engine so their decorators register
+# each Entry subclass. Add new plugin imports here.
 
 from phyai.models.pi0 import main_pi0 as _main_pi0  # noqa: E402, F401
 from phyai.models.pi05 import main_pi05 as _main_pi05  # noqa: E402, F401
-from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
-from phyai.models.pi05 import main_pi05_wn as _main_pi05_wn  # noqa: E402, F401
-from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
-    main_minicpm_gr00t as _main_minicpm_gr00t,
-)
-from phyai.models.lingbot_v2 import (  # noqa: E402, F401
-    main_lingbotv2 as _main_lingbotv2,
-)
 from phyai.models.cosmos3 import main_cosmos3 as _main_cosmos3  # noqa: E402, F401
 from phyai.models.cosmos3 import (  # noqa: E402, F401
     main_cosmos3_policy as _main_cosmos3_policy,
 )
-from phyai.models.cosmos3 import main_cosmos3_wn as _main_cosmos3_wn  # noqa: E402, F401
-from phyai.models.cosmos3 import (  # noqa: E402, F401
-    main_cosmos3_policy_wn as _main_cosmos3_policy_wn,
+from phyai.models.gr00t_n17 import main_gr00t_n17 as _main_gr00t_n17  # noqa: E402, F401
+from phyai.models.minicpm_gr00t import (  # noqa: E402, F401
+    main_minicpm_gr00t as _main_minicpm_gr00t,
 )
+from phyai.models.lingbot_v2 import (
+    main_lingbotv2 as _main_lingbotv2,
+)  # noqa: E402, F401

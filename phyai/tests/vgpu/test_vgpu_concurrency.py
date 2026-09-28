@@ -16,12 +16,6 @@ import torch
 import phyai.vgpu as V
 
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="phyai.vgpu requires CUDA",
-)
-
-
 def _flashinfer_available() -> bool:
     try:
         import flashinfer.green_ctx  # noqa: F401

@@ -113,3 +113,6 @@ profile/
 # For some OpenCode agents
 docs/compose/
 .mimocode/
+
+# npm
+node_modules/

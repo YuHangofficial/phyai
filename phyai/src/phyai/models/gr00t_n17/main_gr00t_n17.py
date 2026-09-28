@@ -13,9 +13,9 @@ from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config
 from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
 from phyai.models.gr00t_n17.modeling_gr00t_n17 import GR00TN17Model
-from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import (
+from phyai.models.gr00t_n17.scheduler_gr00t_n17 import (
     GR00TN17Request,
-    GR00TN17WS1Scheduler,
+    GR00TN17Scheduler,
 )
 from phyai.utils import load_config
 from phyai.weights import load_pretrained
@@ -109,7 +109,7 @@ class GR00TN17Entry(Entry):
 
     def __init__(self) -> None:
         self.model: GR00TN17Model | None = None
-        self.scheduler: GR00TN17WS1Scheduler | None = None
+        self.scheduler: GR00TN17Scheduler | None = None
 
     def setup(self, args: EntryArgs) -> None:
         if not isinstance(args, GR00TN17Args):
@@ -138,7 +138,7 @@ class GR00TN17Entry(Entry):
                 strict=args.weight_strict,
             )
 
-        self.scheduler = GR00TN17WS1Scheduler(
+        self.scheduler = GR00TN17Scheduler(
             self.model,
             max_batch_size=args.max_batch_size,
             device=eng.device.target,

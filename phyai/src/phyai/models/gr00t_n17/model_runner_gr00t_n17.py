@@ -14,10 +14,8 @@ from types import SimpleNamespace
 
 import torch
 
-from phyai.layers.attention.utils import (
-    get_global_fi_workspace,
-    resolve_prefill_backend,
-)
+from phyai.kernel.types import KernelMode
+from phyai.layers.attention.enums import AttnLayout
 from phyai.models.gr00t_n17.modeling_gr00t_n17 import (
     GR00TN17ActionInput,
     GR00TN17BackboneOutput,
@@ -218,41 +216,39 @@ class GR00TN17BackboneRunner(ModelRunner):
         return None if plan is None else plan[2]
 
     def _make_vision_graph_state(self, cu_seqlens: torch.Tensor) -> tuple:
-        from flashinfer.prefill import BatchPrefillWithRaggedKVCacheWrapper
-
+        # The catalog owns backend selection and plan construction. Build the
+        # same ragged context the vision layer would create on its first call,
+        # but in capture mode so capability and policy can distinguish graph
+        # execution. The dummy Q/K/V only describe the static shape; they are
+        # never passed to a kernel.
         qwen_model = self.model.backbone.qwen3vl_model.model
         visual = qwen_model.visual
-        workspace = get_global_fi_workspace(cu_seqlens.device)
-        wrappers = []
+        total_tokens = int(cu_seqlens[-1].item())
+        contexts = []
         for block in visual.blocks:
             layer = block.attn.attn
-            qo_indptr_buf = torch.empty_like(cu_seqlens, dtype=torch.int32)
-            kv_indptr_buf = torch.empty_like(cu_seqlens, dtype=torch.int32)
-            wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                workspace,
-                "NHD",
-                use_cuda_graph=True,
-                qo_indptr_buf=qo_indptr_buf,
-                kv_indptr_buf=kv_indptr_buf,
-                backend=resolve_prefill_backend(),
+            dummy_q = torch.empty(
+                (total_tokens, layer.num_heads, layer.head_dim),
+                dtype=visual.dtype,
+                device=cu_seqlens.device,
             )
-            wrapper.plan(
-                cu_seqlens.to(torch.int32),
-                cu_seqlens.to(torch.int32),
-                num_qo_heads=layer.num_heads,
-                num_kv_heads=layer.num_kv_heads,
-                head_dim_qk=layer.head_dim,
-                causal=layer.causal,
-                sm_scale=layer.scale,
-                window_left=(
-                    -1 if layer.sliding_window is None else layer.sliding_window - 1
-                ),
-                logits_soft_cap=layer.logits_soft_cap,
-                q_data_type=visual.dtype,
-                kv_data_type=visual.dtype,
+            dummy_kv = torch.empty(
+                (total_tokens, layer.num_kv_heads, layer.head_dim),
+                dtype=visual.dtype,
+                device=cu_seqlens.device,
             )
-            wrappers.append(wrapper)
-        return tuple(wrappers)
+            contexts.append(
+                layer._build_default_ctx(
+                    dummy_q,
+                    dummy_kv,
+                    dummy_kv,
+                    AttnLayout.RAGGED_3D,
+                    cu_seqlens,
+                    cu_seqlens,
+                    mode=KernelMode.CAPTURE,
+                )
+            )
+        return tuple(contexts)
 
     @staticmethod
     def _run_vision_attention_with_wrapper(
@@ -271,7 +267,10 @@ class GR00TN17BackboneRunner(ModelRunner):
         )
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-        out = wrapper.run(q, k, v)
+        if hasattr(wrapper, "backend") and hasattr(wrapper, "plan"):
+            out = wrapper.backend.forward(attn.attn, q, k, v, wrapper)
+        else:
+            out = wrapper.run(q, k, v)
         out = out.reshape(seq_length, -1)
         out, _ = attn.proj(out)
         return out
@@ -424,19 +423,6 @@ class GR00TN17BackboneRunner(ModelRunner):
 class GR00TN17ActionHeadRunner(ModelRunner):
     """Runs action denoising with the backbone's bucketed graph shapes."""
 
-    @staticmethod
-    def _supports_cuda_graph_attention(model: GR00TN17Model) -> bool:
-        action_config = model.action_head.config
-        if action_config.dit.attention_backend == "flashinfer":
-            return False
-        vl_self_attention = action_config.vl_self_attention
-        if (
-            vl_self_attention is not None
-            and vl_self_attention.attention_backend == "flashinfer"
-        ):
-            return False
-        return True
-
     def __init__(
         self,
         model: GR00TN17Model,
@@ -450,11 +436,7 @@ class GR00TN17ActionHeadRunner(ModelRunner):
         self.device = (
             torch.device(device) if device is not None else torch.device("cpu")
         )
-        self.use_cuda_graph = (
-            bool(use_cuda_graph)
-            and self.device.type == "cuda"
-            and self._supports_cuda_graph_attention(model)
-        )
+        self.use_cuda_graph = bool(use_cuda_graph) and self.device.type == "cuda"
         self.graphs = CudaGraphRegistry()
         self._step_timesteps: torch.Tensor | None = None
         self._action_position_ids: torch.Tensor | None = None

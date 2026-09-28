@@ -18,12 +18,17 @@ import torch
 import torch.nn as nn
 
 from phyai.layers.quant.base import AllocationRequest
+from phyai.kernel.types import PhysicalSignature
 
 
 @dataclass
 class Bf16Spec:
     spec_id: str = "bf16"
     weight_dtype: torch.dtype = torch.bfloat16
+
+    @property
+    def physical_signature(self) -> PhysicalSignature:
+        return PhysicalSignature(format="bf16", storage_dtype="bf16")
 
     def allocate(self, layer: nn.Module, request: AllocationRequest) -> None:
         layer.weight = nn.Parameter(

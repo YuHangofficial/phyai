@@ -28,6 +28,7 @@ import torch.nn as nn
 from phyai.layers.quant.base import AllocationRequest
 from phyai.layers.quant.granularity import Granularity
 from phyai.layers.quant.linear import ActivationView
+from phyai.kernel.types import PhysicalSignature
 
 
 _FP8_E4M3_AMAX = 448.0
@@ -53,6 +54,16 @@ class Fp8Spec:
     def __post_init__(self) -> None:
         if self.granularity == Granularity.BLOCK and self.block_shape is None:
             raise ValueError("Fp8Spec(granularity=BLOCK) requires block_shape")
+
+    @property
+    def physical_signature(self) -> PhysicalSignature:
+        return PhysicalSignature(
+            format="fp8_e4m3",
+            granularity=self.granularity.value,
+            block_shape=self.block_shape,
+            scale_dtype="fp32",
+            storage_dtype="fp8_e4m3",
+        )
 
     @property
     def spec_id(self) -> str:

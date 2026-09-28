@@ -16,7 +16,6 @@ from phyai.layers.attention.gdn.base import (
     GatedDeltaNetMetadata,
     GatedDeltaNetPlanHandle,
 )
-from phyai.layers.attention.gdn.registry import register_backend
 
 
 def _load_prefill_op() -> Callable[..., Any]:
@@ -37,9 +36,18 @@ def _check_supported_device(x: torch.Tensor) -> None:
     major, minor = torch.cuda.get_device_capability(x.device)
     if major not in (9, 10):
         raise RuntimeError(
-            "FlashInfer 0.6.12 GDN supports SM90/SM100 devices; "
+            "FlashInfer 0.6.x GDN supports SM90/SM100 devices; "
             f"got compute capability {major}.{minor}."
         )
+
+
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    """QK L2 normalization, matching the FLA convention."""
+    promoted = x.float()
+    normalized = promoted * torch.rsqrt(
+        promoted.square().sum(dim=-1, keepdim=True) + 1e-6
+    )
+    return normalized.to(x.dtype)
 
 
 def _check_input_dtypes(
@@ -73,9 +81,10 @@ class FlashInferGatedDeltaNetPlan(GatedDeltaNetPlanHandle):
     """FlashInfer GDN needs no separate planning object."""
 
 
-@register_backend("flashinfer")
 class FlashInferGatedDeltaNetBackend(GatedDeltaNetBackend):
     """Route GDN prefill and decode through FlashInfer."""
+
+    name = "flashinfer"
 
     def __init__(self, runner=None) -> None:
         del runner
@@ -137,8 +146,19 @@ class FlashInferGatedDeltaNetBackend(GatedDeltaNetBackend):
         a_flat = a.reshape(-1, layer.num_state_heads)
         b_flat = b.reshape(-1, layer.num_state_heads)
 
-        g = -a_log.exp().unsqueeze(0) * F.softplus(a_flat.float() + dt_bias.float())
+        # The prefill kernel takes the forget gate in linear space -- it
+        # computes log2f(alpha) internally, so a log-space gate turns into
+        # log(negative) = NaN on the very first token.
+        decay = torch.exp(
+            -a_log.exp().unsqueeze(0) * F.softplus(a_flat.float() + dt_bias.float())
+        )
         beta = b_flat.float().sigmoid()
+        if layer.use_qk_l2norm:
+            # ``use_qk_l2norm_in_kernel`` mis-executes on SM90 (a no-op within
+            # one chunk, NaN across chunk boundaries, in 0.6.12 through
+            # 0.6.17), so normalize here and keep the kernel flag off.
+            q_flat = _l2norm(q_flat)
+            k_flat = _l2norm(k_flat)
         output = None
         if ctx.output is not None:
             output = ctx.output.reshape(-1, layer.num_state_heads, layer.head_dim)
@@ -147,13 +167,13 @@ class FlashInferGatedDeltaNetBackend(GatedDeltaNetBackend):
             q_flat,
             k_flat,
             v_flat,
-            g=g,
+            g=decay,
             beta=beta,
             scale=layer.scale,
             initial_state=ctx.state,
             output_final_state=ctx.output_state is not None,
             cu_seqlens=ctx.cu_seqlens,
-            use_qk_l2norm_in_kernel=layer.use_qk_l2norm,
+            use_qk_l2norm_in_kernel=False,
             output=output,
             output_state=ctx.output_state,
         )

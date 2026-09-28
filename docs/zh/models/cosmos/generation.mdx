@@ -1,0 +1,433 @@
+---
+title: "Cosmos3 生成模式"
+description: "使用同一个插件在单卡或多卡上运行 Cosmos3 T2V 与 T2AV"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano"
+  subtitle="Text-to-Video / Text-to-Audio-Video · 单卡或多卡"
+  icon="C"
+  rows={{
+    "模型类型": "World Foundation Model",
+    "权重": <a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano</a>,
+    "路径": ["T2V", "T2AV"],
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3T2VScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3</code>,
+    "采样器": "UniPC",
+    "默认尺寸": "720×1280 · 189 frames · 35 steps",
+    "参数精度": "bf16"
+  }}
+/>
+
+# 概述
+
+Cosmos3 的生成路径把一句话变成一段视频。打开 sound stream，同一次去噪还会写出一条跟着画面走的音轨。T2V 只出视频；T2AV 让视频 latent 和 sound latent 在同一条时间轴上一起推进，画面从噪声里慢慢显影，声音在旁边同步成形。
+
+一个 `cosmos3` 插件同时覆盖两条路径和两种机器规模。默认 `cfg_size=tp_size=1`，引擎就在你的进程里 inline 运行。加上 `--cfg 2` 或 `--tp N`，它改为在前几张可见 GPU 上给每个 rank 起一个 worker；请求和输出都不变。
+
+<Warning>
+  这条路径以正确和对齐参考实现为先，不以速度为先。去噪循环是 Python 层的 UniPC 循环，CUDA graph 关闭，也还没有专用 kernel 和 batching。手头测到的任何耗时都请当作基线。
+</Warning>
+
+# 架构
+
+这条路径沿用 PhyAI 一贯的 <Tooltip headline="Engine + plugin" tip="Engine 根据 plugin 名称解析 Entry；Entry.setup() 负责构造模型、加载权重并准备 scheduler；Entry.step() 接收 canonical request 并返回模型输出。">Engine + plugin 契约</Tooltip>。插件内部把工作拆成几块：
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/cosmos3" defaultOpen>
+    <Tree.File name="main_cosmos3.py" />
+    <Tree.File name="scheduler_cosmos3.py" />
+    <Tree.File name="model_runner_cosmos3.py" />
+    <Tree.File name="model_runner_vae_cosmos3.py" />
+    <Tree.File name="modeling_cosmos3.py" />
+    <Tree.File name="vae_wan.py" />
+    <Tree.File name="avae_sound.py" />
+    <Tree.File name="sampler_unipc.py" />
+    <Tree.File name="configuration_cosmos3.py" />
+  </Tree.Folder>
+</Tree>
+
+| 组件 | 职责 |
+| --- | --- |
+| `Cosmos3Entry` | 读取 `Cosmos3Args`；加载 transformer、VAE，开声音时再加载 AVAE |
+| `Cosmos3T2VScheduler` | 驱动去噪循环和 UniPC 采样器；结束时解码视频和声音 |
+| `Cosmos3T2VRunner` | 调用 transformer，缓存与时间步无关的文本条件 |
+| `Cosmos3VAERunner` | 把视频 latent 变成 `[0, 1]` 范围的像素 |
+| `Cosmos3SoundVAERunner` | 把声音 latent 变成 `[-1, 1]` 范围的波形 |
+| `Cosmos3Processor` | 在引擎外做 prompt 分词并追加 prompt 元数据 |
+| `Cosmos3GenerationPostProcessor` | 在引擎外把结果搬到 CPU 并写出 mp4 |
+
+# 运行路径
+
+<Steps>
+  <Step title="准备权重">
+    下载 <a href="https://huggingface.co/nvidia/Cosmos3-Nano" target="_blank" rel="noreferrer">Cosmos3-Nano</a>。示例假设目录长这样：
+
+    ```text
+    /path/to/Cosmos3-Nano/
+      transformer/
+      vae/
+      text_tokenizer/
+      sound_tokenizer/   # T2AV 需要
+      scheduler/
+    ```
+  </Step>
+
+  <Step title="构造 Engine">
+    T2V 需要 transformer 和 VAE。T2AV 还要从 `sound_tokenizer` 加载 AVAE，`load_sound=True` 要的就是它。
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano"
+    with_sound = False
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3",
+            plugin_args=Cosmos3Args(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=False,
+                load_sound=(True if with_sound else None),
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+
+    `flow_shift=10.0` 配 `use_karras_sigmas=False` 是原生的 linear-flow UniPC 调度，示例脚本用的也是这组值。
+  </Step>
+
+  <Step title="Tokenize prompt">
+    scheduler 不碰原始文本。`Cosmos3Processor` 套上 chat template，追加 `eos` 和 `<|vision_start|>`，返回正负 prompt 的 token id。
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3Processor
+
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=24.0,
+        num_frames=189,
+        height=720,
+        width=1280,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device="cuda",
+    )
+    ```
+
+    `negative_prompt=None` 用的是 Cosmos3 内置的结构化负向 prompt；想留空就传 `""`。
+  </Step>
+
+  <Step title="构造请求">
+    `Cosmos3T2VRequest` 装着分词后的条件、latent grid 和采样设置。
+
+    | 字段 | Shape / 类型 | 备注 |
+    | --- | --- | --- |
+    | `text_ids` / `text_mask` | `(1, S)` int64 | 正向 prompt |
+    | `neg_text_ids` / `neg_text_mask` | `(1, S_neg)` int64 | 负向 prompt |
+    | `video_shape` | `(t_lat, h_lat, w_lat)` | latent grid，不是像素 |
+    | `fps` | `float` | 帧率；也会写进 prompt 元数据 |
+    | `num_inference_steps` | `int` | UniPC 步数，示例里是 `35` |
+    | `guidance_scale` | `float` | CFG scale，示例里是 `6.0` |
+    | `seed` | `int` | 初始视频和声音噪声的种子 |
+    | `sound_frames` | `int` 或 `None` | 只要不是 `None` 就开启 T2AV |
+
+    ```python
+    import math
+
+    from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+
+    num_frames = 189
+    height = 720
+    width = 1280
+    fps = 24.0
+    with_sound = False
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+    ```
+
+    `pixel_to_latent_shape` 按 VAE 压缩比把像素尺寸换成 latent grid：时间维除 `4`，空间两维各除 `16`。
+  </Step>
+
+  <Step title="运行生成">
+    ```python
+    output = engine.step(request)
+    ```
+
+    T2V 返回 `(B, 3, T, H, W)` 的像素张量，范围 `[0, 1]`。T2AV 返回一个 dict：
+
+    ```python
+    {
+        "video": pixels,
+        "sound": waveform,
+        "sample_rate": sample_rate,
+    }
+    ```
+  </Step>
+
+  <Step title="保存媒体">
+    postprocessor 把结果搬到 CPU，把帧转成 uint8 RGB，有音频时把波形一起 mux 进同一个 mp4。
+
+    ```python
+    from phyai_utils_tools.models.cosmos3 import Cosmos3GenerationPostProcessor
+
+    postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+    media = postprocessor.postprocess(output)
+    postprocessor.save_mp4(media, ".cache/cosmos3_t2v.mp4")
+    ```
+  </Step>
+</Steps>
+
+# 端到端示例
+
+`examples/cosmos3/run_cosmos3.py` 把这些步骤串成了一条命令。最普通的 T2V：
+
+```bash
+uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "A red sports car driving along a coastal road at sunset." \
+    --out .cache/cosmos3_t2v
+```
+
+加上 CFG 和 tensor parallel，同一个脚本就能铺到八张卡上。8 个 rank 要 8 张可见 GPU，在启动进程上先选好：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --cfg 2 \
+    --tp 4 \
+    --out .cache/cosmos3_parallel
+```
+
+加 `--sound` 就是 T2AV。声音流会加载 AVAE，并且每一步多推进一条 latent，显存和耗时都会上去：
+
+```bash
+uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --prompt "ocean waves crashing on rocks" \
+    --sound \
+    --out .cache/cosmos3_t2av
+```
+
+默认是 `720×1280`、`189` 帧、`35` 步，要跑一阵子。第一次冒烟测试先把尺寸缩小：
+
+```bash
+uv run python examples/cosmos3/run_cosmos3.py \
+    --checkpoint /path/to/Cosmos3-Nano \
+    --num-frames 49 \
+    --height 480 \
+    --width 832 \
+    --steps 10 \
+    --out .cache/cosmos3_smoke
+```
+
+脚本会打印 `model_load`、`preprocess`、`inference`、`to_cpu`、`encode` 五段耗时。`inference` 包含去噪循环和 VAE 解码，`encode` 是 PyAV 写文件的时间。
+
+# 多卡运行
+
+起作用的是 `ParallelConfig` 里的两个字段。`cfg_size=2` 让 conditional 和 unconditional 两个分支并排跑在两个 rank group 上，而不是在一张卡上一前一后。`tp_size=N` 把每个分支里的 transformer 切到 `N` 个 rank 上。每个 rank 是一个 worker 进程，所以一次运行要 `cfg_size * tp_size` 张卡，按可见顺序依次占用。
+
+和 inline 片段相比，改动不多。`EngineConfig` 多一个 `parallel`。请求张量建在 CPU 上，因为 GPU 归 worker，请求要跨进程传过去。引擎挪到 `if __name__ == "__main__":` 后面：worker 用 `spawn` 启动，会重新 import 主模块，没有这层保护，每个 worker 都会试着再建一个引擎。`deployment` 参数依旧可选，这里只是给 worker 多留一点加载权重的时间。
+
+```python
+import torch
+
+from phyai import DeploymentConfig, Engine, EngineArgs
+from phyai.engine_config import (
+    AttentionParallelConfig,
+    DenseParallelConfig,
+    DeviceConfig,
+    EngineConfig,
+    OuterParallelConfig,
+    ParallelConfig,
+    RuntimeConfig,
+)
+from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+from phyai.server import WorkerSupervisorConfig
+from phyai_utils_tools.models.cosmos3 import (
+    Cosmos3GenerationPostProcessor,
+    Cosmos3Processor,
+)
+
+checkpoint_dir = "/path/to/Cosmos3-Nano"
+cfg_size = 2  # cond and uncond branches on two rank groups
+tp_size = 4  # transformer tensor parallelism inside each branch
+num_frames = 189
+height = 720
+width = 1280
+fps = 24.0
+
+
+def main() -> None:
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3",
+            plugin_args=Cosmos3Args(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=False,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                parallel=ParallelConfig(
+                    outer=OuterParallelConfig(cfg_size=cfg_size),
+                    dense=DenseParallelConfig(tp_size=tp_size),
+                    attention=AttentionParallelConfig(tp_size=tp_size),
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        ),
+        # Optional. Without it the engine still spawns workers; this only
+        # gives them longer to load the checkpoint.
+        deployment=DeploymentConfig(
+            process_config=WorkerSupervisorConfig(startup_timeout_s=1800.0),
+        ),
+    )
+    assert engine.mode == "local"
+
+    try:
+        processor = Cosmos3Processor(
+            f"{checkpoint_dir}/text_tokenizer",
+            fps=fps,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            append_metadata=True,
+        )
+        # The workers own the GPUs, so request tensors stay on the CPU.
+        cond, uncond = processor.tokenize_pair(
+            "A red sports car driving along a coastal road at sunset.",
+            negative_prompt=None,
+            device="cpu",
+        )
+        request = Cosmos3T2VRequest(
+            text_ids=cond.text_ids,
+            text_mask=cond.text_mask,
+            neg_text_ids=uncond.text_ids,
+            neg_text_mask=uncond.text_mask,
+            video_shape=pixel_to_latent_shape(num_frames, height, width),
+            fps=fps,
+            num_inference_steps=35,
+            guidance_scale=6.0,
+            seed=42,
+        )
+
+        output = engine.step(request)
+        postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+        media = postprocessor.postprocess(output)
+        postprocessor.save_mp4(media, ".cache/cosmos3_t2v_parallel.mp4")
+    finally:
+        engine.close()
+
+
+# Workers start with the "spawn" method and re-import this module, so the
+# engine must sit behind the guard.
+if __name__ == "__main__":
+    main()
+```
+
+`engine.step()` 交回来的是 output rank 那张卡上张量的 CUDA-IPC view，postprocessor 会把它拷到 CPU，保存和单卡一样。Cosmos3 接受 `cfg_size` 为 1 或 2，`tp_size` 要同时整除 attention head 数和 KV head 数（Cosmos3-Nano 是 1、2、4 或 8），dense 与 attention 的 TP 保持一致。其他并行轴在 worker 启动前就会被拒绝。多副本和 `torchrun` 启动见 [并行服务](/zh/deployment/parallel-serving)。
+
+# 完整代码
+
+```python
+import math
+
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3T2VRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3 import Cosmos3Args
+from phyai_utils_tools.models.cosmos3 import (
+    Cosmos3GenerationPostProcessor,
+    Cosmos3Processor,
+)
+
+checkpoint_dir = "/path/to/Cosmos3-Nano"
+device = "cuda"
+dtype = torch.bfloat16
+num_frames = 189
+height = 720
+width = 1280
+fps = 24.0
+with_sound = False
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3",
+        plugin_args=Cosmos3Args(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+            load_sound=(True if with_sound else None),
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3Processor(
+        f"{checkpoint_dir}/text_tokenizer",
+        fps=fps,
+        num_frames=num_frames,
+        height=height,
+        width=width,
+        append_metadata=True,
+    )
+    cond, uncond = processor.tokenize_pair(
+        "A red sports car driving along a coastal road at sunset.",
+        negative_prompt=None,
+        device=device,
+    )
+
+    request = Cosmos3T2VRequest(
+        text_ids=cond.text_ids,
+        text_mask=cond.text_mask,
+        neg_text_ids=uncond.text_ids,
+        neg_text_mask=uncond.text_mask,
+        video_shape=pixel_to_latent_shape(num_frames, height, width),
+        fps=fps,
+        num_inference_steps=35,
+        guidance_scale=6.0,
+        seed=42,
+        sound_frames=(math.ceil(num_frames / fps * 25.0) if with_sound else None),
+    )
+
+    output = engine.step(request)
+    postprocessor = Cosmos3GenerationPostProcessor(fps=fps)
+    media = postprocessor.postprocess(output)
+    postprocessor.save_mp4(media, ".cache/cosmos3_t2v.mp4")
+finally:
+    engine.close()
+```

@@ -15,7 +15,6 @@ from phyai.layers.attention.gdn.base import (
     GatedDeltaNetMetadata,
     GatedDeltaNetPlanHandle,
 )
-from phyai.layers.attention.gdn.registry import register_backend
 
 
 def _load_chunk_op() -> Callable[..., Any]:
@@ -80,9 +79,10 @@ class FlaGatedDeltaNetPlan(GatedDeltaNetPlanHandle):
     """FLA GDN needs no separate planning object."""
 
 
-@register_backend("fla")
 class FlaGatedDeltaNetBackend(GatedDeltaNetBackend):
     """Route GDN prefill and decode through Flash Linear Attention."""
+
+    name = "fla"
 
     def __init__(self, runner=None, *, chunk_size: int = 64) -> None:
         del runner

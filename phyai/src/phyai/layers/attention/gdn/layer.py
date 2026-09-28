@@ -14,7 +14,8 @@ from phyai.layers.attention.gdn.base import (
     GatedDeltaNetCtx,
     GatedDeltaNetMetadata,
 )
-from phyai.layers.attention.gdn.registry import get_backend_factory
+from phyai.kernel.call import CallSite, backend_preference
+from phyai.layers.attention.shared import attention_dtypes, attention_shape
 
 
 class GatedDeltaNet(nn.Module):
@@ -39,8 +40,9 @@ class GatedDeltaNet(nn.Module):
         num_value_heads: int | None = None,
         scale: float | None = None,
         use_qk_l2norm: bool = True,
-        backend: str = "flashinfer",
+        backend: str | None = None,
         backend_kwargs: dict[str, Any] | None = None,
+        kernel_role: str = "gdn",
     ) -> None:
         super().__init__()
         if num_key_heads is None:
@@ -71,11 +73,28 @@ class GatedDeltaNet(nn.Module):
         self.scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
         self.use_qk_l2norm = bool(use_qk_l2norm)
 
-        factory = get_backend_factory(backend)
-        self._backend_factory = factory
+        self.kernel_role = kernel_role
+        self.backend = backend
+        self.prefer = backend_preference("attention_gdn", backend)
         self._backend_kwargs = dict(backend_kwargs or {})
-        self.backend = getattr(factory, "name", str(backend))
-        self._lazy_backend: GatedDeltaNetBackend | None = None
+        # One CallSite per layer: static facts live on the site, per-call
+        # selection is a pay-per-use memo hit instead of a fresh query.
+        self._call_site = CallSite(
+            "attention_gdn",
+            role=self.kernel_role,
+            prefer=self.prefer,
+            dims={
+                "heads": self.num_query_heads,
+                "key_heads": self.num_key_heads,
+                "value_heads": self.num_value_heads,
+                "state_heads": self.num_state_heads,
+                "head_dim": self.head_dim,
+            },
+            attrs={"use_qk_l2norm": self.use_qk_l2norm},
+        )
+        # Backend instances are memoized on the layer, not on the process
+        # selector, so device buffers cannot leak between engines.
+        self._resolved_backends: dict[tuple[object, ...], GatedDeltaNetBackend] = {}
 
     def forward(
         self,
@@ -92,7 +111,20 @@ class GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         layout = self._check_inputs(q, k, v, a, b, a_log, dt_bias)
         if ctx is None:
-            ctx = self._build_default_ctx(q, layout, cu_seqlens)
+            ctx = self._build_default_ctx(
+                q,
+                layout,
+                cu_seqlens,
+                dtypes={
+                    "input": q.dtype,
+                    "key": k.dtype,
+                    "value": v.dtype,
+                    "a": a.dtype,
+                    "b": b.dtype,
+                    "a_log": a_log.dtype,
+                    "dt_bias": dt_bias.dtype,
+                },
+            )
         elif ctx.layout != layout:
             raise ValueError(
                 f"ctx.layout={ctx.layout.name} does not match q layout {layout.name}."
@@ -109,8 +141,10 @@ class GatedDeltaNet(nn.Module):
         q: torch.Tensor,
         layout: AttnLayout,
         cu_seqlens: torch.Tensor | None,
+        *,
+        dtypes: dict[str, object],
     ) -> GatedDeltaNetCtx:
-        backend = self._ensure_backend()
+        backend = self._ensure_backend(q, layout, dtypes=dtypes)
         if layout.is_padded():
             batch_size, seq_len = q.shape[:2]
             if cu_seqlens is None:
@@ -144,10 +178,35 @@ class GatedDeltaNet(nn.Module):
             cu_seqlens=cu_seqlens,
         )
 
-    def _ensure_backend(self) -> GatedDeltaNetBackend:
-        if self._lazy_backend is None:
-            self._lazy_backend = self._backend_factory(None, **self._backend_kwargs)
-        return self._lazy_backend
+    def _ensure_backend(
+        self,
+        q: torch.Tensor,
+        layout: AttnLayout,
+        *,
+        dtypes: dict[str, object] | None = None,
+    ) -> GatedDeltaNetBackend:
+        call_dims = {
+            name: value
+            for name, value in attention_shape(self, q).items()
+            if name == "tokens"
+        }
+        selection = self._call_site.select(
+            device=q.device,
+            dtype=attention_dtypes(q, extra=dtypes),
+            dims=call_dims,
+            attrs={"layout": "padded" if layout.is_padded() else "ragged"},
+        )
+        key = (
+            selection.kernel_id,
+            selection.query.mode.value,
+            tuple(sorted((str(k_), str(v)) for k_, v in selection.params.items())),
+        )
+        cached = self._resolved_backends.get(key)
+        if cached is not None:
+            return cached
+        backend = selection.implementation(None, **self._backend_kwargs)
+        self._resolved_backends[key] = backend
+        return backend
 
     def _check_inputs(
         self,

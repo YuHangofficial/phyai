@@ -7,46 +7,46 @@ the WS1 scheduler owns request packing and Euler integration.
 
 from __future__ import annotations
 
-import itertools
 import math
+import itertools
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 import phyai.parallel as P
-from phyai.engine_config import get_engine_config, resolve_engine_defaults
-from phyai.layers.attention.attention.layer import Attention
-from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCtx
-from phyai.layers.conv import Conv3d
-from phyai.layers.linear import (
-    ColumnParallelLinear,
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
 from phyai.layers.mlp import DenseMLP
+from phyai.layers.conv import Conv3d
 from phyai.layers.quant import Bf16Spec
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.layers.linear import (
+    ReplicatedLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    ColumnParallelLinear,
+)
+from phyai.parallel.state import resolve_mesh
+from phyai.weights.shards import _Leg, fused, sharded, replicated
+from phyai.layers.attention.paged import PagedAttnCtx, PagedAttention
 from phyai.layers.rotary_embedding import (
     InterleavedMRotaryEmbedding,
     apply_rotary_pos_emb,
 )
 from phyai.layers.transformer_block import TransformerBlock
 from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
+from phyai.layers.attention.nocache.layer import Attention
 from phyai.models.lingbot_v2.configuration_lingbotv2 import (
-    LingBotV2ExpertConfig,
-    LingBotV2FlowMatchingConfig,
-    LingBotV2MoEConfig,
     LingBotVLA2Config,
     Qwen3VLTextConfig,
+    LingBotV2MoEConfig,
     Qwen3VLVisionConfig,
+    LingBotV2ExpertConfig,
+    LingBotV2FlowMatchingConfig,
 )
-from phyai.parallel.state import resolve_mesh
-from phyai.weights.shards import _Leg, fused, replicated, sharded
 
 if TYPE_CHECKING:
-    from phyai.layers.attention import ARAttnCtx
+    from phyai.layers.attention import PagedAttnCtx
 
 
 def _fp32_router_linear(
@@ -739,9 +739,7 @@ class Qwen3VLVisionModel(nn.Module):
         prefix: str = "visual",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -962,9 +960,7 @@ class Qwen3VLTextModel(nn.Module):
         attn_causal: bool = True,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -1046,7 +1042,7 @@ class Qwen3VLTextModel(nn.Module):
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_ctx: "ARAttnCtx | None" = None,
+        attn_ctx: PagedAttnCtx | None = None,
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
@@ -1364,7 +1360,7 @@ class LingBotV2ExpertLayer(nn.Module):
             params_dtype=params_dtype,
             prefix=f"{attn_prefix}.o_proj",
         )
-        self.attn = DiffusionAttention(
+        self.attn = PagedAttention(
             num_heads=self.q_heads_local,
             head_dim=config.head_dim,
             layer_id=layer_idx,
@@ -1416,7 +1412,7 @@ class LingBotV2ExpertLayer(nn.Module):
         rope: InterleavedMRotaryEmbedding,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_ctx: DiffusionAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         """Apply joint diffusion attention, normalization, and the MLP path."""
 
@@ -1781,16 +1777,14 @@ class LingBotV2Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         vision_dtype = vision_params_dtype or params_dtype
-        if attn_backend != "flashinfer":
+        if attn_backend not in (None, "flashinfer"):
             raise NotImplementedError(
                 "LingBot V2 paged prefix/expert attention currently requires "
-                "attn_backend='flashinfer'."
+                "FlashInfer-compatible paged attention."
             )
         self.config = config
         self.params_dtype = params_dtype
@@ -1811,7 +1805,7 @@ class LingBotV2Model(nn.Module):
             norm_backend=norm_backend,
             device=device,
             prefix=self.TEXT_PREFIX,
-            text_attn_kind="ar",
+            text_attn_kind="paged",
             attn_causal=config.vlm_causal,
         )
         self.expert_stack = LingBotV2ExpertStack(

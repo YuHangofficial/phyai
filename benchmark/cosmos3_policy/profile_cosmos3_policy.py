@@ -9,8 +9,12 @@ from pathlib import Path
 
 import torch
 
-import model_flops_cosmos3 as mf
-import hardware_probe as hp
+try:
+    from . import hardware_probe as hp
+    from . import model_flops_cosmos3 as mf
+except ImportError:  # Direct ``python benchmark/.../profile_cosmos3_policy.py``.
+    import hardware_probe as hp
+    import model_flops_cosmos3 as mf
 
 
 # The released DROID policy's recommended denoise-step count (cosmos-framework
@@ -20,24 +24,27 @@ NUM_STEPS = 4
 
 
 def register_single_gpu_mesh() -> None:
-    """Single-GPU ws=1 mesh + flashinfer linear init (mirrors the parity run).
+    """Register the single-GPU mesh and initialize kernel selection.
 
     The Engine plugin does this internally; a direct-construction profiler must
-    replicate it before building any phyai layer.
+    replicate it before building any phyai layer. Kernel selection is process
+    scoped, so initialize it after the benchmark has installed its engine
+    configuration.
     """
-    from unittest.mock import MagicMock
-
-    import phyai.layers.linear as linear_mod
+    from phyai.engine_config import ParallelConfig, get_engine_config
+    from phyai.kernel.bootstrap import initialize_kernel_system
+    from phyai.kernel.types import ModelContext
     from phyai.parallel.mesh import Mesh
     from phyai.parallel.state import register_mesh
+    from phyai.parallel.layout import build_rank_layout
 
-    tm = MagicMock()
-    tm.mesh_dim_names = ("tp",)
-    tm.size.side_effect = lambda axis: 1
-    tm.get_local_rank.side_effect = lambda axis: 0
-    tm.get_group.side_effect = lambda axis: MagicMock()
-    register_mesh(Mesh(tm, name="model"))
-    linear_mod.init(register_flashinfer=True, validate=False)
+    register_mesh(Mesh(build_rank_layout(ParallelConfig()), name="model"))
+    config = get_engine_config()
+    initialize_kernel_system(
+        config.kernel,
+        device=config.device.target,
+        model=ModelContext(family="cosmos3"),
+    )
 
 
 def module_bytes(module: torch.nn.Module) -> int:

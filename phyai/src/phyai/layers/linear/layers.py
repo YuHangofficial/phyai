@@ -1,9 +1,9 @@
-"""Linear layers — named-axis TP/SP on top of WeightSpec + KernelDispatcher.
+"""Named-group TP/SP linear layers on top of WeightSpec and kernel selection.
 
-These classes only own the *parallel* aspect (mesh axis, bias placement,
+These classes only own the *parallel* aspect (mesh group, bias placement,
 input/output collectives) and delegate everything else to ``self.spec``
-and the dispatcher. No fp8 / cutlass / marlin branches live here — the
-decision tree is pushed into :class:`KernelDispatcher`.
+and the unified kernel selector. No fp8 / cutlass / marlin branches live here;
+the catalog owns that decision tree.
 
 Weight loading is param-attached: each layer's ``__init__`` (after
 ``spec.allocate``) sets ``param.hf_keys`` and ``param.weight_loader``
@@ -22,13 +22,12 @@ import torch.nn as nn
 
 import phyai.parallel as P
 from phyai.engine_config import get_engine_config
-from phyai.layers.linear.dispatch import get_linear_dispatcher
+from phyai.kernel.call import CallSite
 from phyai.layers.linear.spec import Bf16Spec
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.active import get_active_plan
 from phyai.layers.quant.materialize import materialize
 from phyai.parallel.state import resolve_mesh
-from phyai.utils.cuda import sm_arch
 from phyai.weights.shards import _Leg, fused, replicated, sharded
 
 
@@ -38,6 +37,48 @@ def _M_of(x: torch.Tensor) -> int:
     for s in x.shape[:-1]:
         M *= int(s)
     return M
+
+
+def _resolve_linear_kernel(
+    layer: "LinearBase",
+    x: torch.Tensor,
+    *,
+    M: int,
+    N: int,
+    K: int,
+):
+    """Select the GEMM implementation for one call.
+
+    The quantization signature is passed as structured facts rather than as an
+    identifier string. Each catalog row names its exact storage format, so
+    there is no lossy round trip through a ``spec_id`` and no possibility of a
+    row claiming eligibility for a format its code cannot execute.
+    """
+
+    # One binding per layer, created on first use and stashed on the layer.
+    # Lazy rather than in ``__init__`` because this adapter also serves the tied
+    # vocabulary head, which is not a ``LinearBase``.
+    site = getattr(layer, "gemm_call", None)
+    if site is None or site.role != layer.kernel_role:
+        site = CallSite("gemm", role=layer.kernel_role)
+        layer.gemm_call = site
+
+    return site.select(
+        device=x.device,
+        dtype={
+            "input": x.dtype,
+            "output": layer.params_dtype,
+            "weight": layer.weight.dtype,
+        },
+        quant=layer.spec.physical_signature,
+        dims={"M": M, "N": N, "K": K},
+    )
+
+
+# Public adapter for non-LinearBase consumers such as the tied vocabulary head.
+# Keeping the query construction in one place prevents those consumers from
+# silently drifting back to the legacy dispatcher.
+resolve_linear_kernel = _resolve_linear_kernel
 
 
 class LinearBase(nn.Module):
@@ -60,16 +101,20 @@ class LinearBase(nn.Module):
         scheme: object | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
+        kernel_role: str | None = None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.skip_bias_add = skip_bias_add
+        resolved_device = (
+            device if device is not None else get_engine_config().device.target
+        )
         if spec is not None:
             self.spec = spec
         elif scheme is not None:
-            self.spec = materialize(scheme, sm_arch())
+            self.spec = materialize(scheme, resolved_device)
         else:
             plan = get_active_plan()
             resolved = (
@@ -78,12 +123,15 @@ class LinearBase(nn.Module):
                 else None
             )
             self.spec = (
-                materialize(resolved, sm_arch()) if resolved is not None else Bf16Spec()
+                materialize(resolved, resolved_device)
+                if resolved is not None
+                else Bf16Spec()
             )
-        self.device = (
-            device if device is not None else get_engine_config().device.target
-        )
+        self.device = resolved_device
         self.prefix = prefix
+        self.kernel_role = (
+            kernel_role or type(self).__name__.removesuffix("Linear").lower()
+        )
         self._bias_requested = bias
 
     def post_load(self) -> None:
@@ -138,6 +186,7 @@ class ReplicatedLinear(LinearBase):
         scheme: object | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
+        kernel_role: str | None = None,
     ) -> None:
         super().__init__(
             in_features,
@@ -149,6 +198,7 @@ class ReplicatedLinear(LinearBase):
             scheme=scheme,
             device=device,
             prefix=prefix,
+            kernel_role=kernel_role,
         )
         self.spec.allocate(
             self,
@@ -185,24 +235,23 @@ class ReplicatedLinear(LinearBase):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = get_linear_dispatcher().select(
-            spec_id=self.spec.spec_id,
+        kernel = _resolve_linear_kernel(
+            self,
+            x,
             M=_M_of(x),
             N=self.out_features,
             K=self.in_features,
-            in_dtype=x.dtype,
-            out_dtype=self.params_dtype,
         )
         bias = self.bias if not self.skip_bias_add else None
-        y = kernel.apply(self, x, bias)
+        y = kernel.execute(self, x, bias)
         return y, (self.bias if self.skip_bias_add else None)
 
 
 class ColumnParallelLinear(LinearBase):
-    """Sharded on the output dim along ``axis`` of ``mesh``.
+    """Sharded on the output dim along ``group`` of ``mesh``.
 
-    With ``sp_axis`` set, the forward first all-gathers ``x`` along that
-    axis (dim=0 by convention) — sequence-parallel entry path.
+    With ``sequence_parallel=True``, the forward first all-gathers tokens
+    along the same TP group (dim=0 by convention).
     """
 
     def __init__(
@@ -210,8 +259,8 @@ class ColumnParallelLinear(LinearBase):
         in_features: int,
         out_features: int,
         *,
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        group: str = "dense_tp",
+        sequence_parallel: bool = False,
         gather_output: bool = False,
         bias: bool = True,
         skip_bias_add: bool = False,
@@ -222,6 +271,7 @@ class ColumnParallelLinear(LinearBase):
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
+        kernel_role: str | None = None,
     ) -> None:
         super().__init__(
             in_features,
@@ -233,15 +283,18 @@ class ColumnParallelLinear(LinearBase):
             scheme=scheme,
             device=device,
             prefix=prefix,
+            kernel_role=kernel_role,
         )
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
         self._mesh = mesh_obj
-        self.axis = axis
-        self.sp_axis = sp_axis
+        self.group = group
+        self.sequence_parallel = sequence_parallel
+        if not isinstance(sequence_parallel, bool):
+            raise TypeError("sequence_parallel must be a bool.")
         self.gather_output = gather_output
-        self.tp_size = mesh_obj.axis_size(axis)
-        self.tp_rank = mesh_obj.axis_local_rank(axis)
+        self.tp_size = mesh_obj.group_size(group)
+        self.tp_rank = mesh_obj.group_rank(group)
 
         global_sizes = output_sizes if output_sizes is not None else [out_features]
         if sum(global_sizes) != out_features:
@@ -286,34 +339,33 @@ class ColumnParallelLinear(LinearBase):
         # Non-fused column-parallel: subclasses (Merged / QKV) override
         # by re-attaching after super().__init__ returns.
         if prefix and len(per_rank_sizes) == 1:
-            weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
+            weight_loader = sharded(dim=0, group=group, mesh=mesh_obj)
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
                 self.bias.hf_keys = [(f"{prefix}.bias", None)]
-                self.bias.weight_loader = sharded(dim=0, axis=axis, mesh=mesh_obj)
+                self.bias.weight_loader = sharded(dim=0, group=group, mesh=mesh_obj)
             self._attach_optional_scales(self, prefix)
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.sp_axis is not None:
-            x = P.all_gather(x, axis=self.sp_axis, dim=0)
+        if self.sequence_parallel:
+            x = P.all_gather(x, group=self.group, dim=0, mesh=self.mesh_name)
 
-        kernel = get_linear_dispatcher().select(
-            spec_id=self.spec.spec_id,
+        kernel = _resolve_linear_kernel(
+            self,
+            x,
             M=_M_of(x),
             N=self.output_size_per_partition,
             K=self.input_size_per_partition,
-            in_dtype=x.dtype,
-            out_dtype=self.params_dtype,
         )
         bias = self.bias if not self.skip_bias_add else None
-        y = kernel.apply(self, x, bias)
+        y = kernel.execute(self, x, bias)
 
         if self.gather_output and self.tp_size > 1:
-            y = P.all_gather(y, axis=self.axis, dim=-1)
+            y = P.all_gather(y, group=self.group, dim=-1, mesh=self.mesh_name)
         return y, (self.bias if self.skip_bias_add else None)
 
 
@@ -327,8 +379,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         in_features: int,
         output_sizes: list[int],
         *,
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        group: str = "dense_tp",
+        sequence_parallel: bool = False,
         gather_output: bool = False,
         bias: bool = True,
         skip_bias_add: bool = False,
@@ -339,12 +391,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
+        kernel_role: str | None = None,
     ) -> None:
         super().__init__(
             in_features,
             sum(output_sizes),
-            axis=axis,
-            sp_axis=sp_axis,
+            group=group,
+            sequence_parallel=sequence_parallel,
             gather_output=gather_output,
             bias=bias,
             skip_bias_add=skip_bias_add,
@@ -355,6 +408,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             mesh=mesh,
             device=device,
             prefix=prefix,
+            kernel_role=kernel_role,
         )
         legs = tuple(hf_legs) if hf_legs is not None else self.DEFAULT_HF_LEGS
         if len(legs) != len(self.output_partition_sizes):
@@ -375,7 +429,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             ):
                 hf_base = f"{parent}.{leg_name}" if parent else leg_name
                 leg_dict[i] = _Leg(
-                    offset=offset, size=per_rank, dim=0, axis=axis, replicate=1
+                    offset=offset,
+                    size=per_rank,
+                    dim=0,
+                    group=group,
+                    replication_factor=1,
                 )
                 keys.append((f"{hf_base}.weight", i))
                 if self.bias is not None:
@@ -397,7 +455,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     When ``tp_size`` exceeds ``num_kv_heads``, K and V are replicated
     ``tp_size // num_kv_heads`` times so every rank has a full set.
     The replica logic shows up in the ``fused(...)`` loader's
-    ``_Leg(replicate=...)`` for the K and V legs.
+    ``_Leg(replication_factor=...)`` for the K and V legs.
     """
 
     DEFAULT_HF_LEGS: Mapping[str, str] = MappingProxyType(
@@ -411,8 +469,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         num_heads: int,
         num_kv_heads: int | None = None,
         *,
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        group: str = "attention_tp",
+        sequence_parallel: bool = False,
         gather_output: bool = False,
         bias: bool = True,
         skip_bias_add: bool = False,
@@ -423,9 +481,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
+        kernel_role: str | None = None,
     ) -> None:
         mesh_obj = resolve_mesh(mesh)
-        tp_size = mesh_obj.axis_size(axis)
+        tp_size = mesh_obj.group_size(group)
 
         if num_kv_heads is None:
             num_kv_heads = num_heads
@@ -451,8 +510,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         super().__init__(
             hidden_size,
             out_features,
-            axis=axis,
-            sp_axis=sp_axis,
+            group=group,
+            sequence_parallel=sequence_parallel,
             gather_output=gather_output,
             bias=bias,
             skip_bias_add=skip_bias_add,
@@ -463,6 +522,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             mesh=mesh,
             device=device,
             prefix=prefix,
+            kernel_role=kernel_role,
         )
         self.num_kv_replicas = num_kv_replicas
         self.head_dim = head_dim
@@ -479,20 +539,22 @@ class QKVParallelLinear(ColumnParallelLinear):
             parent = prefix.rpartition(".")[0]
             q_local, k_local, v_local = self.output_partition_sizes
             leg_dict: dict[str, _Leg] = {
-                "q": _Leg(offset=0, size=q_local, dim=0, axis=axis, replicate=1),
+                "q": _Leg(
+                    offset=0, size=q_local, dim=0, group=group, replication_factor=1
+                ),
                 "k": _Leg(
                     offset=q_local,
                     size=k_local,
                     dim=0,
-                    axis=axis,
-                    replicate=num_kv_replicas,
+                    group=group,
+                    replication_factor=num_kv_replicas,
                 ),
                 "v": _Leg(
                     offset=q_local + k_local,
                     size=v_local,
                     dim=0,
-                    axis=axis,
-                    replicate=num_kv_replicas,
+                    group=group,
+                    replication_factor=num_kv_replicas,
                 ),
             }
             keys: list[tuple[str, str]] = []
@@ -514,10 +576,10 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-    """Sharded on the input dim along ``axis`` of ``mesh``.
+    """Sharded on the input dim along ``group`` of ``mesh``.
 
-    Exit collective is ``all_reduce`` on ``axis`` unless ``sp_axis`` is
-    set, in which case it becomes ``reduce_scatter`` on ``sp_axis``.
+    The exit collective is ``all_reduce`` on ``group``, or ``reduce_scatter``
+    on the same group when ``sequence_parallel=True``.
     """
 
     def __init__(
@@ -525,8 +587,8 @@ class RowParallelLinear(LinearBase):
         in_features: int,
         out_features: int,
         *,
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        group: str = "dense_tp",
+        sequence_parallel: bool = False,
         input_is_parallel: bool = True,
         reduce_results: bool = True,
         bias: bool = True,
@@ -537,6 +599,7 @@ class RowParallelLinear(LinearBase):
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
+        kernel_role: str | None = None,
     ) -> None:
         super().__init__(
             in_features,
@@ -548,14 +611,17 @@ class RowParallelLinear(LinearBase):
             scheme=scheme,
             device=device,
             prefix=prefix,
+            kernel_role=kernel_role,
         )
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
         self._mesh = mesh_obj
-        self.axis = axis
-        self.sp_axis = sp_axis
-        self.tp_size = mesh_obj.axis_size(axis)
-        self.tp_rank = mesh_obj.axis_local_rank(axis)
+        self.group = group
+        self.sequence_parallel = sequence_parallel
+        if not isinstance(sequence_parallel, bool):
+            raise TypeError("sequence_parallel must be a bool.")
+        self.tp_size = mesh_obj.group_size(group)
+        self.tp_rank = mesh_obj.group_rank(group)
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
@@ -590,7 +656,7 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
         if prefix:
-            weight_loader = sharded(dim=1, axis=axis, mesh=mesh_obj)
+            weight_loader = sharded(dim=1, group=group, mesh=mesh_obj)
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self._attach_weight_loader(self, weight_loader)
             if self.bias is not None:
@@ -607,13 +673,12 @@ class RowParallelLinear(LinearBase):
             shard = x.shape[-1] // self.tp_size
             x = x.narrow(-1, self.tp_rank * shard, shard).contiguous()
 
-        kernel = get_linear_dispatcher().select(
-            spec_id=self.spec.spec_id,
+        kernel = _resolve_linear_kernel(
+            self,
+            x,
             M=_M_of(x),
             N=self.output_size_per_partition,
             K=self.input_size_per_partition,
-            in_dtype=x.dtype,
-            out_dtype=self.params_dtype,
         )
         # Only rank 0 adds the bias to avoid double counting post-reduce.
         add_bias = (
@@ -621,11 +686,11 @@ class RowParallelLinear(LinearBase):
             if (self.bias is not None and self.tp_rank == 0 and not self.skip_bias_add)
             else None
         )
-        y = kernel.apply(self, x, add_bias)
+        y = kernel.execute(self, x, add_bias)
 
         if self.reduce_results and self.tp_size > 1:
-            if self.sp_axis is not None:
-                y = P.reduce_scatter(y, axis=self.sp_axis, dim=0)
+            if self.sequence_parallel:
+                y = P.reduce_scatter(y, group=self.group, dim=0, mesh=self.mesh_name)
             else:
-                y = P.all_reduce(y, axis=self.axis)
+                y = P.all_reduce(y, group=self.group, mesh=self.mesh_name)
         return y, (self.bias if self.skip_bias_add else None)

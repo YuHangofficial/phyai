@@ -54,6 +54,15 @@ def register_mesh(mesh: "Mesh") -> None:
     _meshes[mesh.name] = mesh
 
 
+def clear_meshes() -> None:
+    """Forget every registered mesh (used by ``phyai.parallel.shutdown``)."""
+    _meshes.clear()
+
+
+def registered_meshes() -> tuple["Mesh", ...]:
+    return tuple(_meshes.values())
+
+
 def resolve_mesh(arg: "str | Mesh") -> "Mesh":
     """Resolve a ``Mesh`` instance or registered name to a ``Mesh`` object.
 

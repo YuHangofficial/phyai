@@ -13,7 +13,7 @@ from phyai.engine_config import get_engine_config
 from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.pi0.configuration_pi0 import PI0Config
 from phyai.models.pi0.modeling_pi0 import PI0Model
-from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request, PI0WS1Scheduler
+from phyai.models.pi0.scheduler_pi0 import PI0Request, PI0Scheduler
 from phyai.utils import load_config
 from phyai.weights import load_pretrained
 
@@ -98,7 +98,7 @@ class PI0Entry(Entry):
 
     def __init__(self) -> None:
         self.model: PI0Model | None = None
-        self.scheduler: PI0WS1Scheduler | None = None
+        self.scheduler: PI0Scheduler | None = None
 
     def setup(self, args: PI0Args) -> None:  # type: ignore[override]
         """Build model, load weights, construct + warm the scheduler."""
@@ -125,7 +125,7 @@ class PI0Entry(Entry):
                 strict=args.weight_strict,
             )
 
-        self.scheduler = PI0WS1Scheduler(
+        self.scheduler = PI0Scheduler(
             self.model,
             max_batch_size=args.max_batch_size,
             device=eng.device.target,

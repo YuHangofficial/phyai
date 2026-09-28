@@ -1,0 +1,148 @@
+---
+title: "Parallel serving"
+description: "Execution layers, replica routing, and deployment modes for single-GPU and local multi-GPU inference."
+---
+
+`Engine` is the one interface for every deployment shape. A single-rank, single-replica engine runs inline in your process. A local multi-GPU deployment keeps the same `step()`, `submit()`, and `close()`; only the executor behind the dispatcher changes.
+
+## Execution layers
+
+```text
+Engine
+  -> RequestDispatcher
+       -> ReplicaExecutor[0..N)
+            -> InlineExecutor
+            -> MultiprocessExecutor
+            -> ExternalExecutor
+```
+
+A `ReplicaExecutor` is always one complete model replica, whether that replica is one rank or many. The dispatcher chooses between replicas and never treats the ranks inside one as separate workers.
+
+| Executor | Process ownership | Use |
+| --- | --- | --- |
+| `InlineExecutor` | Builds `EngineCore` in the caller process | The default single-rank, single-replica path |
+| `MultiprocessExecutor` | One spawned local worker per rank, under a shared `WorkerSupervisor` | Local model parallelism or several local replicas |
+| `ExternalExecutor` | Reuses the rank a launcher already created | `torchrun` and other external launchers |
+
+The inline path has no process supervisor and no rendezvous service, which is what a single-GPU robot controller wants.
+
+## Model parallelism
+
+`ParallelConfig` describes how one replica is cut up. The outer `pipeline` and `cfg` dimensions apply to every domain; dense layers, attention, and MoE each describe their own TP/DP/CP/EP split of the same rank pool:
+
+```python
+from phyai import (
+    AttentionParallelConfig,
+    DenseParallelConfig,
+    MoeParallelConfig,
+    OuterParallelConfig,
+    ParallelConfig,
+)
+
+parallel = ParallelConfig(
+    outer=OuterParallelConfig(cfg_size=2),
+    dense=DenseParallelConfig(tp_size=4),
+    attention=AttentionParallelConfig(tp_size=4),
+    moe=MoeParallelConfig(tp_size=2, ep_size=2),
+)
+```
+
+Model code addresses groups by name, such as `dense_tp`, `attention_cp`, `moe_ep`, and `world` (`P.all_reduce(x, group="dense_tp")`). Within one pipeline/CFG partition the three domains must cover the same number of ranks:
+
+```text
+dense.tp_size * dense.dp_size
+  = attention.tp_size * attention.cp_size * attention.dp_size
+  = moe.tp_size * moe.ep_size * moe.dp_size
+```
+
+A plugin declares the domains it implements in `Entry.parallel_domains` and can tighten the rules in `Entry.validate_parallel()`. The default is single rank, so a topology the plugin cannot run fails before any worker starts rather than silently running duplicate models. Cosmos3, for example, accepts matching dense and attention TP plus CFG and rejects everything else. Topology comes from these objects only; `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` describe the physical processes, not the model layout.
+
+## Serving replicas
+
+Replicas are copies of the whole model that the dispatcher routes between. They live in `DeploymentConfig`, not in `ParallelConfig`, and no process group is created between them:
+
+```text
+ranks_per_replica = parallel.infer_replica_world_size()
+worker_count = deployment.replica_count * ranks_per_replica
+```
+
+## Mode selection
+
+`DeploymentConfig()` defaults to `mode="auto"`:
+
+| Condition | Mode |
+| --- | --- |
+| One rank, one replica, no explicit placement | `inline` |
+| More than one rank or replica, or explicit `devices` | `local` |
+| `DeploymentConfig.external()` | `external` |
+
+The single-GPU path needs no deployment configuration at all:
+
+```python
+from phyai import Engine, EngineArgs
+
+engine = Engine(EngineArgs(plugin="my_model", plugin_args=model_args))
+try:
+    result = engine.step(request)
+finally:
+    engine.close()
+```
+
+Use a local deployment when a replica spans several ranks or when several replicas should sit on separate devices:
+
+```python
+import torch
+
+from phyai import DeploymentConfig, Engine, EngineArgs
+from phyai.engine_config import (
+    AttentionParallelConfig,
+    DenseParallelConfig,
+    DeviceConfig,
+    EngineConfig,
+    ParallelConfig,
+)
+from phyai.server import WorkerSupervisorConfig
+
+engine = Engine(
+    EngineArgs(
+        plugin="my_parallel_model",
+        plugin_args=model_args,
+        config=EngineConfig(
+            device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+            parallel=ParallelConfig(
+                dense=DenseParallelConfig(tp_size=2),
+                attention=AttentionParallelConfig(tp_size=2),
+            ),
+        ),
+    ),
+    deployment=DeploymentConfig.local(
+        devices=(0, 1, 2, 3),
+        replica_count=2,
+        process_config=WorkerSupervisorConfig(base_port=29500),
+    ),
+)
+```
+
+The first two devices hold replica 0 and the next two hold replica 1. Device entries are logical indices into the launching process's visible devices, so they compose with a shell mask: under `CUDA_VISIBLE_DEVICES=4,5,6,7` the same `devices=(0, 1, 2, 3)` lands on physical GPUs 4 to 7. The plugin has to declare `dense` or `attention` in `parallel_domains`; Cosmos3 declares both. Local workers start with Python's `spawn`, which re-imports your main module, so construct the engine under `if __name__ == "__main__":`.
+
+Multi-node runs use an external launcher (`torchrun --nnodes ...`) with `DeploymentConfig.external()`, one process per rank. In that mode the engine does not broadcast requests: every rank must call `step()` with the same request in the same order, because all ranks take part in the same collectives, and a request that reaches only one rank leaves the others waiting forever. Read the same input on every rank, or receive on one and broadcast with `torch.distributed` first. Only the output rank returns a result; the rest return `None`. Routing across machines belongs to a gateway above the engine.
+
+## Request routing
+
+Each request goes whole to one healthy replica, the one with the fewest requests in flight; ties rotate round-robin. Every rank of that replica receives the request, and only the output rank answers. The engine never splits, gathers, or merges across replicas. If the samples in a batch are independent you can shard it yourself: `submit()` one shard per replica and concatenate the futures' results in order, after moving them to a common device.
+
+Two kinds of failure are told apart by exception type. A request-local failure, such as the plugin rejecting a payload, raises the plugin's own exception on the inline and external executors and leaves the replica healthy; inside managed workers the same failure takes the whole group down, because ranks sharing collectives cannot resume mid-request, so validate requests before you submit them. `phyai.EngineUnavailableError` means the backend can no longer serve: workers died, a hard timeout fired, or the engine was closed. Re-create the engine, or let the layer above take it out of rotation.
+
+`Engine.mode` tells you which backend was chosen. `Engine.submit()` returns a standard `concurrent.futures.Future`; only queued inline requests can be cancelled.
+
+## Workers and tensor ownership
+
+Workers inherit the parent's device visibility and each pins its own index with `torch.cuda.set_device`, the same placement style as sglang and vllm, so `cuda:1` means the same GPU in every process. Startup completes once every worker has reported ready.
+
+Results come back as they are. CUDA tensors cross the process boundary as CUDA-IPC views of the worker's memory: zero-copy, still on the worker's GPU, and valid only while the worker group is alive. Call `.cpu()` or `.clone()` before closing the engine if you need to keep them. Requests may carry tensors on any local device; CPU tensors travel through shared memory.
+
+Failure handling is fail-fast. A worker exit, a malformed response, or an expired `WorkerSupervisorConfig.execution_timeout_s` fails the whole group, and later requests raise `EngineUnavailableError`. PhyAI does not retry a request once execution has started and does not restart workers; that belongs to whatever launched the engine, be it systemd, Kubernetes, or an RL framework. The timeout clock starts at submission, so time spent queued counts.
+
+## Shutdown
+
+`close()` is idempotent: it cancels queued inline work, fails pending managed futures with `EngineUnavailableError`, stops the workers, and releases the process groups. Using `Engine` as a context manager does this for you.

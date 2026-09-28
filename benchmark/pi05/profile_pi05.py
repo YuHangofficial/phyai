@@ -18,7 +18,7 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request
+from phyai.models.pi05.scheduler_pi05 import PI05Request
 from phyai.utils import load_config
 from phyai.utils.profile import ProfilerConfig, get_profiler, install_profiler
 

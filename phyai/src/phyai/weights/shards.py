@@ -33,18 +33,31 @@ def replicated() -> WeightLoader:
 
 
 def sharded(
-    *, dim: int, axis: str = "tp", mesh: Mesh, replicate: int = 1
+    *, dim: int, group: str = "dense_tp", mesh: Mesh, replication_factor: int = 1
 ) -> WeightLoader:
-    """Single-axis TP / EP shard along ``dim``.
+    """Single-group TP / EP shard along ``dim``.
 
-    ``replicate>1`` is the GQA case: ``replicate`` ranks on ``axis``
-    each read the same shard slot. The effective world size shrinks by
-    ``replicate``; the effective rank is ``rank // replicate``.
+    ``replication_factor`` is the GQA case: that many ranks in ``group``
+    each read the same shard slot.
     """
 
+    if (
+        not isinstance(replication_factor, int)
+        or isinstance(replication_factor, bool)
+        or replication_factor < 1
+        or mesh.group_size(group) % replication_factor
+    ):
+        raise ValueError(
+            "replication_factor must be a positive divisor of the group size."
+        )
+
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, _shard_id=None) -> None:
-        rank = mesh.axis_local_rank(axis) // replicate
-        world = mesh.axis_size(axis) // replicate
+        rank = mesh.group_rank(group) // replication_factor
+        world = mesh.group_size(group) // replication_factor
+        if loaded.shape[dim] % world:
+            raise ValueError(
+                f"weight dimension {loaded.shape[dim]} is not divisible by {world} shards."
+            )
         size = loaded.shape[dim] // world
         param.data.copy_(loaded.narrow(dim, rank * size, size))
 
@@ -57,15 +70,15 @@ class _Leg:
 
     ``offset`` / ``size`` are the **post-shard local** position and size
     in the destination's ``fuse_dim``. ``dim`` is the source's TP-shard
-    dim (almost always ``0`` — column-parallel fuse). ``replicate`` is
+    dim (almost always ``0`` — column-parallel fuse). ``replication_factor`` is
     the GQA replication factor for K/V legs.
     """
 
     offset: int
     size: int
     dim: int = 0
-    axis: str = "tp"
-    replicate: int = 1
+    group: str = "dense_tp"
+    replication_factor: int = 1
 
 
 def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
@@ -76,13 +89,13 @@ def fused(*, fuse_dim: int, legs: dict, mesh: Mesh) -> WeightLoader:
     TP-shards the source, and writes into the destination's ``fuse_dim``
     slot at ``[offset, offset+size)``.
 
-    Covers fused QKV with GQA (Q has ``replicate=1``, K/V have
-    ``replicate=num_kv_replicas``) and fused gate/up.
+    Covers fused QKV with GQA (Q has ``replication_factor=1``, K/V have
+    ``replication_factor=num_kv_replicas``) and fused gate/up.
     """
 
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, shard_id) -> None:
         leg = legs[shard_id]
-        rank = mesh.axis_local_rank(leg.axis) // leg.replicate
+        rank = mesh.group_rank(leg.group) // leg.replication_factor
         src = loaded.narrow(leg.dim, rank * leg.size, leg.size)
         param.data.narrow(fuse_dim, leg.offset, leg.size).copy_(src)
 
@@ -122,7 +135,7 @@ def weight_norm_fold(*, eps: float = 1e-12) -> WeightLoader:
     return load
 
 
-def vocab(*, axis: str = "tp", mesh: Mesh) -> WeightLoader:
+def vocab(*, group: str = "dense_tp", mesh: Mesh) -> WeightLoader:
     """Vocab-parallel embedding load with right-edge zero padding.
 
     The destination's ``shape[0]`` is the per-rank padded size. The HF
@@ -133,7 +146,7 @@ def vocab(*, axis: str = "tp", mesh: Mesh) -> WeightLoader:
 
     def load(param: torch.nn.Parameter, loaded: torch.Tensor, _shard_id=None) -> None:
         per_rank = param.shape[0]
-        rank = mesh.axis_local_rank(axis)
+        rank = mesh.group_rank(group)
         start = rank * per_rank
         v_real = loaded.shape[0]
         if start >= v_real:

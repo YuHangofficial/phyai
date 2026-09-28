@@ -6,7 +6,7 @@ Two classes, intentionally independent:
   Per-rank weight shape ``(V_padded // tp_size, D)``. Forward calls the
   fused :func:`phyai::masked_embedding_lookup` op (Triton on CUDA, eager
   fallback elsewhere) and finishes with a single ``all_reduce`` along the
-  TP axis. There is no ``masked_fill_`` second pass — the kernel writes
+  TP group. There is no ``masked_fill_`` second pass — the kernel writes
   zeros for out-of-shard positions directly.
 
 * :class:`ParallelLMHead` — column-parallel matmul over the same
@@ -34,7 +34,7 @@ import torch.nn as nn
 
 import phyai.parallel as P
 from phyai.engine_config import get_engine_config
-from phyai.layers.linear.dispatch import get_linear_dispatcher
+from phyai.layers.linear.layers import resolve_linear_kernel
 from phyai.layers.quant import AllocationRequest
 from phyai.layers.quant.bf16 import Bf16Spec
 from phyai.layers.vocab_embedding.ops import masked_embedding_lookup
@@ -83,7 +83,7 @@ class VocabParallelEmbedding(nn.Module):
             architectures. Applied at forward time (post-lookup,
             post-all_reduce) rather than baked into the weight, so that a
             tied :class:`ParallelLMHead` sees the un-scaled weight.
-        axis: mesh axis used for the V split. Default ``"tp"``.
+        group: mesh group used for the V split. Default ``"dense_tp"``.
         mesh: mesh name (default ``"model"``).
         prefix: state-dict prefix.
     """
@@ -98,7 +98,7 @@ class VocabParallelEmbedding(nn.Module):
         layout: Literal["vocab_parallel"] = "vocab_parallel",
         padding_multiple: int = 64,
         embed_scale: float = 1.0,
-        axis: str = "tp",
+        group: str = "dense_tp",
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -134,9 +134,9 @@ class VocabParallelEmbedding(nn.Module):
 
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
-        self.axis = axis
-        self.tp_size = mesh_obj.axis_size(axis)
-        self.tp_rank = mesh_obj.axis_local_rank(axis)
+        self.group = group
+        self.tp_size = mesh_obj.group_size(group)
+        self.tp_rank = mesh_obj.group_rank(group)
 
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -169,7 +169,7 @@ class VocabParallelEmbedding(nn.Module):
 
         if prefix:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = vocab(axis=axis, mesh=mesh_obj)
+            self.weight.weight_loader = vocab(group=group, mesh=mesh_obj)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         local = masked_embedding_lookup(
@@ -179,7 +179,7 @@ class VocabParallelEmbedding(nn.Module):
             shard_end=self.shard_end,
         )
         if self.tp_size > 1:
-            local = P.all_reduce(local, axis=self.axis, mesh=self.mesh_name)
+            local = P.all_reduce(local, group=self.group, mesh=self.mesh_name)
         if self.embed_scale != 1.0:
             local = local * self._embed_scale_t.to(local.dtype)
         return local
@@ -190,7 +190,7 @@ class VocabParallelEmbedding(nn.Module):
             f"embedding_dim={self.embedding_dim}, "
             f"per_partition={self.num_embeddings_per_partition}, "
             f"padded={self.num_embeddings_padded}, "
-            f"tp_size={self.tp_size}, axis={self.axis!r}"
+            f"tp_size={self.tp_size}, group={self.group!r}"
         )
         if self.embed_scale != 1.0:
             s += f", embed_scale={self.embed_scale}"
@@ -209,7 +209,7 @@ class ParallelLMHead(nn.Module):
         embedding_dim: hidden size ``D`` (input dim).
         num_embeddings: real vocab size ``V``.
         bias: must be ``False``.
-        params_dtype, spec, padding_multiple, axis, mesh, prefix: as for
+        params_dtype, spec, padding_multiple, group, mesh, prefix: as for
             :class:`VocabParallelEmbedding`.
         tied_weight: if provided, the LM head shares this :class:`nn.Parameter`
             with another layer (typically a :class:`VocabParallelEmbedding`).
@@ -218,7 +218,7 @@ class ParallelLMHead(nn.Module):
             ``Bf16Spec`` is supported in tied mode for now (fp8 etc. would
             need to also tie scale tensors and is deferred).
         gather_output: if True, the per-rank logits are all-gathered along
-            the TP axis on the way out so callers see global ``V_padded``
+            the TP group on the way out so callers see global ``V_padded``
             logits. Default False — the sampler typically gathers itself.
     """
 
@@ -233,7 +233,7 @@ class ParallelLMHead(nn.Module):
         padding_multiple: int = 64,
         tied_weight: nn.Parameter | None = None,
         gather_output: bool = False,
-        axis: str = "tp",
+        group: str = "dense_tp",
         mesh: str = "model",
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -252,12 +252,13 @@ class ParallelLMHead(nn.Module):
             device if device is not None else get_engine_config().device.target
         )
         self.prefix = prefix
+        self.kernel_role = "lm_head"
 
         mesh_obj = resolve_mesh(mesh)
         self.mesh_name = mesh_obj.name
-        self.axis = axis
-        self.tp_size = mesh_obj.axis_size(axis)
-        self.tp_rank = mesh_obj.axis_local_rank(axis)
+        self.group = group
+        self.tp_size = mesh_obj.group_size(group)
+        self.tp_rank = mesh_obj.group_rank(group)
         self.gather_output = gather_output
 
         self.num_embeddings = num_embeddings
@@ -309,22 +310,21 @@ class ParallelLMHead(nn.Module):
             self._tied = False
             if prefix:
                 self.weight.hf_keys = [(f"{prefix}.weight", None)]
-                self.weight.weight_loader = vocab(axis=axis, mesh=mesh_obj)
+                self.weight.weight_loader = vocab(group=group, mesh=mesh_obj)
 
         self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        kernel = get_linear_dispatcher().select(
-            spec_id=self.spec.spec_id,
+        kernel = resolve_linear_kernel(
+            self,
+            x,
             M=_M_of(x),
             N=self.output_size_per_partition,
             K=self.input_size_per_partition,
-            in_dtype=x.dtype,
-            out_dtype=self.params_dtype,
         )
-        y = kernel.apply(self, x, self.bias)
+        y = kernel.execute(self, x, self.bias)
         if self.gather_output and self.tp_size > 1:
-            y = P.all_gather(y, axis=self.axis, dim=-1, mesh=self.mesh_name)
+            y = P.all_gather(y, group=self.group, dim=-1, mesh=self.mesh_name)
         return y
 
     def extra_repr(self) -> str:
@@ -333,7 +333,7 @@ class ParallelLMHead(nn.Module):
             f"num_embeddings={self.num_embeddings}, "
             f"per_partition={self.num_embeddings_per_partition}, "
             f"padded={self.num_embeddings_padded}, "
-            f"tp_size={self.tp_size}, axis={self.axis!r}, "
+            f"tp_size={self.tp_size}, group={self.group!r}, "
             f"gather_output={self.gather_output}"
         )
 

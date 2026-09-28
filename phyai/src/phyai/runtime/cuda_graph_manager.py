@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import contextlib
 from contextvars import ContextVar
-from typing import Any, Callable, Hashable, Iterator
+from typing import Any, Callable, Generator, Hashable
 
 import torch
 
@@ -50,7 +50,7 @@ _capture_stream_override: ContextVar["torch.cuda.Stream | None"] = ContextVar(
 
 
 @contextlib.contextmanager
-def capture_on_stream(stream: "torch.cuda.Stream | None") -> Iterator[None]:
+def capture_on_stream(stream: "torch.cuda.Stream | None") -> Generator[None]:
     """Pin all :meth:`CudaGraph.capture` calls in this scope onto ``stream``.
 
     Use it around model / runner construction that captures graphs, when the

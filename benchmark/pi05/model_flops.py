@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Language-length buckets the pi0.5 scheduler captures graphs for. Must match
-# ``PI05WS1Scheduler._lang_buckets`` (the {16,48,112} set intersected with
+# ``PI05Scheduler._lang_buckets`` (the {16,48,112} set intersected with
 # ``0 < b < tokenizer_max_length`` plus ``tokenizer_max_length`` as fallback).
 DEFAULT_LANG_BUCKETS: tuple[int, ...] = (16, 48, 112, 200)
 

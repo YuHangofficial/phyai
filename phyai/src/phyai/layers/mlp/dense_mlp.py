@@ -1,69 +1,33 @@
-"""DenseMLP — generic 2-layer FFN with optional gating.
+"""Dense two-layer FFN with gated and plain forms.
 
-Covers two MLP topologies that occur side-by-side in modern VLA models
-(SigLIP vision tower + Gemma text tower in PaliGemma is the canonical
-example):
+The gated form computes ``down(act(gate(x)) * up(x))``. A
+:class:`~phyai.layers.linear.MergedColumnParallelLinear` writes gate first and
+up second, which matches FlashInfer's fused ``act_and_mul`` layout. The gated
+path accepts ``silu``, exact ``gelu``, or ``gelu_tanh``.
 
-* **Gated** (``gated=True``) — SwiGLU / GeGLU style
-  ``y = down(act(gate(x)) * up(x))``. Uses
-  :class:`~phyai.layers.linear.MergedColumnParallelLinear` to fuse
-  ``gate`` and ``up`` into one ``[gate, up]`` column-parallel matmul,
-  then a flashinfer fused ``act_and_mul`` kernel, then a
-  :class:`~phyai.layers.linear.RowParallelLinear` ``down``. The fused
-  layout matches flashinfer's
-  ``act(input[..., :H]) * input[..., H:]`` exactly: gate occupies the
-  first half (shard_id 0) and up the second half (shard_id 1).
+The plain form computes ``fc2(act(fc1(x)))`` and accepts exact or tanh GELU.
+Non-gated SiLU is rejected. Activation names are case-insensitive, and hyphens
+normalize to underscores. ``gelu_pytorch_tanh`` and ``gelu_new`` both map to
+``gelu_tanh``. Exact and tanh GELU use separate kernel IDs, so a policy can pin
+either implementation directly.
 
-* **Plain** (``gated=False``) — ``y = fc2(act(fc1(x)))``. No fused
-  kernel exists, so the activation runs through ``F.gelu`` (or
-  ``F.gelu(approximate="tanh")``). This is BERT / CLIP / SigLIP /
-  ViT-style. SiLU is rejected here because no real model uses
-  non-gated SiLU.
+Each child linear owns its ``hf_keys`` and ``weight_loader``. Gated weights use
+``gate_proj``, ``up_proj``, and ``down_proj`` by default; plain weights use
+``fc1`` and ``fc2``. ``gated_hf_legs`` overrides the gate and up names.
 
-Activation x gated matrix:
-
-==========  ==============  ==========================  ===================================
-``gated``   ``activation``  use case                    kernel
-==========  ==============  ==========================  ===================================
-``True``    ``"silu"``      Llama / Qwen SwiGLU         ``flashinfer.activation.silu_and_mul``
-``True``    ``"gelu"``      erf GeGLU                   ``flashinfer.activation.gelu_and_mul``
-``True``    ``"gelu_tanh"`` Gemma GeGLU                 ``flashinfer.activation.gelu_tanh_and_mul``
-``False``   ``"gelu"``      BERT / CLIP MLP             ``F.gelu``
-``False``   ``"gelu_tanh"`` SigLIP / Gemma2 MLP head    ``F.gelu(approximate="tanh")``
-``False``   ``"silu"``      (no real model)             rejected — ``ValueError``
-==========  ==============  ==========================  ===================================
-
-Aliases ``gelu_pytorch_tanh`` and ``gelu_new`` both normalise to
-``gelu_tanh``; underscore vs hyphen is also normalised.
-
-Weight loading: each child linear attaches its own ``hf_keys`` and
-``weight_loader`` at construction (see :mod:`phyai.weights`). HF naming
-for the gated path defaults to ``gate_proj`` / ``up_proj`` /
-``down_proj``; non-gated defaults to ``fc1`` / ``fc2``. The gated leg
-names are overridable via the ``gated_hf_legs=`` constructor kwarg for
-models that use non-standard names.
-
-Limitations
------------
-* No fused activation+quantisation. flashinfer ships
-  ``silu_and_mul_scaled_nvfp4_experts_quantize`` for MoE FP4 but
-  plumbing that here would require a non-linear-op spec hook that does
-  not exist yet.
-* No pre-allocated output buffer for ``act_and_mul``. flashinfer
-  allocates internally per call. A buffer-pool optimisation would be a
-  separate, future change.
-* ``enable_pdl`` is auto-detected by flashinfer; not exposed here.
+Activation and quantization run as separate operations. FlashInfer allocates
+the fused activation output internally and controls ``enable_pdl``.
 """
 
 from __future__ import annotations
 
-import functools
 from typing import Callable, Literal
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from phyai.kernel.call import CallSite, token_shape
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -84,44 +48,62 @@ def _canonicalise_activation(name: str) -> str:
     return canon
 
 
-def _resolve_gated_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Lazy-import flashinfer's fused ``act_and_mul`` for ``name``.
+def _activation_fn(name: str, *, gated: bool) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return a callable that selects its kernel per call.
 
-    The lazy import mirrors :class:`phyai.layers.layer_norm.RMSNorm` —
-    picking one branch shouldn't drag in flashinfer's other modules.
+    Selection facts include shape, device and execution mode, and one module
+    can see several decode/prefill buckets, so the choice cannot be frozen at
+    construction. The selector caches on the normalized query, which is a
+    superset of what a local memo could key on -- the two closure-local dicts
+    this replaces were caching in front of that.
+
+    Gated and plain forms share one catalog operation and differ by the
+    ``gated`` fact, because that is exactly what distinguishes the contracts:
+    FlashInfer only ships the fused gate-and-multiply variants.
     """
+
     canon = _canonicalise_activation(name)
-    if canon == "silu":
-        from flashinfer.activation import silu_and_mul
+    if gated:
+        if canon not in _GATED_ACTS:
+            raise ValueError(
+                f"Unsupported gated activation {name!r}; expected one of "
+                f"{_GATED_ACTS!r}."
+            )
+    else:
+        if canon == "silu":
+            raise ValueError(
+                "non-gated SiLU is not supported (no real model uses it; "
+                "did you mean gated=True?)"
+            )
+        if canon not in _PLAIN_ACTS:
+            raise ValueError(
+                f"Unsupported plain activation {name!r}; expected one of "
+                f"{_PLAIN_ACTS!r}."
+            )
 
-        return silu_and_mul
-    if canon == "gelu":
-        from flashinfer.activation import gelu_and_mul
-
-        return gelu_and_mul
-    if canon == "gelu_tanh":
-        from flashinfer.activation import gelu_tanh_and_mul
-
-        return gelu_tanh_and_mul
-    raise ValueError(
-        f"Unsupported gated activation {name!r}; expected one of {_GATED_ACTS!r}."
+    site = CallSite(
+        "activation",
+        role="mlp.activation",
+        attrs={"activation": canon, "gated": gated},
     )
+
+    def activate(value: torch.Tensor) -> torch.Tensor:
+        handle = site.select(
+            device=value.device,
+            dtype={"input": value.dtype, "output": value.dtype},
+            dims=token_shape(value, hidden=value.shape[-1]),
+        )
+        return handle.execute(value)
+
+    return activate
+
+
+def _resolve_gated_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    return _activation_fn(name, gated=True)
 
 
 def _resolve_plain_act(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
-    canon = _canonicalise_activation(name)
-    if canon == "gelu":
-        return F.gelu
-    if canon == "gelu_tanh":
-        return functools.partial(F.gelu, approximate="tanh")
-    if canon == "silu":
-        raise ValueError(
-            "non-gated SiLU is not supported (no real model uses it; "
-            "did you mean gated=True?)"
-        )
-    raise ValueError(
-        f"Unsupported plain activation {name!r}; expected one of {_PLAIN_ACTS!r}."
-    )
+    return _activation_fn(name, gated=False)
 
 
 class DenseMLP(nn.Module):
@@ -145,11 +127,10 @@ class DenseMLP(nn.Module):
     bias:
         Bias on every internal linear. Llama / Gemma FFNs use
         ``bias=False``; SigLIP / BERT-style use ``bias=True``.
-    axis / sp_axis:
-        Mesh axis for TP and (optionally) sequence-parallel entry. The
-        entry layer (``gate_up_proj`` / ``fc1``) all-gathers along
-        ``sp_axis`` if set; the exit layer always reduces along
-        ``axis``.
+    group / sequence_parallel:
+        TP group and optional sequence parallelism. Sequence parallelism
+        gathers input tokens and reduce-scatters outputs over the same group.
+        ``None`` uses the engine's dense sequence-parallel setting.
     params_dtype:
         Dtype for parameter allocation. Defaults to torch default.
     spec_in / spec_out:
@@ -174,8 +155,8 @@ class DenseMLP(nn.Module):
         activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
         gated: bool = True,
         bias: bool = False,
-        axis: str = "tp",
-        sp_axis: str | None = None,
+        group: str = "dense_tp",
+        sequence_parallel: bool | None = None,
         params_dtype: torch.dtype | None = None,
         spec_in: object | None = None,
         spec_out: object | None = None,
@@ -190,13 +171,15 @@ class DenseMLP(nn.Module):
         self.gated = gated
         self.bias_enabled = bias
         self.prefix = prefix
+        if sequence_parallel is None:
+            sequence_parallel = get_engine_config().parallel.dense.sequence_parallel
 
         if gated:
             self.gate_up_proj = MergedColumnParallelLinear(
                 in_features=hidden_size,
                 output_sizes=[intermediate_size, intermediate_size],
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 gather_output=False,
                 bias=bias,
                 params_dtype=params_dtype,
@@ -208,8 +191,8 @@ class DenseMLP(nn.Module):
             self.down_proj = RowParallelLinear(
                 in_features=intermediate_size,
                 out_features=hidden_size,
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 input_is_parallel=True,
                 reduce_results=True,
                 bias=bias,
@@ -228,8 +211,8 @@ class DenseMLP(nn.Module):
             self.fc1 = ColumnParallelLinear(
                 in_features=hidden_size,
                 out_features=intermediate_size,
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 gather_output=False,
                 bias=bias,
                 params_dtype=params_dtype,
@@ -240,8 +223,8 @@ class DenseMLP(nn.Module):
             self.fc2 = RowParallelLinear(
                 in_features=intermediate_size,
                 out_features=hidden_size,
-                axis=axis,
-                sp_axis=sp_axis,
+                group=group,
+                sequence_parallel=sequence_parallel,
                 input_is_parallel=True,
                 reduce_results=True,
                 bias=bias,

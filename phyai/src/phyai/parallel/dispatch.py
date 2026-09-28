@@ -7,11 +7,11 @@ on the hot path — its construction would dominate the lookup cost.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 
+from phyai.env import envs
 from phyai.parallel.backend import Backend, Op
 from phyai.parallel.exceptions import NoBackendError
 from phyai.parallel.mesh import Mesh
@@ -37,7 +37,7 @@ class Dispatcher:
         policy: Policy | None = None,
     ) -> None:
         self.registry = registry
-        forced = os.environ.get("PHYAI_FORCE_BACKEND")
+        forced = envs.PHYAI_FORCE_COLLECTIVE_BACKEND.get()
         if policy is not None:
             self.policy = policy
         elif forced:
@@ -51,7 +51,7 @@ class Dispatcher:
         *,
         op: Op,
         mesh: Mesh,
-        axis: str,
+        group: str,
         tensor: torch.Tensor | None,
         extra_key: tuple[Any, ...] = (),
         **extra_kwargs: Any,
@@ -59,48 +59,32 @@ class Dispatcher:
         nbytes = tensor.numel() * tensor.element_size() if tensor is not None else 0
         dtype = tensor.dtype if tensor is not None else torch.uint8
         mode = current_mode()
-        ws = mesh.axis_size(axis)
-        key = (op, axis, mesh.name, dtype, _size_bucket(nbytes), mode, ws, extra_key)
+        ws = mesh.group_size(group)
+        key = (op, group, mesh.name, dtype, _size_bucket(nbytes), mode, ws, extra_key)
         b = self._cache.get(key)
         if b is None:
-            pg = mesh.axis_group(axis)
+            pg = mesh.group(group)
             cands = self.registry.candidates(
                 op=op,
                 mode=mode,
                 nbytes=nbytes,
                 dtype=dtype,
                 world_size=ws,
-                topology=mesh.topology(),
+                topology=mesh.topology(group),
                 pg=pg,
+                mesh_name=mesh.name,
+                group=group,
                 **extra_kwargs,
             )
             if not cands:
                 raise NoBackendError(
                     f"no backend for op={op.value} mode={mode.value} "
-                    f"axis={axis} mesh={mesh.name} ws={ws} "
+                    f"group={group} mesh={mesh.name} ws={ws} "
                     f"nbytes={nbytes} dtype={dtype}"
                 )
             b = self.policy.select(cands)
             self._cache[key] = b
         return b
-
-    def has_for(
-        self,
-        *,
-        op: Op,
-        mesh: Mesh,
-        axis: str,
-        tensor: torch.Tensor | None = None,
-    ) -> bool:
-        try:
-            self.select(op=op, mesh=mesh, axis=axis, tensor=tensor)
-            return True
-        except NoBackendError:
-            return False
-
-    def clear_cache(self) -> None:
-        """Test helper / used after re-registering backends."""
-        self._cache.clear()
 
 
 # Process-level singleton; populated in `phyai.parallel.init(...)`.
@@ -116,3 +100,9 @@ def get_dispatcher() -> Dispatcher:
 def set_dispatcher(d: Dispatcher) -> None:
     global _dispatcher
     _dispatcher = d
+
+
+def reset_dispatcher() -> None:
+    """Drop the process-level dispatcher (used by ``phyai.parallel.shutdown``)."""
+    global _dispatcher
+    _dispatcher = None

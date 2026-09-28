@@ -21,11 +21,6 @@ from phyai.layers.rotary_embedding import (
 )
 
 
-cuda_only = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="flashinfer RoPE needs CUDA"
-)
-
-
 # ---------------------------------------------------------------------------
 # Reference helpers
 # ---------------------------------------------------------------------------
@@ -36,7 +31,11 @@ def _ref_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference cos/sin for rotate-half RoPE."""
     inv_freq = 1.0 / (
-        theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+        theta
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=pos_ids.device)
+            / rotary_dim
+        )
     )
     freqs = torch.outer(pos_ids.float().reshape(-1), inv_freq).reshape(
         *pos_ids.shape, -1
@@ -145,7 +144,7 @@ def test_unknown_rope_type_raises():
 
 
 def test_unknown_backend_raises():
-    with pytest.raises(ValueError, match="Unknown RoPE backend"):
+    with pytest.raises(ValueError, match="unknown backend"):
         RotaryEmbedding(64, backend="banana")
 
 
@@ -180,9 +179,9 @@ def test_eager_matches_manual_4d():
     torch.manual_seed(0)
     H_q, H_k, D, S, B = 8, 8, 64, 16, 2
     theta = 10000.0
-    q = torch.randn(B, S, H_q, D)
-    k = torch.randn(B, S, H_k, D)
-    pos = torch.arange(S).unsqueeze(0).expand(B, S)
+    q = torch.randn(B, S, H_q, D, device="cuda")
+    k = torch.randn(B, S, H_k, D, device="cuda")
+    pos = torch.arange(S, device="cuda").unsqueeze(0).expand(B, S)
 
     m = RotaryEmbedding(
         D, max_position_embeddings=64, rope_theta=theta, backend="eager"
@@ -197,9 +196,9 @@ def test_eager_matches_manual_3d_ragged():
     torch.manual_seed(1)
     nnz, H, D = 12, 4, 64
     theta = 10000.0
-    q = torch.randn(nnz, H, D)
-    k = torch.randn(nnz, H, D)
-    pos = torch.arange(nnz)
+    q = torch.randn(nnz, H, D, device="cuda")
+    k = torch.randn(nnz, H, D, device="cuda")
+    pos = torch.arange(nnz, device="cuda")
 
     m = RotaryEmbedding(
         D, max_position_embeddings=64, rope_theta=theta, backend="eager"
@@ -213,9 +212,9 @@ def test_eager_matches_manual_3d_ragged():
 def test_eager_gqa_q_k_diff_heads():
     torch.manual_seed(2)
     B, S, H_q, H_k, D = 2, 8, 8, 2, 64
-    q = torch.randn(B, S, H_q, D)
-    k = torch.randn(B, S, H_k, D)
-    pos = torch.arange(S)
+    q = torch.randn(B, S, H_q, D, device="cuda")
+    k = torch.randn(B, S, H_k, D, device="cuda")
+    pos = torch.arange(S, device="cuda")
 
     m = RotaryEmbedding(D, max_position_embeddings=32, backend="eager")
     q_out, k_out = m(pos, q, k)
@@ -229,9 +228,9 @@ def test_eager_partial_rotary_factor_passthrough():
     B, S, H, D = 1, 4, 2, 64
     partial = 0.5
     rotary_dim = int(D * partial)  # 32
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    pos = torch.arange(S)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    pos = torch.arange(S, device="cuda")
 
     m = RotaryEmbedding(
         D, max_position_embeddings=16, partial_rotary_factor=partial, backend="eager"
@@ -257,9 +256,9 @@ def test_eager_partial_rotary_factor_passthrough():
 def test_eager_position_ids_1d_broadcasts_over_batch():
     torch.manual_seed(4)
     B, S, H, D = 3, 5, 2, 64
-    q = torch.randn(B, S, H, D)
-    k = torch.randn(B, S, H, D)
-    pos_1d = torch.arange(S)
+    q = torch.randn(B, S, H, D, device="cuda")
+    k = torch.randn(B, S, H, D, device="cuda")
+    pos_1d = torch.arange(S, device="cuda")
     pos_2d = pos_1d.unsqueeze(0).expand(B, S)
 
     m = RotaryEmbedding(D, max_position_embeddings=16, backend="eager")
@@ -277,9 +276,9 @@ def test_eager_position_ids_1d_broadcasts_over_batch():
 def test_eager_interleave_matches_manual():
     torch.manual_seed(5)
     nnz, H, D = 6, 2, 64
-    q = torch.randn(nnz, H, D)
-    k = torch.randn(nnz, H, D)
-    pos = torch.arange(nnz)
+    q = torch.randn(nnz, H, D, device="cuda")
+    k = torch.randn(nnz, H, D, device="cuda")
+    pos = torch.arange(nnz, device="cuda")
 
     m = RotaryEmbedding(D, max_position_embeddings=16, interleave=True, backend="eager")
     q_out, k_out = m(pos, q, k)
@@ -352,9 +351,9 @@ def test_2d_q_raises():
 def test_module_linear_scaling_changes_output():
     torch.manual_seed(6)
     D, S, H = 64, 8, 2
-    q = torch.randn(1, S, H, D)
-    k = torch.randn(1, S, H, D)
-    pos = torch.arange(S)
+    q = torch.randn(1, S, H, D, device="cuda")
+    k = torch.randn(1, S, H, D, device="cuda")
+    pos = torch.arange(S, device="cuda")
 
     m_def = RotaryEmbedding(D, max_position_embeddings=16, backend="eager")
     m_lin = RotaryEmbedding(
@@ -375,7 +374,6 @@ def test_module_linear_scaling_changes_output():
 # ---------------------------------------------------------------------------
 
 
-@cuda_only
 def test_flashinfer_matches_eager_4d_bf16():
     torch.manual_seed(7)
     B, S, H_q, H_k, D = 2, 16, 8, 2, 64
@@ -395,7 +393,6 @@ def test_flashinfer_matches_eager_4d_bf16():
     torch.testing.assert_close(k_f, k_e, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_flashinfer_matches_eager_3d_ragged_bf16():
     torch.manual_seed(8)
     nnz, H_q, H_k, D = 24, 8, 2, 64
@@ -416,7 +413,6 @@ def test_flashinfer_matches_eager_3d_ragged_bf16():
     torch.testing.assert_close(k_f, k_e, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_flashinfer_partial_rotary_matches_eager_bf16():
     torch.manual_seed(9)
     B, S, H, D = 1, 8, 4, 64
@@ -444,7 +440,6 @@ def test_flashinfer_partial_rotary_matches_eager_bf16():
     torch.testing.assert_close(k_f, k_e, atol=2e-2, rtol=2e-2)
 
 
-@cuda_only
 def test_flashinfer_rejects_cpu_input():
     m = RotaryEmbedding(
         64, max_position_embeddings=16, backend="flashinfer", device="cuda"
@@ -454,6 +449,43 @@ def test_flashinfer_rejects_cpu_input():
     pos = torch.arange(4)
     with pytest.raises(RuntimeError, match="rotary_emb.to"):
         m(pos, q, k)
+
+
+@pytest.mark.parametrize("backend", ["eager", "flashinfer"])
+def test_rope_kernel_executes_without_the_module(backend):
+    """The catalog rows are pure kernels: ``(positions, q, k, cos_sin_cache)``.
+
+    Selecting a "rope" handle directly and executing it with bare tensors
+    must reproduce the module forward bit-for-bit — pinning the contract
+    that no implementation reaches back into the layer object.
+    """
+    from phyai.kernel.call import backend_preference, select
+
+    torch.manual_seed(11)
+    D, S, H = 64, 12, 4
+    m = RotaryEmbedding(D, max_position_embeddings=32, backend=backend, device="cuda")
+    q = torch.randn(1, S, H, D, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, S, H, D, device="cuda", dtype=torch.float16)
+    pos = torch.arange(S, device="cuda")
+    q_ref, k_ref = m(pos, q, k)
+
+    handle = select(
+        "rope",
+        device=q.device,
+        dtype={"input": q.dtype},
+        shape={
+            "tokens": S,
+            "head_dim": D,
+            "rotary_dim": D,
+            "heads_q": H,
+            "heads_k": H,
+        },
+        attrs={"rope_type": "default", "interleave": False},
+        prefer=backend_preference("rope", backend),
+    )
+    q_out, k_out = handle.execute(pos, q, k, m.cos_sin_cache)
+    torch.testing.assert_close(q_out, q_ref, atol=0, rtol=0)
+    torch.testing.assert_close(k_out, k_ref, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

@@ -1,32 +1,33 @@
-"""ABC and per-call types for FlashInfer-backed Gated Delta Net."""
+"""Types for FlashInfer-backed Gated Delta Net.
+
+The metadata lifecycle is the shared
+:mod:`phyai.layers.attention.contract`.
+"""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import torch
 
+from phyai.layers.attention.contract import (
+    AttentionBackendBase,
+    AttnPlanHandleBase,
+    BaseAttnMetadata,
+)
 from phyai.layers.attention.enums import AttnLayout, AttnMode
 
 
 @dataclass(frozen=True)
-class GatedDeltaNetMetadata:
+class GatedDeltaNetMetadata(BaseAttnMetadata):
     """Host-side description of one GDN step."""
 
-    mode: AttnMode
-    layout: AttnLayout
-    batch_size: int
-    num_query_tokens: int
     cu_seqlens: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
-        if self.batch_size < 0 or self.num_query_tokens < 0:
-            raise ValueError(
-                f"GatedDeltaNetMetadata: batch_size={self.batch_size}, "
-                f"num_query_tokens={self.num_query_tokens} must be non-negative."
-            )
+        super().__post_init__()
         if self.mode == AttnMode.IDLE:
             return
         if self.mode == AttnMode.MIXED:
@@ -37,8 +38,8 @@ class GatedDeltaNetMetadata:
             raise ValueError("GatedDeltaNetMetadata: DECODE requires PADDED_4D layout.")
 
 
-class GatedDeltaNetPlanHandle:
-    """Backend-private per-step state."""
+class GatedDeltaNetPlanHandle(AttnPlanHandleBase):
+    """Backend-private per-step state for GDN."""
 
 
 @dataclass(frozen=True)
@@ -76,42 +77,10 @@ class GatedDeltaNetLayerProto(Protocol):
     use_qk_l2norm: bool
 
 
-class GatedDeltaNetBackend(ABC):
+class GatedDeltaNetBackend(
+    AttentionBackendBase[GatedDeltaNetMetadata, GatedDeltaNetPlanHandle]
+):
     """ABC for Gated Delta Net kernel backends."""
-
-    name: ClassVar[str]
-
-    def supports_capture(self) -> bool:
-        return False
-
-    def init_cuda_graph_state(
-        self,
-        *,
-        max_batch_size: int,
-        max_num_tokens: int,
-        device: torch.device,
-        params_dtype: torch.dtype,
-        layer_proto: GatedDeltaNetLayerProto,
-    ) -> None:
-        return None
-
-    def init_capture_metadata(
-        self, seed_meta: GatedDeltaNetMetadata
-    ) -> GatedDeltaNetPlanHandle:
-        return self.init_forward_metadata(seed_meta)
-
-    def replay_metadata(
-        self,
-        plan: GatedDeltaNetPlanHandle,
-        replay_meta: GatedDeltaNetMetadata,
-    ) -> None:
-        return None
-
-    @abstractmethod
-    def init_forward_metadata(
-        self, meta: GatedDeltaNetMetadata
-    ) -> GatedDeltaNetPlanHandle:
-        """Prepare one eager step and return its opaque plan handle."""
 
     @abstractmethod
     def forward(

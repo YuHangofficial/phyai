@@ -1,45 +1,15 @@
-"""Typed env-var registry for ``PHYAI_*`` overrides.
-
-Every env var phyai consults goes through one :class:`EnvField`
-descriptor in :class:`envs` below — instead of scattered
-``os.environ.get(...)`` calls in random modules. Two upsides:
-
-* one place to document and tune the env-var contract;
-* typed parsing (``int`` / ``bool`` / ``torch.dtype``) lives next to
-  the declaration, so callers always get the right shape back without
-  rewriting parsing logic per-site.
-
-Usage
------
-::
-
-    from phyai.env import envs
-
-    if (raw := envs.PHYAI_ATTN_BACKEND.get()) is not None:
-        cfg = cfg.replace(backends=cfg.backends.replace(attn=raw))
-
-The module is intentionally tiny and dependency-free (no torch, no
-phyai imports) so it can be consulted from low-level modules during
-their own bootstrap without import cycles.
-"""
+"""Typed registry for ``PHYAI_*`` environment variables."""
 
 from __future__ import annotations
 
 import os
-from typing import Callable, Generic, TypeVar
-
+from typing import Generic, TypeVar, Callable
 
 T = TypeVar("T")
 
 
 class EnvField(Generic[T]):
-    """One typed env-var slot with a parser and an optional default.
-
-    ``get()`` returns ``self.default`` when the variable is unset, and
-    a parsed value otherwise. Parsing errors raise :class:`ValueError`
-    with the env-var name attached so the failure points back at the
-    user's environment rather than the consuming module.
-    """
+    """Typed environment-variable field with an optional default."""
 
     __slots__ = ("name", "default", "parser")
 
@@ -68,7 +38,7 @@ class EnvField(Generic[T]):
 
 
 def _parse_bool(s: str) -> bool:
-    """Accept ``1/true/yes/on`` (case-insensitive) -> True; ``0/false/no/off`` -> False."""
+    """Parse a boolean environment value."""
     v = s.strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
@@ -78,11 +48,7 @@ def _parse_bool(s: str) -> bool:
 
 
 def _parse_dtype(s: str):
-    """Map a name like ``"bf16"`` / ``"bfloat16"`` to ``torch.dtype``.
-
-    Imports torch lazily so importing :mod:`phyai.env` stays cheap
-    and dependency-free at module-import time.
-    """
+    """Parse a PyTorch dtype name."""
     import torch
 
     table: dict[str, "torch.dtype"] = {
@@ -107,15 +73,7 @@ def _parse_dtype(s: str):
 
 
 def _parse_regex_list(s: str) -> tuple[str, ...]:
-    """Parse a JSON array of regex strings, e.g. ``'["o_proj$", "\\\\.heads\\\\."]'``.
-
-    JSON (not a comma-split) because regex patterns routinely contain
-    ``,`` / ``|`` / ``.`` that a naive split would mangle. A single bare
-    string (not valid JSON, or JSON that isn't a list) is treated as a
-    one-element list so ``PHYAI_DEBUG_TENSOR_DUMP_FILTER='o_proj$'`` also
-    works for the common single-pattern case. An empty / whitespace string
-    yields the empty tuple. Used for the tensor-dump operator filter.
-    """
+    """Parse a JSON regex list or a single bare pattern."""
     import json
 
     raw = s.strip()
@@ -135,50 +93,55 @@ def _parse_regex_list(s: str) -> tuple[str, ...]:
 
 
 class envs:
-    """Process-level typed env-var registry.
+    """Process-level typed environment-variable registry."""
 
-    Read each via ``envs.PHYAI_FOO.get()`` and check ``.is_set()`` when
-    you need to distinguish "unset" from "set to default". Adding a new
-    env var means a single new line here and a one-line consumer change.
-    """
-
-    # ---------- backend / kernel selection ---------- #
-    PHYAI_ATTN_BACKEND = EnvField("PHYAI_ATTN_BACKEND", None, str)
-    PHYAI_NORM_BACKEND = EnvField("PHYAI_NORM_BACKEND", None, str)
-    PHYAI_LINEAR_BACKEND = EnvField("PHYAI_LINEAR_BACKEND", None, str)
+    # Backend and kernel selection.
     PHYAI_VGPU_BACKEND = EnvField("PHYAI_VGPU_BACKEND", None, str)
+    # Prefer one collective (communication) backend by name: "nccl", "pynccl"
+    # or "gloo". It wins whenever it can serve the call and falls back
+    # otherwise (pynccl declines eager mode). Distinct from the vGPU backend
+    # and from kernel policies.
+    PHYAI_FORCE_COLLECTIVE_BACKEND = EnvField(
+        "PHYAI_FORCE_COLLECTIVE_BACKEND", None, str
+    )
+    # Explicit libnccl path for the ctypes pynccl backend.
+    PHYAI_NCCL_SO_PATH = EnvField("PHYAI_NCCL_SO_PATH", None, str)
+    PHYAI_KERNEL_CONFIG = EnvField("PHYAI_KERNEL_CONFIG", None, str)
+    PHYAI_KERNEL_PROFILE = EnvField("PHYAI_KERNEL_PROFILE", None, str)
+    PHYAI_KERNEL_AUTOTUNE_CACHE = EnvField("PHYAI_KERNEL_AUTOTUNE_CACHE", None, str)
+    # Recheck frozen kernel selections on every call.
+    PHYAI_KERNEL_VERIFY_FROZEN = EnvField(
+        "PHYAI_KERNEL_VERIFY_FROZEN", None, _parse_bool
+    )
 
-    # ---------- device / dtype ---------- #
+    # Device and dtype.
     PHYAI_DEVICE = EnvField("PHYAI_DEVICE", None, str)
     PHYAI_PARAMS_DTYPE = EnvField("PHYAI_PARAMS_DTYPE", None, _parse_dtype)
 
-    # ---------- runtime ---------- #
+    # Runtime settings.
     PHYAI_USE_CUDA_GRAPH = EnvField("PHYAI_USE_CUDA_GRAPH", None, _parse_bool)
+    PHYAI_FREEZE_KERNEL_CHOICES = EnvField(
+        "PHYAI_FREEZE_KERNEL_CHOICES", None, _parse_bool
+    )
+    # Distributed process-group timeout in seconds.
+    PHYAI_DIST_TIMEOUT_S = EnvField("PHYAI_DIST_TIMEOUT_S", None, int)
+    # Torch intra-op thread count.
+    PHYAI_NUM_THREADS = EnvField("PHYAI_NUM_THREADS", None, int)
+    # Global Python, NumPy, and Torch RNG seed.
+    PHYAI_SEED = EnvField("PHYAI_SEED", None, int)
 
-    # ---------- parallel ---------- #
-    PHYAI_WORLD_SIZE = EnvField("PHYAI_WORLD_SIZE", None, int)
-    PHYAI_DP_SIZE = EnvField("PHYAI_DP_SIZE", None, int)
-    PHYAI_CFG_SIZE = EnvField("PHYAI_CFG_SIZE", None, int)
-    PHYAI_EP_SIZE = EnvField("PHYAI_EP_SIZE", None, int)
-    PHYAI_SP_SIZE = EnvField("PHYAI_SP_SIZE", None, int)
-    PHYAI_CP_SIZE = EnvField("PHYAI_CP_SIZE", None, int)
-    PHYAI_TP_SIZE = EnvField("PHYAI_TP_SIZE", None, int)
+    # Bootstrap and diagnostics.
+    # Default log-handler level.
+    PHYAI_LOG_LEVEL = EnvField("PHYAI_LOG_LEVEL", None, str)
+    # Skip PhyAI environment tuning.
+    PHYAI_SKIP_ENV_SETUP = EnvField("PHYAI_SKIP_ENV_SETUP", None, _parse_bool)
 
-    # ---------- low-level tuning ---------- #
+    # Low-level tuning.
     PHYAI_FLASHINFER_WORKSPACE_BYTES = EnvField(
         "PHYAI_FLASHINFER_WORKSPACE_BYTES", None, int
     )
-    PHYAI_FLASHINFER_PREFILL_BACKEND = EnvField(
-        "PHYAI_FLASHINFER_PREFILL_BACKEND", None, str
-    )
-    PHYAI_FORCE_LINEAR_KERNEL = EnvField("PHYAI_FORCE_LINEAR_KERNEL", None, str)
 
-    # ---------- debug / tensor dump ---------- #
-    # When the dump dir is set the engine runs eager (cuda graph forced
-    # off) and records every selected leaf operator's output, one .pt per
-    # step. FILTER is a JSON array of regexes matched against operator
-    # names (or a single bare pattern); FILTER_FN is a "pkg.mod:func" /
-    # "/path.py:func" predicate. The two filters are mutually exclusive.
+    # Tensor-dump output and operator filters.
     PHYAI_DEBUG_TENSOR_DUMP_DIR = EnvField("PHYAI_DEBUG_TENSOR_DUMP_DIR", None, str)
     PHYAI_DEBUG_TENSOR_DUMP_FILTER = EnvField(
         "PHYAI_DEBUG_TENSOR_DUMP_FILTER", None, _parse_regex_list
@@ -186,6 +149,87 @@ class envs:
     PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN = EnvField(
         "PHYAI_DEBUG_TENSOR_DUMP_FILTER_FN", None, str
     )
+
+
+#: Removed variables are rejected instead of silently changing topology.
+REMOVED_ENV_VARS: dict[str, str] = {
+    "PHYAI_REPLICA_COUNT": "DeploymentConfig(replica_count=...)",
+    "PHYAI_CFG_SIZE": "EngineConfig.parallel.outer.cfg_size",
+    "PHYAI_TP_SIZE": "EngineConfig.parallel.dense.tp_size",
+    "PHYAI_EP_SIZE": "EngineConfig.parallel.moe.ep_size",
+    "PHYAI_SP_SIZE": "EngineConfig.parallel.dense.sequence_parallel",
+    "PHYAI_CP_SIZE": "EngineConfig.parallel.attention.cp_size",
+    "PHYAI_DP_SIZE": "DeploymentConfig(replica_count=...)",
+    "PHYAI_WORLD_SIZE": (
+        "the launcher or local deployment determines the replica world size"
+    ),
+    "PHYAI_ATTN_BACKEND": (
+        "a kernel policy rule -- e.g. "
+        "`rules: [{match: {op: attention}, restrict_to: 'sdpa.attention'}]` "
+        "in the YAML named by PHYAI_KERNEL_CONFIG -- or a layer's backend= "
+        "argument. A policy rule can scope itself to one op and one role; this "
+        "variable could not."
+    ),
+    "PHYAI_NORM_BACKEND": (
+        "a kernel policy rule -- e.g. "
+        "`rules: [{match: {op: rmsnorm}, restrict_to: 'phyai_kernel.*'}]` -- "
+        "or a layer's backend= argument"
+    ),
+    "PHYAI_LINEAR_BACKEND": (
+        "a kernel policy rule -- e.g. "
+        "`rules: [{match: {op: gemm, role: mlp.down}, restrict_to: 'torch.gemm.*'}]`. "
+        "This variable never had any effect at all: it was validated against the "
+        "catalog but nothing read it."
+    ),
+    "PHYAI_FLASHINFER_PREFILL_BACKEND": (
+        "a kernel policy rule naming the row -- e.g. "
+        "`rules: [{match: {op: attention_paged}, restrict_to: "
+        "'flashinfer.attention_paged.fa2'}]`. Each FlashInfer prefill "
+        "kernel is now its own catalog row, so the choice can be scoped to one "
+        "op or role and is capability-gated (FA3 is Hopper-only, trtllm-gen and "
+        "cutlass are Blackwell-only). This variable was one name for every "
+        "attention site in the process, and its single valid-name set was "
+        "written for the paged wrapper while the no-cache stack uses the ragged "
+        "one, which accepts a different set"
+    ),
+    "PHYAI_FORCE_BACKEND": (
+        "PHYAI_FORCE_COLLECTIVE_BACKEND with the same value (nccl / pynccl / "
+        "gloo); the old name did not say which backend it forced"
+    ),
+    "PHYAI_REPLICA_ID": (
+        "the WorkerPlacement handed to the worker factory (replica_id); the "
+        "supervisor no longer mirrors placement into the environment"
+    ),
+    "PHYAI_WORKER_ID": (
+        "the WorkerPlacement handed to the worker factory (worker_id); the "
+        "supervisor no longer mirrors placement into the environment"
+    ),
+    "PHYAI_REPLICA_NODE_COUNT": (
+        "nothing: placement is probed at runtime by phyai.parallel.init (node "
+        "identity gathered over the process group, NVLink checked with NVML)"
+    ),
+    "PHYAI_REPLICA_GPUS_PER_NODE": (
+        "nothing: placement is probed at runtime by phyai.parallel.init (node "
+        "identity gathered over the process group, NVLink checked with NVML)"
+    ),
+    "PHYAI_FORCE_LINEAR_KERNEL": (
+        "a kernel policy rule -- e.g. "
+        "`rules: [{match: {op: gemm}, restrict_to: 'torch.gemm.*'}]`, or add a "
+        "`role:` to the match to change only one layer group"
+    ),
+}
+
+
+def removed_env_vars_in_use() -> dict[str, str]:
+    """Return removed environment variables currently in use."""
+
+    import os
+
+    return {
+        name: advice
+        for name, advice in REMOVED_ENV_VARS.items()
+        if os.environ.get(name)
+    }
 
 
 __all__ = ["EnvField", "envs"]

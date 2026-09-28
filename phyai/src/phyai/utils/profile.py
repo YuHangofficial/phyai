@@ -53,18 +53,18 @@ from __future__ import annotations
 import abc
 import argparse
 import contextlib
-import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, ContextManager, Iterator, Literal, Sequence
+from typing import Any, ClassVar, ContextManager, Generator, Literal, Sequence
 
 import torch
 import torch.distributed as dist
+from phyai.utils.logging import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 ProfilerBackendName = Literal["none", "torch", "nsys"]
@@ -261,7 +261,7 @@ def _have_cuda() -> bool:
 
 
 @contextmanager
-def _nvtx_range(name: str) -> Iterator[None]:
+def _nvtx_range(name: str) -> Generator[None]:
     """NVTX push/pop with a graceful fallback when CUDA is not present."""
     if not _have_cuda():
         yield

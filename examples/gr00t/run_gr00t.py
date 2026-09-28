@@ -27,7 +27,7 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
 from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
-from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+from phyai.models.gr00t_n17.scheduler_gr00t_n17 import GR00TN17Request
 from phyai.utils import load_config
 
 

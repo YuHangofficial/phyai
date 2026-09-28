@@ -20,9 +20,9 @@ from phyai.models.minicpm_gr00t.modeling_minicpm_gr00t import (
     MiniCPMGR00TModel,
     minicpm_gr00t_weight_remap,
 )
-from phyai.models.minicpm_gr00t.scheduler_ws1_minicpm_gr00t import (
+from phyai.models.minicpm_gr00t.scheduler_minicpm_gr00t import (
     MiniCPMGR00TRequest,
-    MiniCPMGR00TWS1Scheduler,
+    MiniCPMGR00TScheduler,
 )
 from phyai.weights import load_pretrained
 
@@ -61,7 +61,7 @@ def _compose_remap(
 
 @dataclass
 class MiniCPMGR00TArgs(EntryArgs):
-    """Arguments for the single-card MiniCPM-GR00T inference plugin."""
+    """Arguments for the MiniCPM-GR00T inference plugin."""
 
     checkpoint: str | Path | None = None
     config: MiniCPMGR00TConfig | None = None
@@ -82,7 +82,7 @@ class MiniCPMGR00TEntry(Entry):
 
     def __init__(self) -> None:
         self.model: MiniCPMGR00TModel | None = None
-        self.scheduler: MiniCPMGR00TWS1Scheduler | None = None
+        self.scheduler: MiniCPMGR00TScheduler | None = None
 
     def setup(self, args: MiniCPMGR00TArgs) -> None:  # type: ignore[override]
         engine = get_engine_config()
@@ -108,7 +108,7 @@ class MiniCPMGR00TEntry(Entry):
             device=engine.device.target,
             use_cuda_graph=engine.runtime.use_cuda_graph,
         )
-        self.scheduler = MiniCPMGR00TWS1Scheduler(
+        self.scheduler = MiniCPMGR00TScheduler(
             runner,
             device=engine.device.target,
         )

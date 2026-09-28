@@ -14,6 +14,9 @@ dependencies = [
 [tool.ruff.format]
 preview = false
 
+[tool.ruff.lint.isort]
+length-sort = true
+
 [tool.uv]
 package = false
 
@@ -37,6 +40,11 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = ["-ra", "--import-mode=importlib"]
+markers = [
+    "gpu: requires a working CUDA runtime",
+    "ipc: exercises inter-process buffer transport",
+    "multi_gpu: requires at least two visible CUDA devices and NCCL",
+]
 testpaths = [
     "phyai/tests",
     "phyai-kernel/tests",

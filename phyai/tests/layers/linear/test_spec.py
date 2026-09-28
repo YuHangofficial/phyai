@@ -1,6 +1,6 @@
 """WeightSpec tests — allocate shapes, process_after_loading, activation quant.
 
-No CUDA required; float8_e4m3fn tensors allocate on CPU in newer PyTorch.
+Shape/metadata logic only; no kernels execute.
 """
 
 from __future__ import annotations

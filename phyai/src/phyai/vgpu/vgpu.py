@@ -9,7 +9,7 @@ thread.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Generator
 
 import torch
 
@@ -31,12 +31,15 @@ class vGPU:
     .. warning::
 
        vGPUs **must be long-lived**. flashinfer's
-       ``split_device_green_ctx`` leaks driver memory on every call;
-       ``cuStreamDestroy + cuGreenCtxDestroy`` plus ``empty_cache``
-       recover none of it. The leak is upstream — likely in flashinfer or
-       the CUDA driver layer — so the defensive posture in phyai is to
+       ``split_device_green_ctx`` leaks ~16 MiB of driver memory on every
+       call — still present in 0.6.17, measured linear over repeated
+       calls — and ``cuStreamDestroy + cuGreenCtxDestroy`` plus
+       ``empty_cache`` recover none of it. The leak is upstream (flashinfer
+       or the CUDA driver layer), so the defensive posture in phyai is to
        keep vGPU objects long-lived. Creating and destroying vGPUs on a
        request hot path will exhaust device memory.
+       ``tests/vgpu/test_leak_regression.py`` documents the leak and fails
+       loudly the day an upstream release actually fixes it.
     """
 
     name: str
@@ -99,7 +102,7 @@ class vGPU:
         return obj
 
     @contextmanager
-    def activate(self) -> Iterator["vGPU"]:
+    def activate(self) -> Generator["vGPU"]:
         """Enter the vGPU's stream + mem-pool scope.
 
         ``torch.cuda.use_mem_pool`` is documented as thread-local; child
@@ -151,9 +154,9 @@ def create_vgpus(
 
     .. warning::
 
-       Long-lived usage only. flashinfer's per-call driver leak means
-       re-creating vGPUs in a request hot path will exhaust device
-       memory; see :class:`vGPU` docstring.
+       Long-lived usage only. flashinfer's per-call driver leak (~16 MiB,
+       still present in 0.6.17) means re-creating vGPUs in a request hot
+       path will exhaust device memory; see the :class:`vGPU` docstring.
 
     Args:
         device: CUDA device (string or :class:`torch.device`).

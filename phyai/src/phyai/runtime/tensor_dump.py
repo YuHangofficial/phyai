@@ -75,7 +75,6 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import logging
 import os
 import re
 from pathlib import Path
@@ -85,10 +84,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from phyai.utils import all_ranks_log, this_rank_log
+from phyai.utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # A leaf-operator predicate over (dotted_name, module). ``filter`` accepts
 # this directly, or a sequence of regex strings compiled into one, or None
@@ -280,9 +279,7 @@ class TensorDumper:
         n_hooked = 0
         for root_name, module in targets.items():
             n_hooked += self._attach_to_tree(root_name, module)
-        all_ranks_log(
-            logger,
-            logging.INFO,
+        logger.info(
             "TensorDumper attached %d leaf hooks across %d target(s) "
             "(dump_dir=%s, filter=%s).",
             n_hooked,
@@ -291,9 +288,7 @@ class TensorDumper:
             self._describe_filter(),
         )
         if n_hooked == 0:
-            all_ranks_log(
-                logger,
-                logging.WARNING,
+            logger.warning(
                 "TensorDumper hooked 0 leaf operators — the filter %s matched "
                 "nothing across the targets. No tensors will be recorded.",
                 self._describe_filter(),
@@ -356,9 +351,7 @@ class TensorDumper:
             return None
         path = self._process_dir / f"pass{self._pass_index:05d}.pt"
         torch.save(self._current, str(path))
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "TensorDumper wrote pass %05d (%d tensors) to %s",
             self._pass_index,
             len(self._current),

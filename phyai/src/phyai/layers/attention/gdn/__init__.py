@@ -7,6 +7,8 @@ from phyai.layers.attention.gdn.backends import (
     FlaGatedDeltaNetPlan,
     FlashInferGatedDeltaNetBackend,
     FlashInferGatedDeltaNetPlan,
+    FlashQlaGatedDeltaNetBackend,
+    FlashQlaGatedDeltaNetPlan,
 )
 from phyai.layers.attention.gdn.base import (
     GatedDeltaNetBackend,
@@ -16,27 +18,19 @@ from phyai.layers.attention.gdn.base import (
     GatedDeltaNetPlanHandle,
 )
 from phyai.layers.attention.gdn.layer import GatedDeltaNet
-from phyai.layers.attention.gdn.registry import (
-    BackendFactory,
-    get_backend_factory,
-    list_backends,
-    register_backend,
-)
 
 
 __all__ = [
-    "BackendFactory",
     "FlaGatedDeltaNetBackend",
     "FlaGatedDeltaNetPlan",
     "FlashInferGatedDeltaNetBackend",
     "FlashInferGatedDeltaNetPlan",
+    "FlashQlaGatedDeltaNetBackend",
+    "FlashQlaGatedDeltaNetPlan",
     "GatedDeltaNet",
     "GatedDeltaNetBackend",
     "GatedDeltaNetCtx",
     "GatedDeltaNetLayerProto",
     "GatedDeltaNetMetadata",
     "GatedDeltaNetPlanHandle",
-    "get_backend_factory",
-    "list_backends",
-    "register_backend",
 ]

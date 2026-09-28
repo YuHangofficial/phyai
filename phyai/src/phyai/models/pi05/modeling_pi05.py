@@ -6,16 +6,14 @@ https://www.pi.website/blog/pi05
 from __future__ import annotations
 
 import math
-import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config, resolve_engine_defaults
-from phyai.layers.attention.ar import ARAttention, ARAttnCtx
-from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCtx
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.layers.attention.paged import PagedAttention, PagedAttnCtx
 from phyai.layers.conv import Conv2d
 from phyai.layers.layer_norm import AdaRMSNorm, GemmaRMSNorm, LayerNorm
 from phyai.layers.linear import (
@@ -34,56 +32,6 @@ from phyai.models.pi05.configuration_pi05 import (
     SiglipVisionConfig,
 )
 from phyai.weights.shards import replicated
-
-
-def _adarms_backend(norm_backend: str) -> str:
-    """Map a generic norm backend to one :class:`AdaRMSNorm` accepts.
-
-    flashinfer has no AdaRMS kernel; transparently fall back to
-    ``phyai-kernel`` (Triton, CUDA) so callers can leave their
-    :class:`EngineConfig` at the production default and still have
-    pi0.5 construction succeed.
-    """
-    if norm_backend == "flashinfer":
-        return "phyai-kernel"
-    return norm_backend
-
-
-def _vision_norm_backend(norm_backend: str, vision_dtype: torch.dtype) -> str:
-    """Map a generic norm backend to one the vision tower can run at ``vision_dtype``.
-
-    flashinfer's LayerNorm / RMSNorm CUDA kernels hard-require a **bf16**
-    input tensor (``flashinfer.norm.layernorm``: "input ... Need to be
-    bfloat16"). When the vision tower runs in fp32 (the openpi / lerobot
-    parity path keeps SigLIP + projector + their norms in fp32), the
-    flashinfer norm path cannot consume the fp32 activations, so we fall
-    back to ``phyai-kernel`` (Triton, which accepts any floating dtype) —
-    mirroring :func:`_adarms_backend`. When the tower stays at the bf16
-    default, the backend is left untouched.
-    """
-    if norm_backend == "flashinfer" and vision_dtype != torch.bfloat16:
-        return "phyai-kernel"
-    return norm_backend
-
-
-def _engine_to_paged_backend(attn_backend: str) -> str:
-    """Map :class:`EngineConfig`'s ``attn_backend`` onto the AR / Diffusion
-    paged backend name.
-
-    The AR and Diffusion paged stacks are **flashinfer-only** (GPU):
-    ``"flashinfer"`` is the only backend registered in either
-    subpackage. ``"sdpa"`` / ``"eager"`` have no paged backend (SDPA
-    cannot read paged KV; there is no CPU reference path), so any
-    non-flashinfer name is rejected here rather than silently coerced.
-    """
-    canonical = attn_backend.lower().replace("_", "-")
-    if canonical != "flashinfer":
-        raise ValueError(
-            f"AR / Diffusion paged stacks are flashinfer-only (GPU); got "
-            f"attn_backend={attn_backend!r}. pi0.5 inference requires "
-            f"backend='flashinfer'."
-        )
-    return canonical
 
 
 # SigLIP encoder layers name their pre-norms ``layer_norm1`` /
@@ -166,6 +114,7 @@ class SiglipVisionEmbeddings(nn.Module):
             padding=0,
             bias=True,
             dtype=params_dtype,
+            compute_dtype=torch.float32,
             prefix=f"{prefix}.patch_embedding" if prefix else "",
         )
         self.position_embedding = PositionEmbedding(
@@ -194,8 +143,8 @@ class SiglipVisionEmbeddings(nn.Module):
             )
         h_patch = self.patch_embedding(pixel_values)  # (B, hidden, H/p, W/p)
         embeds = h_patch.flatten(2).transpose(1, 2)  # (B, num_patches, hidden)
-        embeds = embeds + self.position_embedding()  # broadcast (N, D) over batch
-        return embeds
+        embeds = embeds + self.position_embedding().to(h_patch.dtype)
+        return embeds.to(self.patch_embedding.weight.dtype)
 
 
 class SiglipVisionEncoder(nn.Module):
@@ -205,7 +154,7 @@ class SiglipVisionEncoder(nn.Module):
 
     SigLIP's encoder layer is pre-norm with LayerNorm (bias=True),
     bidirectional (causal=False), q/k/v/out_proj all biased, and a
-    plain ``fc1 -> GELU(tanh) -> fc2`` MLP (bias=True). HF source names
+    plain ``fc1 -> GELU(exact) -> fc2`` MLP (bias=True). HF source names
     differ from the Llama / Gemma defaults: ``layer_norm1`` /
     ``layer_norm2`` for the norms and ``out_proj`` for the attention
     output projection.
@@ -221,9 +170,7 @@ class SiglipVisionEncoder(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         layer_prefix = f"{prefix}.layers" if prefix else ""
         self.layers = nn.ModuleList(
             [
@@ -237,7 +184,7 @@ class SiglipVisionEncoder(nn.Module):
                     attn_out_bias=True,
                     rope=None,
                     mlp_gated=False,
-                    mlp_activation="gelu_pytorch_tanh",
+                    mlp_activation="gelu",
                     mlp_bias=True,
                     norm_type="layernorm",
                     norm_eps=config.layer_norm_eps,
@@ -283,9 +230,7 @@ class SiglipVisionModel(nn.Module):
         prefix: str = "vision_model",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.prefix = prefix
         self.embeddings = SiglipVisionEmbeddings(
@@ -398,25 +343,21 @@ class PI05VisionTower(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
-        # ``params_dtype`` is the vision *compute* dtype (may be fp32 for the
-        # parity path); ``io_dtype`` is the surrounding model's dtype that the
-        # output is cast back to (bf16). When the two match (bf16 default) the
-        # boundary casts in forward are no-ops.
+        params_dtype = resolve_params_dtype(params_dtype)
+        # ``params_dtype`` controls the vision encoder/projector precision;
+        # the patch stem retains the reference's fp32 boundary independently.
+        # ``io_dtype`` is the surrounding model's dtype for the tower output.
         self.compute_dtype = params_dtype
         self.io_dtype = io_dtype if io_dtype is not None else params_dtype
         # fp32 activations can't flow through flashinfer's bf16-only norm
         # kernels; route the vision norms to phyai-kernel when running fp32.
-        vision_norm_backend = _vision_norm_backend(norm_backend, params_dtype)
         self.config = config
         self.prefix = prefix
         self.vision_tower = VisionTowerWrapper(
             config,
             params_dtype=params_dtype,
             attn_backend=attn_backend,
-            norm_backend=vision_norm_backend,
+            norm_backend=norm_backend,
             prefix=f"{prefix}.vision_tower" if prefix else "vision_tower",
         )
         self.multi_modal_projector = MultiModalProjector(
@@ -428,13 +369,10 @@ class PI05VisionTower(nn.Module):
         )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # Upcast the incoming pixels to the vision compute dtype (bf16 -> fp32
-        # on the parity path; a no-op when the tower is bf16), run the tower +
-        # projector in that dtype, then cast back to the model's io_dtype. The
-        # casts are captured into the vision CUDA graph; its external interface
-        # stays io_dtype.
-        x = pixel_values.to(self.compute_dtype)
-        h = self.vision_tower(x)  # (B, N, hidden)
+        # The embedding module owns the fp32 stem boundary and casts its output
+        # to the encoder parameter dtype. Preserve caller pixels here so a bf16
+        # encoder does not discard image precision before the stem.
+        h = self.vision_tower(pixel_values)  # (B, N, hidden)
         h = self.multi_modal_projector(h)  # (B, N, projection_dim)
         return h.to(self.io_dtype)
 
@@ -480,9 +418,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.layer_idx = layer_idx
         self.prefix = prefix
@@ -515,19 +451,21 @@ class PaliGemmaDecoderLayer(nn.Module):
             1, self.qkv_proj.num_kv_heads * self.qkv_proj.num_kv_replicas
         )
         self.o_proj = RowParallelLinear(
+            group="attention_tp",
             in_features=config.num_attention_heads * config.head_dim,
             out_features=config.hidden_size,
             bias=False,
             params_dtype=params_dtype,
             prefix=f"{attn_prefix}.o_proj",
         )
-        self.attn = ARAttention(
+        self.attn = PagedAttention(
             num_heads=self.q_heads_local,
             head_dim=config.head_dim,
             layer_id=layer_idx,
             num_kv_heads=self.kv_heads_local,
             causal=False,
-            backend=_engine_to_paged_backend(attn_backend),
+            backend=attn_backend,
+            kernel_role="prefix",
         )
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size,
@@ -539,7 +477,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="gelu_pytorch_tanh",
+            activation="gelu",
             gated=True,
             bias=False,
             params_dtype=params_dtype,
@@ -564,7 +502,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         h: torch.Tensor,
         position_ids: torch.Tensor,
         rope: RotaryEmbedding,
-        attn_ctx: ARAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         """Pre-norm self-attention + gated MLP, with KV cache scatter."""
         residual = h
@@ -597,9 +535,7 @@ class PaliGemmaLanguageModel(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.prefix = prefix
         self.embed_tokens = PaliGemmaEmbedTokens(
@@ -644,7 +580,7 @@ class PaliGemmaLanguageModel(nn.Module):
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         rope: RotaryEmbedding,
-        attn_ctx: ARAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         """Run every decoder layer + final norm over ``inputs_embeds``."""
         h = inputs_embeds
@@ -712,10 +648,7 @@ class PI05ExpertLayer(nn.Module):
                 "PI05ExpertLayer requires GemmaExpertConfig.use_adarms=True; "
                 "non-AdaRMS expert is not part of pi0.5."
             )
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
-        adarms_backend = _adarms_backend(norm_backend)
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.layer_idx = layer_idx
         self.prefix = prefix
@@ -731,7 +664,7 @@ class PI05ExpertLayer(nn.Module):
             hidden_size=config.hidden_size,
             cond_dim=config.adarms_cond_dim,
             eps=config.rms_norm_eps,
-            backend=adarms_backend,
+            backend=norm_backend,
             dtype=params_dtype,
             prefix=f"{prefix}.input_layernorm" if prefix else "",
         )
@@ -753,32 +686,34 @@ class PI05ExpertLayer(nn.Module):
         # paligemma stream), and o_proj reduces back down to the
         # expert's ``hidden_size = 1024``.
         self.o_proj = RowParallelLinear(
+            group="attention_tp",
             in_features=config.num_attention_heads * config.head_dim,
             out_features=config.hidden_size,
             bias=False,
             params_dtype=params_dtype,
             prefix=f"{attn_prefix}.o_proj",
         )
-        self.attn = DiffusionAttention(
+        self.attn = PagedAttention(
             num_heads=self.q_heads_local,
             head_dim=config.head_dim,
             layer_id=layer_idx,
             num_kv_heads=self.kv_heads_local,
             causal=False,
-            backend=_engine_to_paged_backend(attn_backend),
+            backend=attn_backend,
+            kernel_role="expert",
         )
         self.post_attention_layernorm = AdaRMSNorm(
             hidden_size=config.hidden_size,
             cond_dim=config.adarms_cond_dim,
             eps=config.rms_norm_eps,
-            backend=adarms_backend,
+            backend=norm_backend,
             dtype=params_dtype,
             prefix=f"{prefix}.post_attention_layernorm" if prefix else "",
         )
         self.mlp = DenseMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            activation="gelu_pytorch_tanh",
+            activation="gelu",
             gated=True,
             bias=False,
             params_dtype=params_dtype,
@@ -804,7 +739,7 @@ class PI05ExpertLayer(nn.Module):
         position_ids: torch.Tensor,
         cond: torch.Tensor | None,
         rope: RotaryEmbedding,
-        attn_ctx: DiffusionAttnCtx,
+        attn_ctx: PagedAttnCtx,
         *,
         modulation: ExpertLayerModulation | None = None,
     ) -> torch.Tensor:
@@ -850,10 +785,7 @@ class PI05ExpertStack(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
-        adarms_backend = _adarms_backend(norm_backend)
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.prefix = prefix
         layers_prefix = f"{prefix}.layers" if prefix else "layers"
@@ -874,7 +806,7 @@ class PI05ExpertStack(nn.Module):
             hidden_size=config.hidden_size,
             cond_dim=config.adarms_cond_dim,
             eps=config.rms_norm_eps,
-            backend=adarms_backend,
+            backend=norm_backend,
             dtype=params_dtype,
             prefix=f"{prefix}.norm" if prefix else "",
         )
@@ -917,7 +849,7 @@ class PI05ExpertStack(nn.Module):
         position_ids: torch.Tensor,
         cond: torch.Tensor | None,
         rope: RotaryEmbedding,
-        attn_ctx: DiffusionAttnCtx,
+        attn_ctx: PagedAttnCtx,
         *,
         modulation: ExpertStepModulation | None = None,
     ) -> torch.Tensor:
@@ -1056,7 +988,7 @@ class PI05Model(nn.Module):
 
     Each decoder layer (paligemma + expert) owns its own paged
     attention instance bound to its layer index — paligemma uses
-    :class:`ARAttention` and the expert uses :class:`DiffusionAttention`.
+    :class:`PagedAttention` and the expert uses :class:`PagedAttention`.
     """
 
     def __init__(
@@ -1071,9 +1003,7 @@ class PI05Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         # The vision tower may run at a different (typically higher) precision
         # than the rest of the model — openpi / lerobot keep SigLIP + projector
         # in fp32 while the language + expert stacks are bf16. ``None`` keeps it
@@ -1081,51 +1011,34 @@ class PI05Model(nn.Module):
         vision_dtype = (
             vision_params_dtype if vision_params_dtype is not None else params_dtype
         )
-        # RoPE backend defaults follow the attention backend's preference:
-        # both flashinfer paths exist and are fast; the eager path is the
-        # fallback for non-flashinfer attention backends.
-        if rope_backend is None:
-            rope_backend = "flashinfer" if attn_backend == "flashinfer" else "eager"
+        # ``rope_backend`` stays as the caller left it, ``None`` included.
+        # Coupling it to ``attn_backend`` was a stand-in for the real constraint,
+        # which ``flashinfer.rope`` declares itself: a dtype requirement and
+        # ``shape.rotary_dim == shape.head_dim``. An ineligible call falls to
+        # ``eager.rope`` on its own, and the trace says which leaf failed.
         self.config = config
         self.params_dtype = params_dtype
         self.vision_params_dtype = vision_dtype
         self.attn_backend = attn_backend
 
-        # flashinfer's prefill kernel hard-asserts ``head_dim ∈ {64, 128, 256}``.
-        # SigLIP-So400m has head_dim=72 (= 1152 / 16) and would JIT-fail.
-        # Auto-fall back to ``sdpa`` for the vision tower when the requested
-        # backend is flashinfer; the joint attention path continues with the
-        # user-requested backend (head_dim = 256 in pi0.5 always satisfies the
-        # assert).
-        vision_attn_backend = attn_backend
-        if attn_backend == "flashinfer" and config.vision.head_dim not in (
-            64,
-            128,
-            256,
-        ):
-            vision_attn_backend = "sdpa"
-            # TODO: the sdpa vision path can be wrapped in torch.compile
-            # to recover some of the throughput lost vs flashinfer.
-            warnings.warn(
-                f"PI05Model: vision tower head_dim={config.vision.head_dim} "
-                f"not in flashinfer's supported set {{64, 128, 256}}; "
-                f"vision attention silently downgraded to 'sdpa'. The "
-                f"language + expert joint attention path still uses "
-                f"'flashinfer' as requested. (Expected for SigLIP-So400m, "
-                f"head_dim = 1152 / 16 = 72.)",
-                stacklevel=2,
-            )
+        # FlashInfer's prefill kernel only supports ``head_dim in {64, 128, 256}``
+        # -- SigLIP-So400m has head_dim=72 and would JIT-fail -- but that limit
+        # is declared on FlashInfer's catalog row, so an unsupported head_dim
+        # makes it ineligible and SDPA is selected automatically. The
+        # hand-rolled downgrade and its warning are gone; ``explain()`` reports
+        # the reason when it happens, so ``attn_backend`` passes through as the
+        # caller wrote it.
         self.vision = PI05VisionTower(
             config.vision,
             params_dtype=vision_dtype,
             io_dtype=params_dtype,
-            attn_backend=vision_attn_backend,
+            attn_backend=attn_backend,
             norm_backend=norm_backend,
         )
 
         # Text and expert stacks. Each layer owns its own paged
-        # attention bound to layer_id=i: paligemma uses ARAttention,
-        # expert uses DiffusionAttention. The runners build the
+        # attention bound to layer_id=i: paligemma uses PagedAttention,
+        # expert uses PagedAttention. The runners build the
         # right ctx type per stack and thread it through the
         # stack's forward(h, position_ids, [cond,] rope, ctx).
         #

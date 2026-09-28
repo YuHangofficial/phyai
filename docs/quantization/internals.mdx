@@ -89,25 +89,24 @@ NVFP4 packs two E2M1 values per byte, so the logical `(N, K)` weight is stored a
 
 It does one thing the other two specs do not: quantize from a high-precision checkpoint on the fly. When `load_weight` sees an incoming bf16/fp16/fp32 weight, it stashes it in `_nvfp4_pending_weight`; `process_after_loading` then calls `quantize_loaded_weight` to pack it. The `128x4` layout quantizes through FlashInfer's `nvfp4_quantize`, which needs CUDA.
 
-# The forward pass: spec_id picks the kernel
+# The forward pass: the kernel catalog picks the kernel
 
-Layers do not write fp8 / cutlass / marlin branches themselves. `LinearBase.forward` hands `spec.spec_id` to the dispatcher, which picks a kernel:
+Layers do not write fp8 / cutlass / marlin branches themselves. `LinearBase.forward` describes the call as structured facts — the exact storage format from `spec.physical_signature`, the dtypes, and `M`/`N`/`K` — and the kernel selector picks the catalog row whose declared capability matches:
 
 ```python
-kernel = get_linear_dispatcher().select(
-    spec_id=self.spec.spec_id,
-    M=_M_of(x), N=self.out_features, K=self.in_features,
-    in_dtype=x.dtype, out_dtype=self.params_dtype,
+kernel = _resolve_linear_kernel(
+    self, x, M=_M_of(x), N=self.out_features, K=self.in_features
 )
+y = kernel.execute(self, x, bias)
 ```
 
-The dispatcher (`layers/linear/dispatch.py`) keys its cache on `(spec_id, M_bucket, N, K, in_dtype, out_dtype, sm, mode)`, so decode (small M) and prefill (large M) can land on different kernels. Each spec's `spec_id`:
+Selection is memoized per layer by a `CallSite` whose key covers exactly the facts the catalog rows and the active policy read (dtype, `N`/`K`, the quantization signature, execution mode), so repeated calls cost one dictionary lookup. Which storage format runs where is declared per catalog row in `phyai/kernel/ops/gemm.py`:
 
-| spec | example spec_id |
+| spec | physical signature |
 | --- | --- |
-| `Bf16Spec` | `bf16` |
-| `Fp8Spec` | `fp8_per_channel` · `fp8_per_tensor` · `fp8_block_128_128` |
-| `Nvfp4Spec` | `nvfp4_block_16_128x4` · `nvfp4_block_16_linear` |
+| `Bf16Spec` | `format=bf16` |
+| `Fp8Spec` | `format=fp8_e4m3` with `granularity=per_tensor / per_channel / block` |
+| `Nvfp4Spec` | `format=nvfp4` with `layout=128x4 / linear` |
 
 # Extension
 

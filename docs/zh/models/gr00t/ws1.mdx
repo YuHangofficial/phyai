@@ -15,7 +15,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
     "权重": <a href="https://huggingface.co/collections/nvidia/gr00t-n17" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">NVIDIA GR00T-N1.7 collection</a>,
     "标签": ["VLA", "Cosmos-Reason2-2B", "Qwen3-VL", "flow-matching", "single-GPU"],
     "输入": "RGB 相机 · 机器人状态 · 语言指令",
-    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">GR00TN17WS1Scheduler</code>,
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">GR00TN17Scheduler</code>,
     "插件": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">gr00t_n17</code>,
     "参数精度": "bf16",
     "论文": <a href="https://arxiv.org/abs/2503.14734" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">arxiv.org/abs/2503.14734</a>,
@@ -41,7 +41,7 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
 <Tree>
   <Tree.Folder name="phyai/src/phyai/models/gr00t_n17" defaultOpen>
     <Tree.File name="main_gr00t_n17.py" />
-    <Tree.File name="scheduler_ws1_gr00t_n17.py" />
+    <Tree.File name="scheduler_gr00t_n17.py" />
     <Tree.File name="model_runner_gr00t_n17.py" />
     <Tree.File name="modeling_gr00t_n17.py" />
     <Tree.File name="qwen3_vl_adapter.py" />
@@ -58,7 +58,7 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
 | `GR00TN17Entry` | 注册 `"gr00t_n17"` 插件、加载 checkpoint，并创建单卡调度器 |
 | `GR00TN17BackboneRunner` | 运行 Cosmos-Reason2/Qwen3-VL 视觉和语言 backbone，并管理按 shape 区分的 CUDA Graph |
 | `GR00TN17ActionHeadRunner` | 选择具身对应的状态/动作编码器与动作解码器投影，采样或接收 action noise，并运行 flow-matching 去噪循环 |
-| `GR00TN17WS1Scheduler` | 准备请求 tensor，将其分发给 backbone 和 action-head runner，并返回归一化 action chunk |
+| `GR00TN17Scheduler` | 准备请求 tensor，将其分发给 backbone 和 action-head runner，并返回归一化 action chunk |
 | `GR00TProcessor` | 将原始 observation 转换为模型 tensor，并把归一化 action chunk 解码为所选具身对应、以物理量表示的动作字段 |
 
 请求路径如下：
@@ -145,7 +145,7 @@ PhyAI 的 `ws1` 路径在单张 GPU 上运行 backbone 和 action head。引擎�
     按照上述约定构造好 `observation` 后，继续执行：
 
     ```python
-    from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+    from phyai.models.gr00t_n17.scheduler_gr00t_n17 import GR00TN17Request
 
     prepared = processor.process_observation(observation)
     request = GR00TN17Request(tensors=prepared.tensors)
@@ -225,7 +225,7 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
 from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
-from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+from phyai.models.gr00t_n17.scheduler_gr00t_n17 import GR00TN17Request
 from phyai.utils import load_config
 from phyai_utils_tools.models.gr00t import GR00TObservation, GR00TProcessor
 

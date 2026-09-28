@@ -8,11 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config, resolve_engine_defaults
-from phyai.layers.attention.attention.layer import Attention
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.layers.attention.mask import AttnMask
+from phyai.layers.attention.nocache.layer import Attention
 from phyai.layers.attention.gdn import GatedDeltaNet
-from phyai.layers.conv import Conv1d, Conv2d
-from phyai.layers.layer_norm import GemmaRMSNorm, LayerNorm
+from phyai.layers.conv import CausalConv1d, Conv2d
+from phyai.layers.layer_norm import GatedRMSNorm, GemmaRMSNorm, LayerNorm
 from phyai.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -34,7 +35,7 @@ from phyai.weights.shards import replicated
 
 
 if TYPE_CHECKING:
-    from phyai.layers.attention import ARAttnCtx, GatedDeltaNetCtx
+    from phyai.layers.attention import PagedAttnCtx, GatedDeltaNetCtx
 
 
 def minicpm_gr00t_weight_remap(name: str) -> str | None:
@@ -52,57 +53,6 @@ def minicpm_gr00t_weight_remap(name: str) -> str | None:
     )
     name = name.replace(".ff.net.0.proj.", ".ff.fc1.")
     return name.replace(".ff.net.2.", ".ff.fc2.")
-
-
-def _fp32_norm_backend(norm_backend: str, dtype: torch.dtype) -> str:
-    if norm_backend == "flashinfer" and dtype == torch.float32:
-        return "phyai-kernel"
-    return norm_backend
-
-
-def _attention_backend_for_head_dim(attn_backend: str, head_dim: int) -> str:
-    if attn_backend == "flashinfer" and head_dim == 72:
-        return "sdpa"
-    return attn_backend
-
-
-class MiniCPMGR00TQwenRMSNormGated(nn.Module):
-    """Qwen3.5 head-wise RMSNorm followed by a SiLU gate."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float,
-        *,
-        device: torch.device | str,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        self.weight.hf_keys = [(f"{prefix}.weight", None)]
-        self.weight.weight_loader = replicated()
-
-    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        if hidden_states.is_cuda:
-            from phyai_kernel import rmsnorm_silu_mul
-
-            return rmsnorm_silu_mul(
-                hidden_states.contiguous(),
-                gate.contiguous(),
-                self.weight,
-                self.eps,
-            )
-        input_dtype = hidden_states.dtype
-        normalized = hidden_states.float()
-        variance = normalized.square().mean(dim=-1, keepdim=True)
-        normalized = normalized * torch.rsqrt(variance + self.eps)
-        normalized = self.weight * normalized.to(input_dtype)
-        return (normalized * F.silu(gate.float())).to(input_dtype)
 
 
 class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
@@ -134,22 +84,21 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
                 self.num_value_heads,
                 self.num_value_heads,
             ],
+            group="attention_tp",
             bias=False,
             params_dtype=params_dtype,
             device=device,
             hf_legs=("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"),
             prefix=f"{prefix}.in_proj",
         )
-        self.conv1d = Conv1d(
-            self.conv_dim,
+        self.conv1d = CausalConv1d(
             self.conv_dim,
             config.linear_conv_kernel_dim,
-            padding=config.linear_conv_kernel_dim - 1,
-            groups=self.conv_dim,
-            bias=False,
+            split_sizes=(self.key_dim, self.key_dim, self.value_dim),
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.conv1d",
+            kernel_role="qwen.causal_conv",
         )
         self.A_log = nn.Parameter(
             torch.empty(self.num_value_heads, dtype=torch.float32, device=device),
@@ -170,11 +119,12 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
             num_value_heads=self.num_value_heads,
             backend=gdn_backend,
         )
-        self.norm = MiniCPMGR00TQwenRMSNormGated(
+        self.norm = GatedRMSNorm(
             self.value_head_dim,
             config.rms_norm_eps,
             device=device,
             prefix=f"{prefix}.norm",
+            kernel_role="qwen.gated_norm",
         )
         self.out_proj = ReplicatedLinear(
             self.value_dim,
@@ -193,6 +143,10 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
         gdn_ctx: GatedDeltaNetCtx | None = None,
     ) -> torch.Tensor:
         if attention_mask is not None and hidden_states.shape[0] > 1:
+            # GDN is recurrent: there is no per-key mask to apply, so padding
+            # is handled the Mamba-family way — zero the padded inputs so
+            # they inject nothing into the conv window or the delta state.
+            # (Padded rows' own outputs are garbage and ignored by contract.)
             hidden_states = hidden_states * attention_mask[..., None]
         batch_size, seq_len, _ = hidden_states.shape
         projected, _ = self.in_proj(hidden_states)
@@ -205,22 +159,7 @@ class MiniCPMGR00TQwenGatedDeltaNet(nn.Module):
             ),
             dim=-1,
         )
-        if mixed_qkv.is_cuda:
-            from phyai_kernel import causal_conv1d_silu_split_qkv
-
-            query, key, value = causal_conv1d_silu_split_qkv(
-                mixed_qkv,
-                self.conv1d.weight,
-                (self.key_dim, self.key_dim, self.value_dim),
-            )
-        else:
-            mixed_qkv = self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :seq_len]
-            mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
-            query, key, value = torch.split(
-                mixed_qkv,
-                (self.key_dim, self.key_dim, self.value_dim),
-                dim=-1,
-            )
+        query, key, value = self.conv1d(mixed_qkv)
         query = query.reshape(
             batch_size, seq_len, self.num_key_heads, self.key_head_dim
         )
@@ -274,6 +213,7 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         self.qkv_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [query_gate_size, key_value_size, key_value_size],
+            group="attention_tp",
             bias=config.attention_bias,
             params_dtype=params_dtype,
             device=device,
@@ -318,8 +258,14 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_ctx: ARAttnCtx | None = None,
+        attn_ctx: PagedAttnCtx | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if attention_mask is not None and attn_ctx is not None:
+            raise ValueError(
+                "attention_mask applies to the ctx-less padded path; a "
+                "runner-driven ctx expresses masking through KV visibility."
+            )
         batch_size, seq_len, _ = hidden_states.shape
         projected, _ = self.qkv_proj(hidden_states)
         query_gate, key, value = projected.split(
@@ -342,7 +288,12 @@ class MiniCPMGR00TQwenAttention(nn.Module):
         )
         value = value.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         query, key = self.rotary_emb.apply(query, key, cos, sin)
-        output = self.attn(query, key, value, ctx=attn_ctx)
+        mask = (
+            None
+            if attention_mask is None
+            else AttnMask.from_key_mask(attention_mask.bool())
+        )
+        output = self.attn(query, key, value, ctx=attn_ctx, mask=mask)
         output = output.reshape(batch_size, seq_len, -1)
         output = output * torch.sigmoid(gate.reshape(batch_size, seq_len, -1))
         output, _ = self.o_proj(output)
@@ -417,7 +368,7 @@ class MiniCPMGR00TQwenDecoderLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        attn_ctx: ARAttnCtx | None = None,
+        attn_ctx: PagedAttnCtx | None = None,
         gdn_ctx: GatedDeltaNetCtx | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -437,6 +388,7 @@ class MiniCPMGR00TQwenDecoderLayer(nn.Module):
                 cos=cos,
                 sin=sin,
                 attn_ctx=attn_ctx,
+                attention_mask=attention_mask,
             )
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
@@ -460,9 +412,7 @@ class MiniCPMGR00TTextModel(nn.Module):
         prefix: str = "vlm.llm.model",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -518,7 +468,7 @@ class MiniCPMGR00TTextModel(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        attn_ctx: ARAttnCtx | None = None,
+        attn_ctx: PagedAttnCtx | None = None,
         gdn_ctxs: tuple[GatedDeltaNetCtx | None, ...] | None = None,
     ) -> torch.Tensor:
         if gdn_ctxs is not None and len(gdn_ctxs) != len(self.layers):
@@ -866,14 +816,9 @@ class MiniCPMGR00TVisionModel(nn.Module):
         prefix: str = "vlm.vpm",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
-        vision_attn_backend = _attention_backend_for_head_dim(
-            attn_backend, config.head_dim
-        )
         self.config = config
         self.embeddings = MiniCPMGR00TVisionEmbeddings(
             config,
@@ -887,7 +832,7 @@ class MiniCPMGR00TVisionModel(nn.Module):
                 MiniCPMGR00TVisionLayer(
                     config,
                     params_dtype=params_dtype,
-                    attn_backend=vision_attn_backend,
+                    attn_backend=attn_backend,
                     norm_backend=norm_backend,
                     device=device,
                     prefix=f"{prefix}.encoder.layers.{layer_idx}",
@@ -977,13 +922,10 @@ class MiniCPMGR00TVLM(nn.Module):
             device=device,
             prefix="vlm.vpm",
         )
-        vision_attn_backend = _attention_backend_for_head_dim(
-            attn_backend, config.vision.head_dim
-        )
         self.vit_merger = MiniCPMGR00TVisionWindowMerger(
             config.vision,
             params_dtype=params_dtype,
-            attn_backend=vision_attn_backend,
+            attn_backend=attn_backend,
             norm_backend=norm_backend,
             device=device,
         )
@@ -1083,6 +1025,7 @@ class MiniCPMGR00TDiTAttention(nn.Module):
             self.to_kv = MergedColumnParallelLinear(
                 context_dim,
                 [self.hidden_size, self.hidden_size],
+                group="attention_tp",
                 bias=True,
                 params_dtype=params_dtype,
                 device=device,
@@ -1419,19 +1362,14 @@ class MiniCPMGR00TActionHead(nn.Module):
         prefix: str = "action_head",
     ) -> None:
         super().__init__()
-        action_attn_backend = (
-            "sdpa"
-            if attn_backend == "flashinfer" and params_dtype == torch.float32
-            else attn_backend
-        )
-        action_norm_backend = _fp32_norm_backend(norm_backend, params_dtype)
+        action_attn_backend = attn_backend
         self.config = config
         self.params_dtype = params_dtype
         self.model = MiniCPMGR00TDiT(
             config.dit,
             params_dtype=params_dtype,
             attn_backend=action_attn_backend,
-            norm_backend=action_norm_backend,
+            norm_backend=norm_backend,
             device=device,
             prefix=f"{prefix}.model",
         )
@@ -1515,11 +1453,6 @@ class MiniCPMGR00TModel(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        _, attn_backend, norm_backend = resolve_engine_defaults(
-            vlm_params_dtype,
-            attn_backend,
-            norm_backend,
-        )
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -1603,7 +1536,7 @@ class MiniCPMGR00TModel(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        attn_ctx: ARAttnCtx | None = None,
+        attn_ctx: PagedAttnCtx | None = None,
         gdn_ctxs: tuple[GatedDeltaNetCtx | None, ...] | None = None,
     ) -> torch.Tensor:
         return self.vlm.llm.model(

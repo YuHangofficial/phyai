@@ -8,49 +8,41 @@ tokens in each denoise step and projects them back to action velocity.
 
 from __future__ import annotations
 
-import logging
-
 import torch
 
 from phyai.cache import KVCachePool
+from phyai.utils import get_logger
+from phyai.models.pi0.forward_batch_pi0 import LLMForwardBatch, VisionForwardBatch
 from phyai.layers.attention import (
-    ARAttention,
-    ARAttentionBackend,
-    ARAttnCtx,
-    ARAttnMetadata,
-    ARAttnPlanHandle,
-    AttnLayout,
     AttnMode,
-    DiffusionAttention,
-    DiffusionAttentionBackend,
-    DiffusionAttnCtx,
-    DiffusionAttnMetadata,
-    DiffusionAttnPlanHandle,
-    get_ar_backend_factory,
-    get_diffusion_backend_factory,
+    AttnLayout,
+    PagedAttnCtx,
+    PagedAttention,
+    PagedAttnMetadata,
+    PagedAttnPlanHandle,
+    PagedAttentionBackend,
 )
+from phyai.runtime.model_runner import ModelRunner
+from phyai.layers.attention.shared import select_paged_backend
 from phyai.layers.rotary_embedding import RotaryEmbedding
 from phyai.models.pi0.modeling_pi0 import (
-    ActionTimeHeads,
-    PaliGemmaLanguageModel,
     PI0ExpertStack,
     PI0VisionTower,
+    ActionTimeHeads,
+    PaliGemmaLanguageModel,
 )
-from phyai.payload import LLMForwardBatch, VisionForwardBatch
 from phyai.runtime.cuda_graph_manager import CudaGraph
-from phyai.runtime.model_runner import ModelRunner
-from phyai.utils import all_ranks_log
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
-def _ar_attn_proto(stack_layers) -> ARAttention:
+def _ar_attn_proto(stack_layers) -> PagedAttention:
     if len(stack_layers) == 0:
         raise ValueError("stack has no layers; cannot read attention metadata.")
     return stack_layers[0].attn
 
 
-def _diffusion_attn_proto(stack_layers) -> DiffusionAttention:
+def _diffusion_attn_proto(stack_layers) -> PagedAttention:
     if len(stack_layers) == 0:
         raise ValueError("stack has no layers; cannot read attention metadata.")
     return stack_layers[0].attn
@@ -80,12 +72,10 @@ class PI0VisionRunner(ModelRunner):
         self.graph: CudaGraph | None = None
 
     def setup(self) -> None:
-        all_ranks_log(logger, logging.INFO, "Entering PI0VisionRunner.setup")
+        logger.info("Entering PI0VisionRunner.setup")
         if not self.use_cuda_graph or self.device.type != "cuda":
             return
-        all_ranks_log(
-            logger,
-            logging.INFO,
+        logger.info(
             "Entering PI0VisionRunner.setup: capturing vision-tower CUDA graph "
             "at fixed shape (%d, %d, %d, %d).",
             self.num_images,
@@ -138,7 +128,7 @@ class PI0LLMRunner(ModelRunner):
         self.n_per_sample = int(n_per_sample)
         self.params_dtype = params_dtype
         self.device = torch.device(device)
-        self.attn_proto: ARAttention = _ar_attn_proto(paligemma_lm.layers)
+        self.attn_proto: PagedAttention = _ar_attn_proto(paligemma_lm.layers)
         self.num_heads = self.attn_proto.num_heads
         self.num_kv_heads = self.attn_proto.num_kv_heads
         self.head_dim = self.attn_proto.head_dim
@@ -149,18 +139,26 @@ class PI0LLMRunner(ModelRunner):
             else self.batch_size * self.n_per_sample
         )
 
-        factory = get_ar_backend_factory(self.attn_proto.backend)
-        self.attn_backend: ARAttentionBackend = factory(self)
+        self.attn_backend: PagedAttentionBackend = select_paged_backend(
+            "attention_paged",
+            self.attn_proto,
+            self,
+            device=self.device,
+            params_dtype=self.params_dtype,
+            num_tokens=self.batch_size * self.n_per_sample,
+            capture=bool(use_cuda_graph) and self.device.type == "cuda",
+            runner_tag="pi0.lm",
+        )
         self.use_cuda_graph = (
             bool(use_cuda_graph)
             and self.attn_backend.supports_capture()
             and self.device.type == "cuda"
         )
-        self._capture_plan: ARAttnPlanHandle | None = None
+        self._capture_plan: PagedAttnPlanHandle | None = None
         self.graph: CudaGraph | None = None
 
     def setup(self) -> None:
-        all_ranks_log(logger, logging.INFO, "Entering PI0LLMRunner.setup")
+        logger.info("Entering PI0LLMRunner.setup")
         self.attn_backend.init_cuda_graph_state(
             max_batch_size=self.batch_size,
             max_num_tokens=self.batch_size * self.n_per_sample,
@@ -175,7 +173,7 @@ class PI0LLMRunner(ModelRunner):
             )
             self._capture_graph()
 
-    def _capture_seed_metadata(self) -> ARAttnMetadata:
+    def _capture_seed_metadata(self) -> PagedAttnMetadata:
         cu_q = torch.arange(
             0,
             (self.batch_size + 1) * self.n_per_sample,
@@ -204,7 +202,7 @@ class PI0LLMRunner(ModelRunner):
             dtype=torch.int64,
             device=self.device,
         )
-        return ARAttnMetadata(
+        return PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=self.batch_size,
@@ -235,7 +233,7 @@ class PI0LLMRunner(ModelRunner):
         position_ids: torch.Tensor,
         write_indices: torch.Tensor,
     ) -> torch.Tensor:
-        ctx = ARAttnCtx(
+        ctx = PagedAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
             mode=AttnMode.PREFILL,
@@ -245,7 +243,7 @@ class PI0LLMRunner(ModelRunner):
         )
         return self.paligemma_lm(hidden_states, position_ids, self.rope, ctx)
 
-    def plan_inference(self, meta: ARAttnMetadata) -> None:
+    def plan_inference(self, meta: PagedAttnMetadata) -> None:
         if self.use_cuda_graph:
             self.attn_backend.replay_metadata(self._capture_plan, meta)
         else:
@@ -314,7 +312,7 @@ class PI0ExpertRunner(ModelRunner):
         self.expert_hidden = int(heads.expert_hidden)
         self.params_dtype = params_dtype
         self.device = torch.device(device)
-        self.attn_proto: DiffusionAttention = _diffusion_attn_proto(expert_stack.layers)
+        self.attn_proto: PagedAttention = _diffusion_attn_proto(expert_stack.layers)
         self.num_heads = self.attn_proto.num_heads
         self.num_kv_heads = self.attn_proto.num_kv_heads
         self.head_dim = self.attn_proto.head_dim
@@ -347,17 +345,30 @@ class PI0ExpertRunner(ModelRunner):
             device=self.device,
         )
 
-        factory = get_diffusion_backend_factory(self.attn_proto.backend)
-        self.state_attn_backend: DiffusionAttentionBackend = factory(self)
-        self.action_attn_backend: DiffusionAttentionBackend = factory(self)
+        # Two independent instances: state and action each own their own
+        # wrapper and workspace, so they cannot share one backend object.
+        def build_expert_backend() -> PagedAttentionBackend:
+            return select_paged_backend(
+                "attention_paged",
+                self.attn_proto,
+                self,
+                device=self.device,
+                params_dtype=self.params_dtype,
+                num_tokens=self.batch_size * self.chunk_size,
+                capture=bool(use_cuda_graph) and self.device.type == "cuda",
+                runner_tag="pi0.expert",
+            )
+
+        self.state_attn_backend: PagedAttentionBackend = build_expert_backend()
+        self.action_attn_backend: PagedAttentionBackend = build_expert_backend()
         self.use_cuda_graph = (
             bool(use_cuda_graph)
             and self.state_attn_backend.supports_capture()
             and self.action_attn_backend.supports_capture()
             and self.device.type == "cuda"
         )
-        self._state_capture_plan: DiffusionAttnPlanHandle | None = None
-        self._action_capture_plan: DiffusionAttnPlanHandle | None = None
+        self._state_capture_plan: PagedAttnPlanHandle | None = None
+        self._action_capture_plan: PagedAttnPlanHandle | None = None
         self.state_graph: CudaGraph | None = None
         self.action_graph: CudaGraph | None = None
         self._time_emb_table: torch.Tensor | None = None
@@ -413,7 +424,7 @@ class PI0ExpertRunner(ModelRunner):
         self._num_steps = int(num_steps)
 
     def setup(self) -> None:
-        all_ranks_log(logger, logging.INFO, "Entering PI0ExpertRunner.setup")
+        logger.info("Entering PI0ExpertRunner.setup")
         if self._time_emb_table is None or self._num_steps <= 0:
             raise RuntimeError(
                 "PI0ExpertRunner.setup() called before bind_euler_schedule(); "
@@ -436,12 +447,10 @@ class PI0ExpertRunner(ModelRunner):
             layer_proto=self.attn_proto,
         )
         if self.use_cuda_graph:
-            all_ranks_log(
-                logger,
-                logging.INFO,
-                "Entering PI0ExpertRunner.setup: capturing the full %d-step "
-                "Euler loop as one CUDA graph at fixed shape "
-                "(B=%d, chunk_size=%d, max_action_dim=%d).",
+            logger.info(
+                "Entering PI0ExpertRunner.setup: capturing the full %d-step Euler "
+                "loop as one CUDA graph at fixed shape (B=%d, chunk_size=%d, "
+                "max_action_dim=%d).",
                 self._num_steps,
                 self.batch_size,
                 self.chunk_size,
@@ -455,7 +464,7 @@ class PI0ExpertRunner(ModelRunner):
             )
             self._capture_graphs()
 
-    def _capture_seed_metadata_state(self) -> DiffusionAttnMetadata:
+    def _capture_seed_metadata_state(self) -> PagedAttnMetadata:
         cu_q = torch.arange(
             0,
             self.batch_size + 1,
@@ -480,7 +489,7 @@ class PI0ExpertRunner(ModelRunner):
             device=self.device,
         )
         last_page = torch.ones(self.batch_size, dtype=torch.int32, device=self.device)
-        return DiffusionAttnMetadata(
+        return PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=self.batch_size,
@@ -492,7 +501,7 @@ class PI0ExpertRunner(ModelRunner):
             write_indices=self.write_indices_state_buf,
         )
 
-    def _capture_seed_metadata_action(self) -> DiffusionAttnMetadata:
+    def _capture_seed_metadata_action(self) -> PagedAttnMetadata:
         cu_q = torch.arange(
             0,
             (self.batch_size + 1) * self.chunk_size,
@@ -517,7 +526,7 @@ class PI0ExpertRunner(ModelRunner):
             device=self.device,
         )
         last_page = torch.ones(self.batch_size, dtype=torch.int32, device=self.device)
-        return DiffusionAttnMetadata(
+        return PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=self.batch_size,
@@ -559,7 +568,7 @@ class PI0ExpertRunner(ModelRunner):
         state: torch.Tensor,
     ) -> torch.Tensor:
         state_h = self.heads.embed_state(state)
-        state_ctx = DiffusionAttnCtx(
+        state_ctx = PagedAttnCtx(
             backend=self.state_attn_backend,
             plan=self._state_capture_plan,
             mode=AttnMode.PREFILL,
@@ -585,7 +594,7 @@ class PI0ExpertRunner(ModelRunner):
         time_emb = self._time_emb_table[step].unsqueeze(0).expand(self.batch_size, -1)
         action_h = self.heads.fuse_action_time(x_t, time_emb)
         action_h = action_h.reshape(self.batch_size * self.chunk_size, -1)
-        action_ctx = DiffusionAttnCtx(
+        action_ctx = PagedAttnCtx(
             backend=self.action_attn_backend,
             plan=self._action_capture_plan,
             mode=AttnMode.PREFILL,
@@ -615,8 +624,8 @@ class PI0ExpertRunner(ModelRunner):
 
     def plan_inference(
         self,
-        state_meta: DiffusionAttnMetadata,
-        action_meta: DiffusionAttnMetadata,
+        state_meta: PagedAttnMetadata,
+        action_meta: PagedAttnMetadata,
     ) -> None:
         if state_meta.position_ids is None:
             raise ValueError(

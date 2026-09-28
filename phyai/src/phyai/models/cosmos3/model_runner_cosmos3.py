@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 
 import torch
 
@@ -13,10 +12,10 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3UndDecoderLayer,
 )
 from phyai.runtime.model_runner import ModelRunner
-from phyai.utils import this_rank_log
+from phyai.utils import get_logger
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class Cosmos3T2VRunner(ModelRunner):
@@ -57,17 +56,13 @@ class Cosmos3T2VRunner(ModelRunner):
                     module.compile(**kwargs)
                     compiled += 1
         except Exception as exc:  # pragma: no cover - compile is best-effort
-            this_rank_log(
-                logger,
-                logging.WARNING,
-                "Cosmos3T2VRunner: torch.compile failed (%s); using eager.",
-                exc,
+            logger.warning_rank0(
+                "Cosmos3T2VRunner: torch.compile failed (%s); using eager.", exc
             )
             return
-        this_rank_log(
-            logger,
-            logging.INFO,
-            "Cosmos3T2VRunner: regional torch.compile applied to %d decoder blocks (%s).",
+        logger.info_rank0(
+            "Cosmos3T2VRunner: regional torch.compile applied to %d decoder "
+            "blocks (%s).",
             compiled,
             kwargs,
         )

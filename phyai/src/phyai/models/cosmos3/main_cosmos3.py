@@ -1,8 +1,7 @@
-"""Cosmos3 generation plugin entry — the engine's cosmos3 hook."""
+"""Cosmos3 generation plugin entry."""
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -10,7 +9,7 @@ from typing import ClassVar
 import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
-from phyai.engine_config import get_engine_config
+from phyai.engine_config import ParallelConfig, get_engine_config
 from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.cosmos3.avae_sound import (
     Cosmos3AVAESoundDecoder,
@@ -25,17 +24,16 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Transformer,
     cosmos3_weight_remap,
 )
+from phyai.models.cosmos3.parallel_cosmos3 import validate_cosmos3_parallel
+from phyai.models.cosmos3.requests_cosmos3 import Cosmos3T2VRequest
 from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
-from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
-    Cosmos3T2VRequest,
-    Cosmos3T2VScheduler,
-)
+from phyai.models.cosmos3.scheduler_cosmos3 import Cosmos3T2VScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -70,6 +68,17 @@ class Cosmos3Entry(Entry):
     name: ClassVar[str] = "cosmos3"
     args_cls: ClassVar[type[EntryArgs]] = Cosmos3Args
 
+    parallel_domains: ClassVar[frozenset[str]] = frozenset(
+        {"cfg", "dense", "attention"}
+    )
+
+    @classmethod
+    def validate_parallel(
+        cls, parallel: ParallelConfig, replica_world_size: int | None = None
+    ) -> None:
+        super().validate_parallel(parallel, replica_world_size)
+        validate_cosmos3_parallel(parallel, replica_world_size)
+
     def __init__(self) -> None:
         # Default-init the slots so :meth:`step` / :meth:`close` /
         # :meth:`dump_targets` can check for "setup not yet run".
@@ -97,9 +106,8 @@ class Cosmos3Entry(Entry):
             else load_config(ckpt / "transformer", Cosmos3Config)
         )
 
-        # The engine already ran P.init (mesh) + L.init (linear dispatcher) before
-        # setup(), so the model constructors below find the dispatcher ready — no
-        # register_mesh shim like the standalone example scripts need.
+        # The engine already initialized the mesh and process kernel selector, so
+        # the model constructors below need no standalone register_mesh shim.
         with use_quant_plan(load_quant_plan(ckpt / "transformer")):
             self.transformer = Cosmos3Transformer(
                 config, params_dtype=dtype, device=device
@@ -144,9 +152,7 @@ class Cosmos3Entry(Entry):
             compile_kwargs=args.compile_kwargs,
         )
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 generation plugin ready (sound=%s, flow_shift=%s, "
             "use_karras_sigmas=%s).",
             self.avae is not None,

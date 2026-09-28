@@ -890,40 +890,22 @@ class Cosmos3WanVAE(nn.Module):
     def decode_parallel(self, latents: torch.Tensor, *, halo: int = 2) -> torch.Tensor:
         import phyai.parallel as P
 
-        def _axis(name: str) -> tuple[int, int]:
-            """``(size, local_rank)`` for ``name``; ``(1, 0)`` if the axis is
-            absent from the mesh (or no mesh). Guards both a missing mesh and a
-            mesh whose ``mesh_dim_names`` doesn't include ``name`` (e.g. a
-            tp-only test mesh has no ``cfg`` axis)."""
-            try:
-                m = P.default_mesh()
-                names = m.torch_mesh.mesh_dim_names or ()
-                if name not in names:
-                    return 1, 0
-                return m.axis_size(name), m.axis_local_rank(name)
-            except Exception:
-                return 1, 0
-
-        tp_size, tp_rank = _axis("tp")
-        cfg_size, cfg_rank = _axis("cfg")
-        n = cfg_size * tp_size
+        try:
+            mesh = P.default_mesh()
+            n = mesh.group_size("world")
+            tile_rank = mesh.group_rank("world")
+        except (KeyError, RuntimeError):
+            n, tile_rank = 1, 0
         if n <= 1:
             return self.decode(latents)
-        # Only the axes actually present and >1 carry the gather/reduce. ``tp`` is
-        # the inner axis (fastest-varying in global_idx), ``cfg`` the outer one.
-        gather_axes = [ax for ax, sz in (("tp", tp_size), ("cfg", cfg_size)) if sz > 1]
 
         _, _, _, h_lat, w_lat = latents.shape
         scale = self.scale_factor_spatial
         gr, gc = self._tile_grid(n)
         n_tiles = gr * gc
 
-        # Global tile index over the (cfg, tp) rank grid — cfg outer, tp inner, to
-        # match the gather reshape order below and the row-major mesh layout. Ranks
-        # beyond the tile grid idle but still join every collective.
-        global_idx = cfg_rank * tp_size + tp_rank
-        active = global_idx < n_tiles
-        gi, gj = (global_idx // gc, global_idx % gc) if active else (0, 0)
+        active = tile_rank < n_tiles
+        gi, gj = (tile_rank // gc, tile_rank % gc) if active else (0, 0)
         _, _, hs, he = self._tile_bounds(h_lat, gr, gi, halo)
         _, _, ws, we = self._tile_bounds(w_lat, gc, gj, halo)
 
@@ -933,31 +915,21 @@ class Cosmos3WanVAE(nn.Module):
             tile = latents[:, :, :, :1, :1].contiguous()
         pixels = self.decode(tile)  # [B, 3, T, (he-hs)*scale, (we-ws)*scale]
 
-        # Per-rank pixel tiles differ in H/W; pad to a common max shape (reconciled
-        # over every participating axis) so they can be stacked into one all_gather
-        # per axis, with the real extent + placement carried in an int metadata tensor.
+        # Per-rank pixel tiles differ in H/W. Pad to one common shape and carry the
+        # real extent and placement in an integer metadata tensor.
         b, c, t, ph, pw = pixels.shape
         dev = pixels.device
         meta = torch.tensor(
             [int(active), hs * scale, ws * scale, ph, pw], dtype=torch.long, device=dev
         )
         max_hw = torch.tensor([ph, pw], dtype=torch.long, device=dev)
-        for ax in gather_axes:
-            max_hw = P.all_reduce(max_hw, axis=ax, op=_max_reduce_op())
+        max_hw = P.all_reduce(max_hw, group="world", op=_max_reduce_op())
         max_h, max_w = int(max_hw[0].item()), int(max_hw[1].item())
 
         buf = pixels.new_zeros(b, c, t, max_h, max_w)
         buf[:, :, :, :ph, :pw] = pixels
-        # Stage the gather over each participating axis, inner (tp) first then outer
-        # (cfg), so the flattened leading dim is in cfg-outer/tp-inner order and index
-        # r matches each tile's global_idx.
-        gathered = buf.unsqueeze(0)
-        meta_all = meta.unsqueeze(0)
-        for ax in gather_axes:
-            gathered = P.all_gather(gathered.unsqueeze(0), axis=ax, dim=0)
-            gathered = gathered.reshape(-1, *buf.shape)
-            meta_all = P.all_gather(meta_all.unsqueeze(0), axis=ax, dim=0)
-            meta_all = meta_all.reshape(-1, 5)
+        gathered = P.all_gather(buf.unsqueeze(0), group="world", dim=0)
+        meta_all = P.all_gather(meta.unsqueeze(0), group="world", dim=0)
 
         full_h, full_w = h_lat * scale, w_lat * scale
         acc = pixels.new_zeros(b, c, t, full_h, full_w)
@@ -975,10 +947,6 @@ class Cosmos3WanVAE(nn.Module):
             wsum[:, :, :, py : py + th, px : px + tw] += w
         out = acc / wsum.clamp_min(1e-6)
         return torch.clamp(out, -1.0, 1.0)
-
-    # Back-compat alias: the tensor-parallel-only entry point. ``decode_parallel``
-    # subsumes it (cfg_size defaults to 1 when there is no cfg axis).
-    decode_tp = decode_parallel
 
     @torch.no_grad()
     def encode(

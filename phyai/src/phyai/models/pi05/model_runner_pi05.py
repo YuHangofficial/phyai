@@ -2,49 +2,40 @@
 
 from __future__ import annotations
 
-import logging
-
 import torch
 
 from phyai.cache import KVCachePool
-from phyai.layers.attention import (
-    ARAttention,
-    ARAttentionBackend,
-    ARAttnCtx,
-    ARAttnMetadata,
-    ARAttnPlanHandle,
-    AttnLayout,
-    AttnMode,
-    DiffusionAttention,
-    DiffusionAttentionBackend,
-    DiffusionAttnCtx,
-    DiffusionAttnMetadata,
-    DiffusionAttnPlanHandle,
-    get_ar_backend_factory,
-    get_diffusion_backend_factory,
-)
-from phyai.layers.rotary_embedding import RotaryEmbedding
-from phyai.models.pi05.modeling_pi05 import (
-    ActionTimeHeads,
-    ExpertModulationTables,
-    PaliGemmaLanguageModel,
-    PI05ExpertStack,
-    PI05VisionTower,
-)
-from phyai.payload import (
+from phyai.utils import get_logger
+from phyai.models.pi05.forward_batch_pi05 import (
     LLMForwardBatch,
     VisionForwardBatch,
 )
-from phyai.runtime.cuda_graph_manager import CudaGraph
+from phyai.layers.attention import (
+    AttnMode,
+    AttnLayout,
+    PagedAttnCtx,
+    PagedAttention,
+    PagedAttnMetadata,
+    PagedAttnPlanHandle,
+    PagedAttentionBackend,
+)
 from phyai.runtime.model_runner import ModelRunner
-from phyai.utils import all_ranks_log
+from phyai.layers.attention.shared import select_paged_backend
+from phyai.layers.rotary_embedding import RotaryEmbedding
+from phyai.models.pi05.modeling_pi05 import (
+    ActionTimeHeads,
+    PI05ExpertStack,
+    PI05VisionTower,
+    ExpertModulationTables,
+    PaliGemmaLanguageModel,
+)
+from phyai.runtime.cuda_graph_manager import CudaGraph
+
+logger = get_logger(__name__)
 
 
-logger = logging.getLogger(__name__)
-
-
-def _ar_attn_proto(stack_layers) -> ARAttention:
-    """Return the first layer's :class:`ARAttention` instance.
+def _ar_attn_proto(stack_layers) -> PagedAttention:
+    """Return the first layer's :class:`PagedAttention` instance.
 
     Used by the LLM runner to read ``num_heads`` / ``num_kv_heads`` /
     ``head_dim`` / ``backend`` for the backend factory and capture-shape
@@ -56,8 +47,8 @@ def _ar_attn_proto(stack_layers) -> ARAttention:
     return stack_layers[0].attn
 
 
-def _diffusion_attn_proto(stack_layers) -> DiffusionAttention:
-    """Return the first layer's :class:`DiffusionAttention` instance.
+def _diffusion_attn_proto(stack_layers) -> PagedAttention:
+    """Return the first layer's :class:`PagedAttention` instance.
 
     Used by the expert runner; same role as :func:`_ar_attn_proto` but
     typed for the diffusion / action-expert stack.
@@ -137,14 +128,12 @@ class PI05VisionRunner(ModelRunner):
         self.graph: CudaGraph | None = None
 
     def setup(self) -> None:
-        all_ranks_log(logger, logging.INFO, "Entering PI05VisionRunner.setup")
+        logger.info("Entering PI05VisionRunner.setup")
         if not self.use_cuda_graph or self.device.type != "cuda":
             return
-        all_ranks_log(
-            logger,
-            logging.INFO,
-            "Entering PI05VisionRunner.setup: capturing vision-tower CUDA graph "
-            "at fixed shape (%d, %d, %d, %d).",
+        logger.info(
+            "Entering PI05VisionRunner.setup: capturing vision-tower CUDA "
+            "graph at fixed shape (%d, %d, %d, %d).",
             self.num_images,
             self.num_channels,
             self.image_size,
@@ -182,8 +171,8 @@ class PI05LLMRunner(ModelRunner):
     per-sample-padded prefix and writes K/V to ``kv_pool``.
 
     Captured at fixed shape ``(B * n_per_sample, hidden_size)``. Owns
-    a single :class:`ARAttentionBackend` instance built via
-    :func:`get_ar_backend_factory`; the backend allocates its own static
+    a single :class:`PagedAttentionBackend` instance selected through the
+    kernel catalog; the backend allocates its own static
     buffers in :meth:`init_cuda_graph_state` and
     re-plans them in place per inference via
     :meth:`replay_metadata` (graph) or
@@ -215,7 +204,7 @@ class PI05LLMRunner(ModelRunner):
         self.device = torch.device(device)
         # Read attention metadata from the first layer; every layer's
         # config is identical, only layer_id differs.
-        self.attn_proto: ARAttention = _ar_attn_proto(paligemma_lm.layers)
+        self.attn_proto: PagedAttention = _ar_attn_proto(paligemma_lm.layers)
         self.num_heads = self.attn_proto.num_heads
         self.num_kv_heads = self.attn_proto.num_kv_heads
         self.head_dim = self.attn_proto.head_dim
@@ -228,15 +217,23 @@ class PI05LLMRunner(ModelRunner):
 
         # Build the runner-scoped backend instance. Backend reads runner
         # state for buffer sizing in init_cuda_graph_state.
-        factory = get_ar_backend_factory(self.attn_proto.backend)
-        self.attn_backend: ARAttentionBackend = factory(self)
+        self.attn_backend: PagedAttentionBackend = select_paged_backend(
+            "attention_paged",
+            self.attn_proto,
+            self,
+            device=self.device,
+            params_dtype=self.params_dtype,
+            num_tokens=self.batch_size * self.n_per_sample,
+            capture=bool(use_cuda_graph) and self.device.type == "cuda",
+            runner_tag="pi05.lm",
+        )
         self.use_cuda_graph = (
             bool(use_cuda_graph)
             and self.attn_backend.supports_capture()
             and self.device.type == "cuda"
         )
 
-        self._capture_plan: ARAttnPlanHandle | None = None
+        self._capture_plan: PagedAttnPlanHandle | None = None
         # One captured graph per prefix-length bucket (keyed by
         # ``n_per_sample``). Shorter buckets pad the lang budget to fewer
         # tokens, so a short prompt skips the dense GEMM work on padding
@@ -250,7 +247,7 @@ class PI05LLMRunner(ModelRunner):
     # ------------------------------------------------------------------ #
 
     def setup(self, n_per_sample_buckets: list[int] | None = None) -> None:
-        all_ranks_log(logger, logging.INFO, "Entering PI05LLMRunner.setup")
+        logger.info("Entering PI05LLMRunner.setup")
         # Always allocate static buffers + build wrapper — graph mode
         # needs them, and the non-cuda-graph path benefits from stable
         # addresses. They are sized for the *largest* bucket
@@ -273,9 +270,7 @@ class PI05LLMRunner(ModelRunner):
             raise ValueError(
                 f"n_per_sample buckets {buckets} must be in (0, {self.n_per_sample}]."
             )
-        all_ranks_log(
-            logger,
-            logging.INFO,
+        logger.info(
             "Entering PI05LLMRunner.setup: capturing %d prefix-forward CUDA "
             "graph(s) at B*n_per_sample in %s (hidden_size=%d).",
             len(buckets),
@@ -293,7 +288,7 @@ class PI05LLMRunner(ModelRunner):
             )
             self.graphs[n_ps] = self._capture_graph(n_ps)
 
-    def _capture_seed_metadata(self, n_per_sample: int) -> ARAttnMetadata:
+    def _capture_seed_metadata(self, n_per_sample: int) -> PagedAttnMetadata:
         # Per-sample padded q layout for this bucket — fixed across all
         # inferences that route to it.
         cu_q = torch.arange(
@@ -327,7 +322,7 @@ class PI05LLMRunner(ModelRunner):
             dtype=torch.int64,
             device=self.device,
         )
-        return ARAttnMetadata(
+        return PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=self.batch_size,
@@ -364,7 +359,7 @@ class PI05LLMRunner(ModelRunner):
         write_indices: torch.Tensor,
     ) -> torch.Tensor:
         """Run paligemma's 18 layers, writing K/V into ``self.kv_pool``."""
-        ctx = ARAttnCtx(
+        ctx = PagedAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
             mode=AttnMode.PREFILL,
@@ -374,12 +369,12 @@ class PI05LLMRunner(ModelRunner):
         )
         return self.paligemma_lm(hidden_states, position_ids, self.rope, ctx)
 
-    def plan_inference(self, meta: ARAttnMetadata) -> None:
+    def plan_inference(self, meta: PagedAttnMetadata) -> None:
         """Stage attention metadata for the next ``forward`` call.
 
         Graph mode: re-plan the captured backend buffers in place via
-        :meth:`ARAttentionBackend.replay_metadata`. Non-graph mode: build
-        a fresh plan via :meth:`ARAttentionBackend.init_forward_metadata`.
+        :meth:`PagedAttentionBackend.replay_metadata`. Non-graph mode: build
+        a fresh plan via :meth:`PagedAttentionBackend.init_forward_metadata`.
         """
         if self.use_cuda_graph:
             self.attn_backend.replay_metadata(self._capture_plan, meta)
@@ -478,7 +473,7 @@ class PI05ExpertRunner(ModelRunner):
         self.expert_hidden = int(heads.expert_hidden)
         self.params_dtype = params_dtype
         self.device = torch.device(device)
-        self.attn_proto: DiffusionAttention = _diffusion_attn_proto(expert_stack.layers)
+        self.attn_proto: PagedAttention = _diffusion_attn_proto(expert_stack.layers)
         self.num_heads = self.attn_proto.num_heads
         self.num_kv_heads = self.attn_proto.num_kv_heads
         self.head_dim = self.attn_proto.head_dim
@@ -506,15 +501,23 @@ class PI05ExpertRunner(ModelRunner):
             device=self.device,
         )
 
-        factory = get_diffusion_backend_factory(self.attn_proto.backend)
-        self.attn_backend: DiffusionAttentionBackend = factory(self)
+        self.attn_backend: PagedAttentionBackend = select_paged_backend(
+            "attention_paged",
+            self.attn_proto,
+            self,
+            device=self.device,
+            params_dtype=self.params_dtype,
+            num_tokens=self.batch_size * self.chunk_size,
+            capture=bool(use_cuda_graph) and self.device.type == "cuda",
+            runner_tag="pi05.expert",
+        )
         self.use_cuda_graph = (
             bool(use_cuda_graph)
             and self.attn_backend.supports_capture()
             and self.device.type == "cuda"
         )
 
-        self._capture_plan: DiffusionAttnPlanHandle | None = None
+        self._capture_plan: PagedAttnPlanHandle | None = None
         self.graph: CudaGraph | None = None
 
         # Euler schedule, bound by the scheduler via ``bind_euler_schedule``
@@ -598,7 +601,7 @@ class PI05ExpertRunner(ModelRunner):
     # ------------------------------------------------------------------ #
 
     def setup(self) -> None:
-        all_ranks_log(logger, logging.INFO, "Entering PI05ExpertRunner.setup")
+        logger.info("Entering PI05ExpertRunner.setup")
         if self._time_emb_table is None or self._num_steps <= 0:
             raise RuntimeError(
                 "PI05ExpertRunner.setup() called before bind_euler_schedule(); "
@@ -614,12 +617,10 @@ class PI05ExpertRunner(ModelRunner):
             layer_proto=self.attn_proto,
         )
         if self.use_cuda_graph:
-            all_ranks_log(
-                logger,
-                logging.INFO,
-                "Entering PI05ExpertRunner.setup: capturing the full %d-step "
-                "Euler loop as one CUDA graph at fixed shape "
-                "(B=%d, chunk_size=%d, max_action_dim=%d).",
+            logger.info(
+                "Entering PI05ExpertRunner.setup: capturing the full %d-step Euler "
+                "loop as one CUDA graph at fixed shape (B=%d, chunk_size=%d, "
+                "max_action_dim=%d).",
                 self._num_steps,
                 self.batch_size,
                 self.chunk_size,
@@ -630,7 +631,7 @@ class PI05ExpertRunner(ModelRunner):
             )
             self._capture_graph()
 
-    def _capture_seed_metadata(self) -> DiffusionAttnMetadata:
+    def _capture_seed_metadata(self) -> PagedAttnMetadata:
         # cu_q is fixed [0, chunk, 2*chunk, ...] across all inferences.
         cu_q = torch.arange(
             0,
@@ -657,7 +658,7 @@ class PI05ExpertRunner(ModelRunner):
             device=self.device,
         )
         last_page = torch.ones(self.batch_size, dtype=torch.int32, device=self.device)
-        return DiffusionAttnMetadata(
+        return PagedAttnMetadata(
             mode=AttnMode.PREFILL,
             layout=AttnLayout.RAGGED_3D,
             batch_size=self.batch_size,
@@ -675,7 +676,7 @@ class PI05ExpertRunner(ModelRunner):
                 self.batch_size,
                 self.chunk_size,
                 self.max_action_dim,
-                dtype=self.params_dtype,
+                dtype=torch.float32,
                 device=self.device,
             ),
         }
@@ -699,9 +700,11 @@ class PI05ExpertRunner(ModelRunner):
         in-graph.
         """
         assert self._mod_tables is not None  # built in bind_euler_schedule()
-        action_emb = self.heads.embed_action(x_t)
+        # RLinf keeps the Euler state in fp32 and casts only the model input to
+        # the embedding dtype. This avoids ten rounds of bf16 update error.
+        action_emb = self.heads.embed_action(x_t.to(self.params_dtype))
         suffix_h = action_emb.reshape(self.batch_size * self.chunk_size, -1)
-        ctx = DiffusionAttnCtx(
+        ctx = PagedAttnCtx(
             backend=self.attn_backend,
             plan=self._capture_plan,
             mode=AttnMode.PREFILL,
@@ -737,7 +740,7 @@ class PI05ExpertRunner(ModelRunner):
             x_t = x_t + self._dt * v_t.to(x_t.dtype)
         return x_t
 
-    def plan_inference(self, meta: DiffusionAttnMetadata) -> None:
+    def plan_inference(self, meta: PagedAttnMetadata) -> None:
         """Refresh metadata for one inference (all Euler steps share it).
 
         ``pos_ids_suffix`` is updated from ``meta.position_ids``;

@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.engine_config import get_engine_config
+from phyai.kernel.call import CallSite, backend_preference, token_shape
 from phyai.weights.shards import replicated, weight_norm_fold
 
 _size_1_t = Union[int, Tuple[int]]
@@ -84,6 +85,7 @@ class _ConvNd(nn.Module):
         device: torch.device | str | None,
         prefix: str = "",
         weight_norm: bool = False,
+        compute_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         if groups <= 0:
@@ -121,6 +123,7 @@ class _ConvNd(nn.Module):
         self.groups = groups
         self.padding_mode = padding_mode
         self.prefix = prefix
+        self.compute_dtype = compute_dtype
 
         # F.pad takes pads in reverse axis order with each axis getting
         # (left, right). Only used when padding_mode != "zeros", but it's
@@ -145,6 +148,19 @@ class _ConvNd(nn.Module):
 
         _attach_conv_loaders(self.weight, self.bias, prefix, weight_norm)
 
+        # Cache higher-precision compute copies after checkpoint loading.
+        self.register_buffer("_compute_weight", None, persistent=False)
+        self.register_buffer("_compute_bias", None, persistent=False)
+
+    def post_load(self) -> None:
+        """Build compute-dtype parameter copies after checkpoint loading."""
+        if self.compute_dtype is None:
+            return
+        self._compute_weight = self.weight.detach().to(self.compute_dtype)
+        self._compute_bias = (
+            self.bias.detach().to(self.compute_dtype) if self.bias is not None else None
+        )
+
     @staticmethod
     def _build_reversed_pad(
         padding: tuple[int, ...] | str,
@@ -167,12 +183,23 @@ class _ConvNd(nn.Module):
         return tuple(out)
 
     def _conv(self, fn, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        bias = self.bias
+        if self.compute_dtype is not None:
+            x = x.to(self.compute_dtype)
+            weight = self._compute_weight
+            bias = self._compute_bias
+            if weight is None:
+                weight = self.weight.to(self.compute_dtype)
+                bias = (
+                    self.bias.to(self.compute_dtype) if self.bias is not None else None
+                )
         if self.padding_mode != "zeros":
             x = F.pad(x, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             return fn(
                 x,
-                self.weight,
-                self.bias,
+                weight,
+                bias,
                 self.stride,
                 0,
                 self.dilation,
@@ -180,8 +207,8 @@ class _ConvNd(nn.Module):
             )
         return fn(
             x,
-            self.weight,
-            self.bias,
+            weight,
+            bias,
             self.stride,
             self.padding,
             self.dilation,
@@ -203,6 +230,8 @@ class _ConvNd(nn.Module):
             s += ", bias=False"
         if self.padding_mode != "zeros":
             s += f", padding_mode={self.padding_mode!r}"
+        if self.compute_dtype is not None:
+            s += f", compute_dtype={self.compute_dtype}"
         return s
 
 
@@ -249,7 +278,12 @@ class Conv1d(_ConvNd):
 
 
 class Conv2d(_ConvNd):
-    """2-D convolution. Mirrors :class:`torch.nn.Conv2d` for inference."""
+    """2-D convolution for inference.
+
+    ``compute_dtype`` runs the convolution with the input and derived parameter
+    copies in that dtype without changing parameter storage. The output keeps
+    the compute dtype.
+    """
 
     _ndim = 2
 
@@ -269,6 +303,7 @@ class Conv2d(_ConvNd):
         device: torch.device | str | None = None,
         prefix: str = "",
         weight_norm: bool = False,
+        compute_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(
             in_channels,
@@ -284,6 +319,7 @@ class Conv2d(_ConvNd):
             device,
             prefix=prefix,
             weight_norm=weight_norm,
+            compute_dtype=compute_dtype,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -429,4 +465,84 @@ class ConvTranspose1d(nn.Module):
         return s
 
 
-__all__ = ["Conv1d", "Conv2d", "Conv3d", "ConvTranspose1d"]
+class CausalConv1d(Conv1d):
+    """Depthwise causal Conv1d fused with an activation and an output split.
+
+    The mixer pattern of the Qwen3.5 / Qwen3-Next GDN family: a grouped
+    causal convolution over token-major activations, the activation applied
+    in the same pass, and the result split into (query, key, value) widths.
+    Executed through the ``causal_conv`` catalog op, so the Triton fused
+    kernel and the torch reference are selected the same way as every other
+    layer — this class only owns the weight and describes the call.
+
+    ``forward(x)`` takes ``(batch, seq, channels)`` token-major activations
+    and returns one tensor per entry of ``split_sizes``, each
+    ``(batch, seq, width)``. The convolution is causal: position ``t`` sees
+    positions ``t - kernel_size + 1 .. t``.
+
+    The weight is stored exactly like :class:`torch.nn.Conv1d` with
+    ``groups=channels`` — shape ``(channels, 1, kernel_size)`` under
+    ``{prefix}.weight`` — so checkpoints load unchanged.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        *,
+        split_sizes: Tuple[int, ...],
+        activation: str = "silu",
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+        prefix: str = "",
+        backend: str | None = None,
+        kernel_role: str = "causal_conv",
+    ) -> None:
+        kernel_size = int(kernel_size)
+        super().__init__(
+            channels,
+            channels,
+            kernel_size,
+            padding=kernel_size - 1,
+            groups=channels,
+            bias=False,
+            dtype=dtype,
+            device=device,
+            prefix=prefix,
+        )
+        self.split_sizes = tuple(int(size) for size in split_sizes)
+        if sum(self.split_sizes) != channels:
+            raise ValueError(
+                f"CausalConv1d: split_sizes {self.split_sizes} must sum to "
+                f"channels={channels}."
+            )
+        self.activation = activation
+        self.kernel_role = kernel_role
+        self._prefer = backend_preference("causal_conv", backend)
+        self._call = CallSite(
+            "causal_conv",
+            role=kernel_role,
+            prefer=self._prefer,
+            dims={"channels": channels, "kernel": kernel_size},
+            attrs={
+                "activation": activation,
+                "split": "qkv"
+                if len(self.split_sizes) == 3
+                else str(len(self.split_sizes)),
+            },
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        handle = self._call.select(
+            device=x.device,
+            dtype={"input": x.dtype},
+            dims=token_shape(x),
+        )
+        return handle.execute(
+            x.contiguous(),
+            self.weight.contiguous(),
+            self.split_sizes,
+        )
+
+
+__all__ = ["CausalConv1d", "Conv1d", "Conv2d", "Conv3d", "ConvTranspose1d"]

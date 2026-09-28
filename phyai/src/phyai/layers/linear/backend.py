@@ -1,62 +1,42 @@
-"""LinearKernel Protocol + descriptive dataclasses.
+"""GEMM backend Protocol.
 
-A ``KernelProbe`` is the dispatcher's query packet, and ``LinearKernel``
-is a pure-capability Protocol each backend implements. There is no
-``score()`` — priority is the Registry's job (see
-:mod:`phyai.layers.linear.registry`).
+Selection used to live here: a ``KernelProbe`` query packet, a ``can_handle``
+predicate per backend, and a registry that ordered the survivors. All of that
+now lives in :mod:`phyai.kernel` — each GEMM implementation is one catalog row
+whose eligibility is a declarative predicate over typed facts, and the row
+binds the concrete function directly.
+
+What is left is the execution contract: a backend is a named collection of
+matmul entry points, each taking the layer (for its weight and scale tensors),
+the activations, and the bias.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 import torch
 
 from phyai.layers.quant.granularity import Granularity
-from phyai.parallel.state import Mode
 
 
-# ``Granularity`` was originally defined here. It now lives in
-# :mod:`phyai.layers.quant.granularity` so non-linear ops can reuse it; the
-# import above re-exports it under the historical path.
-
-
-@dataclass(frozen=True)
-class KernelProbe:
-    """The query packet the dispatcher hands to the registry.
-
-    Fields are chosen so that ``(probe)`` is uniquely keyable into a cache
-    and carries everything a ``LinearKernel.can_handle`` predicate needs.
-    """
-
-    spec_id: str
-    M_bucket: int
-    N: int
-    K: int
-    in_dtype: torch.dtype
-    out_dtype: torch.dtype
-    sm: int
-    mode: Mode
+#: The signature every GEMM entry point shares.
+LinearFn = Callable[
+    [torch.nn.Module, torch.Tensor, "torch.Tensor | None"], torch.Tensor
+]
 
 
 @runtime_checkable
 class LinearKernel(Protocol):
-    """Pure-capability Protocol each matmul backend implements.
+    """A named collection of matmul entry points.
 
-    Hot path is :meth:`apply`; :meth:`can_handle` is consulted on cache
-    miss only and returns a bool (no scoring).
+    There is no ``can_handle`` and no ``apply`` dispatch. Which function runs
+    is decided by the catalog row that was selected, and that row holds a
+    reference to the function itself — so "capability said yes, then execution
+    raised on an unhandled format" is no longer expressible.
     """
 
     name: str
 
-    def can_handle(self, probe: KernelProbe) -> bool: ...
 
-    def supports_capture(self) -> bool: ...
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor: ...
+__all__ = ["Granularity", "LinearFn", "LinearKernel"]

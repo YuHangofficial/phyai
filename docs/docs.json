@@ -50,10 +50,8 @@
               {
                 "group": "Cosmos",
                 "pages": [
-                  "models/cosmos/ws1",
-                  "models/cosmos/ws1_policy",
-                  "models/cosmos/wn",
-                  "models/cosmos/wn_policy",
+                  "models/cosmos/generation",
+                  "models/cosmos/policy",
                   "models/cosmos/processors"
                 ]
               }
@@ -65,6 +63,12 @@
               "quantization/overview",
               "quantization/configuration",
               "quantization/internals"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/parallel-serving"
             ]
           },
           {
@@ -120,10 +124,8 @@
               {
                 "group": "Cosmos",
                 "pages": [
-                  "zh/models/cosmos/ws1",
-                  "zh/models/cosmos/ws1_policy",
-                  "zh/models/cosmos/wn",
-                  "zh/models/cosmos/wn_policy",
+                  "zh/models/cosmos/generation",
+                  "zh/models/cosmos/policy",
                   "zh/models/cosmos/processors"
                 ]
               }
@@ -135,6 +137,12 @@
               "zh/quantization/overview",
               "zh/quantization/configuration",
               "zh/quantization/internals"
+            ]
+          },
+          {
+            "group": "部署",
+            "pages": [
+              "zh/deployment/parallel-serving"
             ]
           },
           {
@@ -161,7 +169,7 @@
     "links": [],
     "primary": {
       "type": "github",
-      "href": "https://github.com/MEmbodied/phyai"
+      "href": "https://github.com/mingti-org/phyai"
     }
   },
   "contextual": {
@@ -178,7 +186,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/MEmbodied/phyai"
+      "github": "https://github.com/mingti-org/phyai"
     }
   }
 }

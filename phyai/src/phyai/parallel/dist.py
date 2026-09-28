@@ -1,47 +1,54 @@
-"""Discrete ``torch.distributed`` bootstrap entry point.
-
-:func:`init_dist` is the single function the engine calls to bring up
-the process group. Splitting it out of :class:`~phyai.engine.Engine`
-keeps the orchestration shallow (Engine just decides *whether* to call
-this; it doesn't own the bootstrap logic) and lets advanced users /
-tests reach for the same routine standalone.
-
-Single-rank short-circuit
--------------------------
-When ``world_size == 1`` and no caller-owned process group exists, no
-``init_process_group`` is issued — every collective in
-:mod:`phyai.parallel.ops` short-circuits at world_size=1, so a real
-group would be ceremony. The function returns ``False`` (we don't own
-a process group) and the caller skips the matching teardown.
-"""
+"""Discrete ``torch.distributed`` bootstrap entry point."""
 
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+
+from phyai.utils.cuda import resolve_device
 
 
 def init_dist(
     *,
     world_size: int,
     device_type: str,
+    timeout: timedelta | None = None,
+    require_launcher: bool = False,
+    device: torch.device | str | None = None,
 ) -> bool:
     """Bring up the process group for the requested ``world_size``.
 
-    ``world_size`` is the total rank count for the global mesh — the
-    product of every parallel axis (``dp * ep * sp * cp * tp``), not
-    one specific axis. The caller (typically :class:`~phyai.engine.Engine`)
-    has already done the multiplication.
+    ``world_size`` is the rank count of one complete model replica — the
+    resolved rank count for the configured model-parallel groups.
+    Serving replicas are outside this process group.
+
+    Args:
+        world_size: total rank count for the global mesh.
+        device_type: ``"cuda"`` / ``"cpu"``; picks the backend and decides
+            whether a device gets pinned.
+        timeout: collective timeout handed to ``init_process_group``.
+            ``None`` keeps torch's own default. Engine passes
+            :attr:`~phyai.engine_config.RuntimeConfig.dist_timeout_s`.
+        require_launcher: require ``RANK``/``WORLD_SIZE``/rendezvous
+            environment variables for a multi-rank group. Engine workers set
+            this flag so a missing launcher cannot silently create duplicate
+            rank-zero processes.
+        device: the device target this rank should own. An explicit index
+            (``"cuda:3"``) is pinned as-is; ``None`` or a bare ``"cuda"``
+            resolves through ``LOCAL_RANK`` exactly as before. Engine passes
+            its configured ``device.target`` so a managed worker bound to
+            ``cuda:i`` is not rebound to device 0 here.
 
     Returns
     -------
     bool
         ``True`` if this call **owns** the process group (created it
         and is responsible for ``dist.destroy_process_group()`` on
-        shutdown). ``False`` if a group was already up (e.g. under
-        ``torchrun``) or single-rank short-circuited.
+        shutdown). ``False`` if a group was already up or single-rank
+        short-circuited.
 
     Behaviour
     ---------
@@ -54,26 +61,45 @@ def init_dist(
     if not dist.is_initialized():
         if world_size == 1:
             if device_type == "cuda":
-                torch.cuda.set_device(0)
+                torch.cuda.set_device(resolve_device(device or "cuda"))
             return False
 
         backend = "nccl" if device_type == "cuda" else "gloo"
-        # Honour a launcher (torchrun / torchelastic) when it has populated the
-        # rendezvous env: each process then has its OWN rank / local_rank. Falling
-        # back to rank 0 / world_size only covers the single-process spin-up case
-        # (one process creating the whole group). Reading RANK here is essential —
-        # hardcoding rank=0 makes every torchrun process claim rank 0 and the NCCL
-        # rendezvous deadlocks on the first collective.
+        # WorkerSupervisor or an external launcher populates the rendezvous
+        # environment so each process has its own replica-local rank.
+        launcher_keys = ("RANK", "WORLD_SIZE")
+        missing = tuple(key for key in launcher_keys if key not in os.environ)
+        if require_launcher and missing:
+            raise RuntimeError(
+                "multi-rank Engine workers require launcher environment "
+                f"variables {launcher_keys!r}; missing {missing!r}."
+            )
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29500")
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", str(world_size))
         os.environ.setdefault("LOCAL_RANK", "0")
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend, rank=rank, world_size=world_size)
+        try:
+            rank = int(os.environ["RANK"])
+            launcher_world_size = int(os.environ["WORLD_SIZE"])
+        except ValueError as error:
+            raise RuntimeError(
+                "RANK and WORLD_SIZE must be integer launcher values."
+            ) from error
+        if launcher_world_size != world_size:
+            raise ValueError(
+                f"launcher WORLD_SIZE={launcher_world_size} does not match "
+                f"requested world_size={world_size}."
+            )
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"launcher RANK={rank} is outside [0, {world_size}).")
+        # Pin the device first: NCCL reads the current device while building
+        # its communicator, so binding after init_process_group leaves a
+        # window where the group and this rank's allocations disagree.
         if backend == "nccl":
-            torch.cuda.set_device(local_rank)
+            torch.cuda.set_device(resolve_device(device or "cuda"))
+        kwargs = {} if timeout is None else {"timeout": timeout}
+        dist.init_process_group(backend, rank=rank, world_size=world_size, **kwargs)
         return True
 
     actual = dist.get_world_size()

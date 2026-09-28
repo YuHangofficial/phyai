@@ -15,7 +15,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
     "Weights": <a href="https://huggingface.co/collections/nvidia/gr00t-n17" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">NVIDIA GR00T-N1.7 collection</a>,
     "Tags": ["VLA", "Cosmos-Reason2-2B", "Qwen3-VL", "flow-matching", "single-GPU"],
     "Inputs": "RGB cameras · robot state · language",
-    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">GR00TN17WS1Scheduler</code>,
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">GR00TN17Scheduler</code>,
     "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">gr00t_n17</code>,
     "Param Precision": "bf16",
     "Paper": <a href="https://arxiv.org/abs/2503.14734" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">arxiv.org/abs/2503.14734</a>,
@@ -41,7 +41,7 @@ The `gr00t_n17` plugin follows PhyAI's <Tooltip headline="Engine + plugin" tip="
 <Tree>
   <Tree.Folder name="phyai/src/phyai/models/gr00t_n17" defaultOpen>
     <Tree.File name="main_gr00t_n17.py" />
-    <Tree.File name="scheduler_ws1_gr00t_n17.py" />
+    <Tree.File name="scheduler_gr00t_n17.py" />
     <Tree.File name="model_runner_gr00t_n17.py" />
     <Tree.File name="modeling_gr00t_n17.py" />
     <Tree.File name="qwen3_vl_adapter.py" />
@@ -58,7 +58,7 @@ The `gr00t_n17` plugin follows PhyAI's <Tooltip headline="Engine + plugin" tip="
 | `GR00TN17Entry` | Registers the `"gr00t_n17"` plugin, loads the checkpoint, and creates the single-GPU scheduler |
 | `GR00TN17BackboneRunner` | Runs the Cosmos-Reason2/Qwen3-VL vision and language backbone; owns shape-keyed CUDA graphs |
 | `GR00TN17ActionHeadRunner` | Selects embodiment-specific state/action encoder and action-decoder projections, samples or accepts action noise, and runs the flow-matching denoising loop |
-| `GR00TN17WS1Scheduler` | Prepares and dispatches request tensors to the backbone and action-head runners, then returns the normalized action chunk |
+| `GR00TN17Scheduler` | Prepares and dispatches request tensors to the backbone and action-head runners, then returns the normalized action chunk |
 | `GR00TProcessor` | Converts raw observations to model tensors and decodes normalized chunks into the selected embodiment's action fields in physical units |
 
 The request path is:
@@ -145,7 +145,7 @@ raw cameras + state + instruction
     After constructing `observation` from this contract, continue with:
 
     ```python
-    from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+    from phyai.models.gr00t_n17.scheduler_gr00t_n17 import GR00TN17Request
 
     prepared = processor.process_observation(observation)
     request = GR00TN17Request(tensors=prepared.tensors)
@@ -225,7 +225,7 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.gr00t_n17.configuration_gr00t_n17 import GR00TN17Config
 from phyai.models.gr00t_n17.main_gr00t_n17 import GR00TN17Args
-from phyai.models.gr00t_n17.scheduler_ws1_gr00t_n17 import GR00TN17Request
+from phyai.models.gr00t_n17.scheduler_gr00t_n17 import GR00TN17Request
 from phyai.utils import load_config
 from phyai_utils_tools.models.gr00t import GR00TObservation, GR00TProcessor
 

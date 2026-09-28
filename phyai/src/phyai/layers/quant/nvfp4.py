@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 
 from phyai.layers.quant.base import AllocationRequest
+from phyai.kernel.types import PhysicalSignature
 
 
 _NVFP4_BLOCK_SIZE = 16
@@ -104,6 +105,22 @@ class Nvfp4Spec:
                 f"Nvfp4Spec scale_layout must be 'linear' or '128x4', "
                 f"got {self.scale_layout!r}"
             )
+
+    @property
+    def physical_signature(self) -> PhysicalSignature:
+        return PhysicalSignature(
+            format="nvfp4",
+            layout=self.scale_layout,
+            block_shape=(1, self.block_size),
+            granularity="block",
+            scale_dtype="fp8_e4m3",
+            storage_dtype="uint8",
+            fields={
+                "block_size": self.block_size,
+                "micro_scaled": True,
+                "global_scale_dtype": "fp32",
+            },
+        )
 
     @property
     def spec_id(self) -> str:

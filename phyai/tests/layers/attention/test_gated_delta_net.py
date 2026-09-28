@@ -4,16 +4,18 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from phyai.kernel.registry import build_catalog
 from phyai.layers.attention import AttnLayout, AttnMode
 from phyai.layers.attention.gdn import (
     FlaGatedDeltaNetBackend,
     FlaGatedDeltaNetPlan,
     FlashInferGatedDeltaNetBackend,
     FlashInferGatedDeltaNetPlan,
+    FlashQlaGatedDeltaNetBackend,
+    FlashQlaGatedDeltaNetPlan,
     GatedDeltaNet,
     GatedDeltaNetCtx,
     GatedDeltaNetMetadata,
-    list_backends,
 )
 from phyai.layers.attention.gdn.backends import fla as fla_backend
 from phyai.layers.attention.gdn.backends import flashinfer as flashinfer_backend
@@ -31,7 +33,7 @@ def _has_flashinfer_gdn() -> bool:
 
 
 def _can_run_flashinfer_gdn() -> bool:
-    if not torch.cuda.is_available() or not _has_flashinfer_gdn():
+    if not _has_flashinfer_gdn():
         return False
     major, _ = torch.cuda.get_device_capability()
     if major == 9:
@@ -44,8 +46,6 @@ def _can_run_flashinfer_gdn() -> bool:
 
 
 def _can_run_fla_gdn() -> bool:
-    if not torch.cuda.is_available():
-        return False
     try:
         from fla.ops.gated_delta_rule import (  # noqa: F401
             chunk_gated_delta_rule,
@@ -103,16 +103,36 @@ def test_gdn_registry_and_repr():
         num_value_heads=4,
     )
 
-    assert list_backends() == ["fla", "flashinfer"]
+    # The kernel catalog is the backend registry.
+    assert build_catalog().backends("attention_gdn") == (
+        "fla",
+        "flash_qla",
+        "flashinfer",
+    )
     assert layer.num_state_heads == 4
-    assert "backend='flashinfer'" in repr(layer)
+    # No backend named -> no preference; the catalog's priority order and the
+    # installed policy decide. The repr says so rather than implying a choice
+    # the layer did not make.
+    assert "backend=None" in repr(layer)
 
-
-def test_fla_declares_cuda_graph_capture_support():
+    hinted = GatedDeltaNet(2, 128, num_key_heads=2, num_value_heads=4, backend="fla")
+    assert "backend='fla'" in repr(hinted)
     assert FlaGatedDeltaNetBackend().supports_capture()
 
 
+@pytest.mark.skipif(
+    not _can_run_flashinfer_gdn(),
+    reason="needs flashinfer GDN support on this GPU.",
+)
 def test_flashinfer_padded_prefill_builds_gates(monkeypatch):
+    """Gate/beta preprocessing, with the kernel itself faked.
+
+    Runs on CUDA because GDN genuinely has no CPU implementation -- its
+    OpSpec declares ``requires_reference=False``. This used to pass on CPU
+    only because the backend was bound at construction and its device check
+    was monkeypatched away, i.e. it exercised a configuration that cannot
+    occur. The maths under test is device-independent.
+    """
     captured = {}
     monkeypatch.setattr(flashinfer_backend, "_check_supported_device", lambda x: None)
 
@@ -123,32 +143,38 @@ def test_flashinfer_padded_prefill_builds_gates(monkeypatch):
     monkeypatch.setattr(flashinfer_backend, "_load_prefill_op", lambda: fake_prefill)
 
     layer = GatedDeltaNet(2, 4, num_value_heads=4)
-    q = torch.randn(2, 3, 2, 4, dtype=torch.bfloat16)
+    q = torch.randn(2, 3, 2, 4, dtype=torch.bfloat16, device="cuda")
     k = torch.randn_like(q)
-    v = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
-    a = torch.randn(2, 3, 4, dtype=torch.bfloat16)
-    b = torch.randn(2, 3, 4, dtype=torch.bfloat16)
-    a_log = torch.randn(4, dtype=torch.float32)
-    dt_bias = torch.randn(4, dtype=torch.bfloat16)
+    v = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16, device="cuda")
+    a = torch.randn(2, 3, 4, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(2, 3, 4, dtype=torch.bfloat16, device="cuda")
+    a_log = torch.randn(4, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(4, dtype=torch.bfloat16, device="cuda")
 
     out = layer(q, k, v, a, b, a_log, dt_bias)
 
+    # The host normalizes q/k and passes the gate in linear space, because
+    # the kernel's l2norm flag mis-executes on SM90 and its gate argument is
+    # a linear-space alpha (log2f'd internally).
+    q_normalized = flashinfer_backend._l2norm(q.reshape(-1, 2, 4)).reshape(2, 3, 2, 4)
     assert out.shape == (2, 3, 4, 4)
-    torch.testing.assert_close(out, torch.cat((q, q), dim=2) + 1)
+    torch.testing.assert_close(out, torch.cat((q_normalized, q_normalized), dim=2) + 1)
     assert captured["q"].shape == (6, 2, 4)
     assert captured["k"].shape == (6, 2, 4)
     assert captured["v"].shape == (6, 4, 4)
     assert captured["cu_seqlens"].tolist() == [0, 3, 6]
     assert captured["cu_seqlens"].dtype == torch.int32
-    expected_g = -a_log.exp().unsqueeze(0) * torch.nn.functional.softplus(
-        a.reshape(-1, 4).float() + dt_bias.float()
+    torch.testing.assert_close(captured["q"], q_normalized.reshape(-1, 2, 4))
+    expected_decay = torch.exp(
+        -a_log.exp().unsqueeze(0)
+        * torch.nn.functional.softplus(a.reshape(-1, 4).float() + dt_bias.float())
     )
     expected_beta = b.reshape(-1, 4).float().sigmoid()
-    torch.testing.assert_close(captured["g"], expected_g)
+    torch.testing.assert_close(captured["g"], expected_decay)
     torch.testing.assert_close(captured["beta"], expected_beta)
     assert captured["g"].dtype == torch.float32
     assert captured["beta"].dtype == torch.float32
-    assert captured["use_qk_l2norm_in_kernel"] is True
+    assert captured["use_qk_l2norm_in_kernel"] is False
 
 
 def test_flashinfer_ragged_prefill_threads_state_buffers(monkeypatch):
@@ -314,13 +340,13 @@ def test_fla_padded_prefill_preserves_layout(monkeypatch):
     monkeypatch.setattr(fla_backend, "_load_chunk_op", lambda: fake_chunk)
 
     layer = GatedDeltaNet(2, 4, backend="fla")
-    q = torch.randn(2, 3, 2, 4, dtype=torch.bfloat16)
+    q = torch.randn(2, 3, 2, 4, dtype=torch.bfloat16, device="cuda")
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    a = torch.randn(2, 3, 2, dtype=torch.bfloat16)
+    a = torch.randn(2, 3, 2, dtype=torch.bfloat16, device="cuda")
     b = torch.randn_like(a)
-    a_log = torch.randn(2, dtype=torch.float32)
-    dt_bias = torch.randn(2, dtype=torch.float32)
+    a_log = torch.randn(2, dtype=torch.float32, device="cuda")
+    dt_bias = torch.randn(2, dtype=torch.float32, device="cuda")
 
     out = layer(q, k, v, a, b, a_log, dt_bias)
 
@@ -377,41 +403,35 @@ def test_fla_decode_gathers_and_scatters_state_pool(monkeypatch):
     assert torch.count_nonzero(out[1]) == 0
 
 
-def test_gdn_idle_does_not_load_flashinfer(monkeypatch):
+def test_idle_and_unsupported_device_never_load_flashinfer_ops(monkeypatch):
     def fail_load():
-        raise AssertionError("FlashInfer op must not load for IDLE mode")
+        raise AssertionError(
+            "FlashInfer op must not load for IDLE mode or before device validation"
+        )
 
     monkeypatch.setattr(flashinfer_backend, "_load_prefill_op", fail_load)
     monkeypatch.setattr(flashinfer_backend, "_load_decode_op", fail_load)
-
     layer = GatedDeltaNet(2, 4)
-    backend = FlashInferGatedDeltaNetBackend()
+
+    # IDLE bypasses the kernel and returns zeros.
     ctx = GatedDeltaNetCtx(
-        backend=backend,
+        backend=FlashInferGatedDeltaNetBackend(),
         plan=FlashInferGatedDeltaNetPlan(),
         mode=AttnMode.IDLE,
         layout=AttnLayout.RAGGED_3D,
     )
     q = torch.randn(3, 2, 4)
     zeros = torch.zeros(3, 2)
-    a_log = torch.zeros(2, dtype=torch.float32)
+    out = layer(
+        q, q, q, zeros, zeros, torch.zeros(2, dtype=torch.float32), torch.zeros(2), ctx
+    )
+    assert out.shape == q.shape and torch.count_nonzero(out) == 0
 
-    out = layer(q, q, q, zeros, zeros, a_log, torch.zeros(2), ctx)
-
-    assert out.shape == q.shape
-    assert torch.count_nonzero(out) == 0
-
-
-def test_flashinfer_rejects_unsupported_device_before_loading_ops(monkeypatch):
-    def fail_load():
-        raise AssertionError("FlashInfer op must not load before device validation")
-
-    monkeypatch.setattr(flashinfer_backend, "_load_prefill_op", fail_load)
-    layer = GatedDeltaNet(2, 4)
+    # A CPU input fails at selection, naming every rejection reason: GDN has
+    # no CPU implementation at all, an opt-out its OpSpec declares explicitly.
     q = torch.randn(3, 2, 4, dtype=torch.bfloat16)
     gates = torch.randn(3, 2, dtype=torch.bfloat16)
-
-    try:
+    with pytest.raises(RuntimeError) as excinfo:
         layer(
             q,
             q,
@@ -422,36 +442,50 @@ def test_flashinfer_rejects_unsupported_device_before_loading_ops(monkeypatch):
             torch.zeros(2, dtype=torch.bfloat16),
             cu_seqlens=torch.tensor([0, 3], dtype=torch.int32),
         )
-    except RuntimeError as exc:
-        assert "requires CUDA tensors" in str(exc)
-    else:
-        raise AssertionError("CPU input must fail before loading FlashInfer")
+    assert "no kernel can handle op='attention_gdn'" in str(excinfo.value)
+    assert "device.vendor == nvidia failed: got 'cpu'" in str(excinfo.value)
 
 
-def test_flashinfer_validates_kernel_dtypes(monkeypatch):
-    monkeypatch.setattr(flashinfer_backend, "_check_supported_device", lambda x: None)
-    layer = GatedDeltaNet(2, 4)
-    q = torch.randn(3, 2, 4)
-    gates = torch.randn(3, 2)
+def test_flashinfer_gdn_declares_bf16_only():
+    """fp32 and fp16 activations make the FlashInfer GDN row ineligible.
 
-    with pytest.raises(ValueError, match="q must be float16 or bfloat16"):
-        layer(
-            q,
-            q,
-            q,
-            gates,
-            gates,
-            torch.zeros(2, dtype=torch.float32),
-            torch.zeros(2),
-            cu_seqlens=torch.tensor([0, 3], dtype=torch.int32),
+    The backend used to enforce dtypes with a ``raise`` inside its forward,
+    which can never drive a fallback because selection had already committed.
+    fp16 is excluded on purpose: the 0.6.x fp16 decode kernel writes a wrong
+    recurrent state, so fp16 falls through to whatever else is installed (FLA).
+    """
+    from phyai.kernel.call import explain
+
+    for activation in ("fp32", "fp16"):
+        trace = explain(
+            "attention_gdn",
+            role="gdn",
+            device="nvidia:SM90",
+            dtype={
+                "input": activation,
+                "key": activation,
+                "value": activation,
+                "a": activation,
+                "b": activation,
+                "a_log": "fp32",
+                "dt_bias": "fp32",
+            },
+            shape={"head_dim": 128, "tokens": 3},
+            attrs={"layout": "ragged"},
         )
+        rejection = next(
+            c for c in trace.candidates if c.kernel_id == "flashinfer.attention_gdn"
+        )
+        assert "dtype.input == bf16" in rejection.reason
+        assert trace.selected != "flashinfer.attention_gdn"
 
 
 @pytest.mark.skipif(
     not _can_run_flashinfer_gdn(),
     reason="FlashInfer GDN tests require a supported SM90/SM100 CUDA device.",
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# fp16 is absent: the catalog row declares bf16 only, so fp16 never reaches it.
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_flashinfer_gdn_prefill_matches_recurrent_reference(dtype):
     torch.manual_seed(23)
     num_query_heads, num_value_heads, head_dim = 2, 4, 128
@@ -514,7 +548,9 @@ def test_flashinfer_gdn_prefill_matches_recurrent_reference(dtype):
     not _can_run_flashinfer_gdn(),
     reason="FlashInfer GDN tests require a supported SM90/SM100 CUDA device.",
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# fp16 is absent on purpose: flashinfer's fp16 decode kernel writes a wrong
+# recurrent state (0.6.12-0.6.17), so the catalog row declares bf16 only.
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_flashinfer_gdn_decode_matches_recurrent_reference(dtype):
     torch.manual_seed(29)
     batch_size, num_heads, head_dim = 2, 2, 128
@@ -637,7 +673,7 @@ def test_fla_gdn_prefill_matches_recurrent_reference(dtype):
     not _can_run_fla_gdn(),
     reason="FLA GDN tests require CUDA + flash-linear-attention.",
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fla_gdn_prefill_replays_under_cuda_graph(dtype):
     layer = GatedDeltaNet(2, 64, backend="fla")
 
@@ -671,7 +707,7 @@ def test_fla_gdn_prefill_replays_under_cuda_graph(dtype):
     not _can_run_fla_gdn(),
     reason="FLA GDN tests require CUDA + flash-linear-attention.",
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fla_gdn_decode_matches_recurrent_reference(dtype):
     torch.manual_seed(37)
     batch_size, num_heads, head_dim = 2, 2, 64
@@ -769,3 +805,108 @@ def test_gdn_validates_decode_shape_and_state_parameters():
         assert "a_log must be float32" in str(exc)
     else:
         raise AssertionError("non-float32 a_log must fail")
+
+
+# --------------------------------------------------------------------- #
+# FlashQLA backend                                                       #
+# --------------------------------------------------------------------- #
+
+
+def _can_run_flash_qla_gdn() -> bool:
+    try:
+        import flash_qla  # noqa: F401
+        import fla  # noqa: F401
+    except ImportError:
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major in (9, 10, 12)
+
+
+@pytest.mark.skipif(
+    not _can_run_flash_qla_gdn(),
+    reason="FlashQLA GDN tests require flash-qla + a SM90/SM100/SM120 CUDA device.",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_qla_gdn_prefill_matches_recurrent_reference(dtype):
+    torch.manual_seed(23)
+    num_query_heads, num_value_heads, head_dim = 2, 4, 128
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+    q = torch.randn(5, num_query_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn(5, num_value_heads, head_dim, device="cuda", dtype=dtype)
+    a = torch.randn(5, num_value_heads, device="cuda", dtype=dtype)
+    b = torch.randn_like(a)
+    a_log = torch.randn(num_value_heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(num_value_heads, device="cuda", dtype=torch.float32)
+    initial_state = (
+        torch.randn(
+            2,
+            num_value_heads,
+            head_dim,
+            head_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.02
+    )
+    output_state = torch.empty_like(initial_state)
+    layer = GatedDeltaNet(
+        num_query_heads,
+        head_dim,
+        num_value_heads=num_value_heads,
+    )
+    backend = FlashQlaGatedDeltaNetBackend()
+    ctx = GatedDeltaNetCtx(
+        backend=backend,
+        plan=FlashQlaGatedDeltaNetPlan(),
+        mode=AttnMode.PREFILL,
+        layout=AttnLayout.RAGGED_3D,
+        cu_seqlens=cu_seqlens,
+        state=initial_state,
+        output_state=output_state,
+    )
+
+    output = layer(q, k, v, a, b, a_log, dt_bias, ctx)
+    ref_output, ref_state = _gdn_reference(
+        q,
+        k,
+        v,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        cu_seqlens,
+        initial_state,
+        layer.scale,
+    )
+
+    atol = 3e-2 if dtype == torch.float16 else 5e-2
+    torch.testing.assert_close(output.cpu().float(), ref_output, atol=atol, rtol=2e-2)
+    torch.testing.assert_close(output_state.cpu(), ref_state, atol=atol, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _can_run_flash_qla_gdn(),
+    reason="Selection needs flash-qla installed and a supported CUDA device.",
+)
+def test_flash_qla_outranks_flashinfer_when_installed():
+    """The FlashQLA row sits above FlashInfer's in the priority order."""
+    from phyai.kernel.call import explain
+
+    trace = explain(
+        "attention_gdn",
+        role="gdn",
+        device="nvidia:SM90",
+        dtype={
+            "input": "bf16",
+            "key": "bf16",
+            "value": "bf16",
+            "a": "bf16",
+            "b": "bf16",
+            "a_log": "fp32",
+            "dt_bias": "bf16",
+        },
+        shape={"head_dim": 128, "tokens": 512},
+        attrs={"layout": "ragged"},
+    )
+    assert trace.selected == "flash_qla.attention_gdn"

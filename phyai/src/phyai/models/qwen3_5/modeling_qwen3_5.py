@@ -9,11 +9,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config, resolve_engine_defaults
-from phyai.layers.attention.attention.layer import Attention
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.layers.attention.mask import AttnMask
+from phyai.layers.attention.nocache.layer import Attention
 from phyai.layers.attention.gdn import GatedDeltaNet
-from phyai.layers.conv import Conv1d, Conv3d
-from phyai.layers.layer_norm import GemmaRMSNorm, LayerNorm
+from phyai.layers.conv import CausalConv1d, Conv3d
+from phyai.layers.layer_norm import GatedRMSNorm, GemmaRMSNorm, LayerNorm
 from phyai.layers.linear import ReplicatedLinear
 from phyai.layers.rotary_embedding import (
     RotaryEmbedding,
@@ -30,12 +31,19 @@ from phyai.weights.shards import replicated
 
 
 if TYPE_CHECKING:
-    from phyai.layers.attention import ARAttnCtx, GatedDeltaNetCtx
+    from phyai.layers.attention import PagedAttnCtx, GatedDeltaNetCtx
 
 
 def _prepare_prefill_attention_mask(
     attention_mask: torch.Tensor | None, input_shape: torch.Size
-) -> None:
+) -> torch.Tensor | None:
+    """Validate an HF-style attention mask and return it when it matters.
+
+    Padded batches used to be refused outright; the full-attention layers
+    now lower a per-row key mask declaratively, and the GDN layers handle
+    padding the Mamba-family way (zeroed inputs). All-ones masks return
+    ``None`` so the unpadded path stays mask-free.
+    """
     if attention_mask is None:
         return None
     if attention_mask.shape != input_shape:
@@ -43,12 +51,9 @@ def _prepare_prefill_attention_mask(
             f"attention_mask must have shape {tuple(input_shape)}, got "
             f"{tuple(attention_mask.shape)}."
         )
-    if not bool(attention_mask.bool().all()):
-        raise NotImplementedError(
-            "Qwen3.5 prefill does not support padding because full-attention "
-            "layers require a padding-aware attention context."
-        )
-    return None
+    if bool(attention_mask.bool().all()):
+        return None
+    return attention_mask
 
 
 def qwen3_5_weight_remap(name: str) -> str | None:
@@ -132,37 +137,6 @@ def get_vision_bilinear_indices_and_weights(
     )
 
 
-class Qwen3_5RMSNormGated(nn.Module):
-    """Qwen3.5 head-wise RMSNorm followed by a SiLU gate."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float,
-        *,
-        device: torch.device | str,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        self.weight.hf_keys = [(f"{prefix}.weight", None)]
-        self.weight.weight_loader = replicated()
-
-    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float()
-        variance = hidden_states.square().mean(dim=-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-        hidden_states = self.weight * hidden_states.to(input_dtype)
-        hidden_states = hidden_states * F.silu(gate.float())
-        return hidden_states.to(input_dtype)
-
-
 class Qwen3_5GatedDeltaNet(nn.Module):
     """Qwen3.5 projections, causal convolution, and GDN core."""
 
@@ -217,16 +191,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             device=device,
             prefix=f"{prefix}.in_proj_a",
         )
-        self.conv1d = Conv1d(
-            self.conv_dim,
+        self.conv1d = CausalConv1d(
             self.conv_dim,
             self.conv_kernel_size,
-            padding=self.conv_kernel_size - 1,
-            groups=self.conv_dim,
-            bias=False,
+            split_sizes=(self.key_dim, self.key_dim, self.value_dim),
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.conv1d",
+            kernel_role="qwen3_5.causal_conv",
         )
         self.A_log = nn.Parameter(
             torch.empty(self.num_value_heads, dtype=torch.float32, device=device),
@@ -246,12 +218,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             num_key_heads=self.num_value_heads,
             num_value_heads=self.num_value_heads,
             backend=gdn_backend,
+            kernel_role="qwen3_5.gdn",
         )
-        self.norm = Qwen3_5RMSNormGated(
+        self.norm = GatedRMSNorm(
             self.value_head_dim,
             config.rms_norm_eps,
             device=device,
             prefix=f"{prefix}.norm",
+            kernel_role="qwen3_5.gated_norm",
         )
         self.out_proj = ReplicatedLinear(
             self.value_dim,
@@ -270,14 +244,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         gdn_ctx: "GatedDeltaNetCtx | None" = None,
     ) -> torch.Tensor:
         if attention_mask is not None and hidden_states.shape[0] > 1:
+            # GDN is recurrent: there is no per-key mask to apply, so padding
+            # is handled the Mamba-family way — zero the padded inputs so
+            # they inject nothing into the conv window or the delta state.
+            # (Padded rows' own outputs are garbage and ignored by contract.)
             hidden_states = hidden_states * attention_mask[..., None]
         batch_size, seq_len, _ = hidden_states.shape
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        mixed_qkv = self.conv1d(mixed_qkv.transpose(1, 2))[:, :, :seq_len]
-        mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv, (self.key_dim, self.key_dim, self.value_dim), dim=-1
-        )
+        query, key, value = self.conv1d(mixed_qkv)
         query = query.reshape(
             batch_size, seq_len, self.num_key_heads, self.key_head_dim
         )
@@ -384,8 +358,14 @@ class Qwen3_5Attention(nn.Module):
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_ctx: "ARAttnCtx | None" = None,
+        attn_ctx: "PagedAttnCtx | None" = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if attention_mask is not None and attn_ctx is not None:
+            raise ValueError(
+                "attention_mask applies to the ctx-less padded path; a "
+                "runner-driven ctx expresses masking through KV visibility."
+            )
         batch_size, seq_len, _ = hidden_states.shape
         query_gate, _ = self.q_proj(hidden_states)
         query, gate = query_gate.view(
@@ -399,7 +379,12 @@ class Qwen3_5Attention(nn.Module):
         )
         value = value.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         query, key = self.rotary_emb.apply(query, key, cos, sin)
-        output = self.attn(query, key, value, ctx=attn_ctx)
+        mask = (
+            None
+            if attention_mask is None
+            else AttnMask.from_key_mask(attention_mask.bool())
+        )
+        output = self.attn(query, key, value, ctx=attn_ctx, mask=mask)
         output = output.reshape(batch_size, seq_len, -1)
         output = output * torch.sigmoid(gate.reshape(batch_size, seq_len, -1))
         output, _ = self.o_proj(output)
@@ -512,7 +497,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        attn_ctx: "ARAttnCtx | None" = None,
+        attn_ctx: "PagedAttnCtx | None" = None,
         gdn_ctx: "GatedDeltaNetCtx | None" = None,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -523,7 +508,11 @@ class Qwen3_5DecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.self_attn(
-                hidden_states, cos=cos, sin=sin, attn_ctx=attn_ctx
+                hidden_states,
+                cos=cos,
+                sin=sin,
+                attn_ctx=attn_ctx,
+                attention_mask=attention_mask,
             )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -546,9 +535,7 @@ class Qwen3_5TextModel(nn.Module):
         prefix: str = "model.language_model",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -623,11 +610,12 @@ class Qwen3_5TextModel(nn.Module):
         *,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        attn_ctx: "ARAttnCtx | None" = None,
+        attn_ctx: "PagedAttnCtx | None" = None,
         gdn_ctxs: list["GatedDeltaNetCtx | None"] | None = None,
     ) -> torch.Tensor:
-        _prepare_prefill_attention_mask(attention_mask, inputs_embeds.shape[:2])
-        attention_mask = None
+        attention_mask = _prepare_prefill_attention_mask(
+            attention_mask, inputs_embeds.shape[:2]
+        )
         cos, sin = self.get_position_embeddings(inputs_embeds, position_ids)
         hidden_states = inputs_embeds
         for layer_idx, layer in enumerate(self.layers):
@@ -899,9 +887,7 @@ class Qwen3_5VisionModel(nn.Module):
         prefix: str = "model.visual",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.spatial_merge_size = config.spatial_merge_size
@@ -991,9 +977,7 @@ class Qwen3_5Model(nn.Module):
         vision_attn_backend: str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.visual = Qwen3_5VisionModel(
             config.vision,
@@ -1237,7 +1221,7 @@ class Qwen3_5Model(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        attn_ctx: "ARAttnCtx | None" = None,
+        attn_ctx: "PagedAttnCtx | None" = None,
         gdn_ctxs: list["GatedDeltaNetCtx | None"] | None = None,
     ) -> torch.Tensor:
         _prepare_prefill_attention_mask(attention_mask, input_ids.shape)
@@ -1317,9 +1301,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         vision_attn_backend: str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.model = Qwen3_5Model(
             config,

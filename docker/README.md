@@ -5,7 +5,7 @@ To simplify developers' experience with phyai, we provide ready-to-use Dockerfil
 ## 1. Using Dockerfile
 
 ```bash
-git clone https://github.com/MEmbodied/phyai.git
+git clone https://github.com/mingti-org/phyai.git
 cd phyai/docker
 
 # NVIDIA GPU. Chose your CUDA version: Dockerfile.cuxxx
@@ -25,7 +25,7 @@ To set up with VS Code Dev Containers:
 2. Clone repository with submodules:
 
     ```shell
-    git clone --recursive https://github.com/MEmbodied/phyai.git
+    git clone --recursive https://github.com/mingti-org/phyai.git
     ```
 
 3. Open project in VS Code:

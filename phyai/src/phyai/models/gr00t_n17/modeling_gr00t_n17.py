@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.layers.attention import Attention
+from phyai.layers.attention import Attention, AttnMask
 from phyai.layers.layer_norm import LayerNorm
 from phyai.layers.linear.layers import ReplicatedLinear
 from phyai.layers.vocab_embedding import VocabParallelEmbedding
@@ -672,53 +672,8 @@ class GR00TN17Attention(nn.Module):
             causal=False,
             backend=self.attention_backend,
             backend_kwargs=backend_kwargs,
+            kernel_role="gr00t.masked",
         )
-
-    def masked_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if attention_mask.ndim != 2:
-            raise ValueError(
-                "GR00TN17Attention attention_mask must be 2-D "
-                f"(batch, source_len), got {tuple(attention_mask.shape)}."
-            )
-        batch, target_len, _, _ = q.shape
-        if attention_mask.shape != (batch, k.shape[1]):
-            raise ValueError(
-                f"attention_mask shape {tuple(attention_mask.shape)} does not "
-                f"match K/V batch/source shape {(batch, k.shape[1])}."
-            )
-        mask = attention_mask.to(device=q.device, dtype=torch.bool)
-        if self.attention_backend == "sdpa":
-            out = F.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                attn_mask=mask[:, None, None, :],
-                scale=self.attn.scale,
-            )
-            return out.transpose(1, 2).contiguous()
-
-        outputs: list[torch.Tensor] = []
-        for batch_idx in range(batch):
-            valid = mask[batch_idx]
-            if not torch.any(valid):
-                outputs.append(
-                    q.new_zeros(1, target_len, self.num_heads, self.head_dim)
-                )
-                continue
-            outputs.append(
-                self.attn(
-                    q[batch_idx : batch_idx + 1],
-                    k[batch_idx : batch_idx + 1, valid],
-                    v[batch_idx : batch_idx + 1, valid],
-                )
-            )
-        return torch.cat(outputs, dim=0)
 
     def _backend_attention(
         self,
@@ -730,7 +685,13 @@ class GR00TN17Attention(nn.Module):
     ) -> torch.Tensor:
         if attention_mask is None:
             return self.attn(q, k, v)
-        return self.masked_attention(q, k, v, attention_mask)
+        # A per-row source mask (scattered columns: "the visual tokens" /
+        # "the text tokens") is the declarative keys family. The layer's
+        # backends lower it — FlashInfer packs the kept rows in one batched
+        # gather, SDPA/eager broadcast it — replacing the per-row Python
+        # loop and the select-as-string-hint dispatch that lived here.
+        mask = attention_mask.to(device=q.device, dtype=torch.bool)
+        return self.attn(q, k, v, mask=AttnMask.from_key_mask(mask))
 
     def forward(
         self,

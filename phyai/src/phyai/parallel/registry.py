@@ -9,13 +9,22 @@ priority numbers.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Final, Iterable, Protocol, runtime_checkable
 
 import torch
 
 from phyai.parallel.backend import Backend, Op, Topology
 from phyai.parallel.exceptions import NoBackendError
 from phyai.parallel.state import Mode
+
+
+# The fallback guarantee is probed under the least favourable placement a
+# group can have: spread over hosts, no NVLink. A backend that only serves
+# NVLink islands or a size whitelist declines this by design, so it can never
+# be mistaken for the universal fallback, whatever machine runs the check.
+WORST_CASE_TOPOLOGY: Final[Topology] = Topology(
+    is_full_nvlink=False, is_single_node=False, n_nodes=2, n_gpus_per_node=1
+)
 
 
 class Registry:
@@ -113,16 +122,21 @@ class Registry:
     def all(self) -> list[Backend]:
         return list(self._backends)
 
-    def validate(self) -> None:
-        """Sanity-check: each (op, mode) standard ctx has at least one
-        backend, every preferred name actually got registered.
+    def validate(self, *, group_sizes: Iterable[int]) -> None:
+        """Assert that a universal fallback exists for every common op.
+
+        Two checks: every ``prefer_for`` name is registered, and for each
+        common op and mode at least one backend accepts
+        :data:`WORST_CASE_TOPOLOGY` at every multi-rank group size in
+        ``group_sizes`` (the sizes actually present in the mesh). Sizes are
+        probed one by one because size whitelists are not monotonic: a
+        backend may take 8 ranks and refuse 16.
 
         Probes with ``pg=None`` so backends fall through their permissive
         probe-time path. ``Mode.GRAPH_CAPTURING`` is only checked when at
         least one registered backend supports capture (gloo-only setups
         legitimately have no capture coverage).
         """
-        # Check preferred names exist
         names = {b.name for b in self._backends}
         for op, prefs in self._prefer.items():
             for n in prefs:
@@ -137,8 +151,7 @@ class Registry:
         if has_capture_backend:
             modes.append(Mode.GRAPH_CAPTURING)
 
-        # Check eager + graph fallback for the common ops with a probe ctx
-        probe_topology = Topology(True, True, 1, 8)
+        sizes = sorted({int(size) for size in group_sizes if size > 1})
         for op in (
             Op.ALL_REDUCE,
             Op.ALL_GATHER,
@@ -149,18 +162,20 @@ class Registry:
             Op.RECV,
         ):
             for mode in modes:
-                if not self.has(
-                    op=op,
-                    mode=mode,
-                    nbytes=1024,
-                    dtype=torch.bfloat16,
-                    world_size=2,
-                    topology=probe_topology,
-                ):
-                    raise NoBackendError(
-                        f"no backend handles op={op.value} mode={mode.value} "
-                        f"(at least one fallback is required)"
-                    )
+                for size in sizes:
+                    if not self.has(
+                        op=op,
+                        mode=mode,
+                        nbytes=1024,
+                        dtype=torch.bfloat16,
+                        world_size=size,
+                        topology=WORST_CASE_TOPOLOGY,
+                    ):
+                        raise NoBackendError(
+                            f"no backend handles op={op.value} mode={mode.value} "
+                            f"for a {size}-rank group under the worst-case "
+                            "topology (a universal fallback is required)"
+                        )
 
 
 @runtime_checkable
@@ -179,7 +194,7 @@ class DefaultPolicy:
 
 
 class ForcedPolicy:
-    """Honor PHYAI_FORCE_BACKEND=<name> if set; otherwise fall back."""
+    """Honor PHYAI_FORCE_COLLECTIVE_BACKEND=<name> if set; otherwise fall back."""
 
     def __init__(self, name: str, fallback: Policy = DefaultPolicy()) -> None:
         self.name = name

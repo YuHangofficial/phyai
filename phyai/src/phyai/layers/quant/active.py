@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import Generator, TYPE_CHECKING
 
-from phyai.utils.logging import this_rank_log
+from phyai.utils.logging import get_logger
 
 if TYPE_CHECKING:
     from phyai.layers.quant.plan import QuantPlan
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _active_plan: ContextVar["QuantPlan | None"] = ContextVar(
     "phyai_quant_plan", default=None
@@ -24,7 +23,7 @@ def get_active_plan() -> "QuantPlan | None":
 
 
 @contextmanager
-def use_quant_plan(plan: "QuantPlan | None") -> Iterator[None]:
+def use_quant_plan(plan: "QuantPlan | None") -> Generator[None]:
     """Make ``plan`` the active plan for the duration of the ``with`` block."""
     token = _active_plan.set(plan)
     try:
@@ -83,9 +82,7 @@ def load_quant_plan(
         loaded_from.append(str(config_path))
     if standalone:
         loaded_from.append(str(standalone_path))
-    this_rank_log(
-        logger, logging.INFO, "Loaded quant config from %s", ", ".join(loaded_from)
-    )
+    logger.info_rank0("Loaded quant config from %s", ", ".join(loaded_from))
 
     return build_quant_plan(
         ConfigSources(hf_quant_config=hf_quant_config, standalone=standalone)

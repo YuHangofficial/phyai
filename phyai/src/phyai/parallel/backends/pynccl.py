@@ -7,27 +7,26 @@ Two layers:
   ranks and a specific CUDA device. Built once via a CPU-side gloo group
   for unique_id bootstrap.
 * ``PyNCCLBackend``: implements the ``Backend`` protocol; holds a dict of
-  ``_PyNcclComm`` keyed by ``(mesh_name, axis)``, lazily initialised by
+  ``_PyNcclComm`` keyed by ``(mesh_name, group)``, built eagerly by
   :meth:`attach` during ``phyai.parallel.init``.
 
 Why bypass ``torch.distributed`` even when it is capture-compatible?
 Two practical reasons:
 
 1. Kernel launches go directly to the **caller's current stream**, so
-   overlap via ``on_stream`` is straightforward.
+   overlapping on a side stream (``torch.cuda.stream``) is straightforward.
 2. No PG watchdog thread / event polling overhead.
 """
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
-from phyai.parallel.backend import Backend, Op, Topology
+from phyai.parallel.backend import Op, Topology
 from phyai.parallel.state import Mode
 from phyai.parallel.backends.pynccl_wrapper import (
     NCCLLibrary,
@@ -38,12 +37,12 @@ from phyai.parallel.backends.pynccl_wrapper import (
     ncclRedOpTypeEnum,
     ncclUniqueId,
 )
-from phyai.utils import all_ranks_log
+from phyai.utils import get_logger
 
 if TYPE_CHECKING:
     from phyai.parallel.mesh import Mesh
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class _PyNcclComm:
@@ -100,20 +99,19 @@ class _PyNcclComm:
         op: ReduceOp,
         *,
         stream: torch.cuda.Stream | None = None,
-        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Reduce ``tensor`` in place."""
         s = stream or self._stream()
-        recv = out if out is not None else tensor
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
-            buffer_type(recv.data_ptr()),
+            buffer_type(tensor.data_ptr()),
             tensor.numel(),
             ncclDataTypeEnum.from_torch(tensor.dtype),
             ncclRedOpTypeEnum.from_torch(op),
             self.comm,
             cudaStream_t(s.cuda_stream),
         )
-        return recv
+        return tensor
 
     def _all_gather(
         self,
@@ -196,7 +194,7 @@ class _PyNcclComm:
             try:
                 self.nccl.ncclCommDestroy(self.comm)
             except Exception as e:
-                all_ranks_log(logger, logging.WARNING, "ncclCommDestroy failed: %s", e)
+                logger.warning("ncclCommDestroy failed: %s", e)
             self.comm = None
 
 
@@ -204,8 +202,12 @@ class PyNCCLBackend:
     """Backend that drives NCCL via a direct ctypes binding.
 
     Capture-safe; in eager mode it returns False from ``can_handle`` so the
-    Dispatcher falls through to ``TorchDistBackend`` (which has the better
-    watchdog story for production eager paths).
+    Dispatcher falls through to ``NcclBackend`` (which has the better
+    watchdog story for production eager paths). Communicators are built
+    per membership by :meth:`attach`; logical groups with identical members
+    share one communicator, which assumes their collectives never run
+    concurrently on different streams (see ``ProcessGroupPool``). Unattached
+    groups fall through to ``NcclBackend``.
     """
 
     name = "pynccl"
@@ -249,6 +251,8 @@ class PyNCCLBackend:
         dtype: torch.dtype,
         world_size: int,
         topology: Topology,
+        mesh_name: str | None = None,
+        group: str | None = None,
         **extra: object,
     ) -> bool:
         if op not in self._OPS:
@@ -257,10 +261,31 @@ class PyNCCLBackend:
             return False
         if world_size <= 1:
             return False
+        if (
+            mesh_name is not None
+            and group is not None
+            and (mesh_name, group) not in self._comms
+        ):
+            # Communicators are per-(mesh, group); decline anything attach()
+            # never built so the registry falls through to NcclBackend.
+            # None means capability probe (registry.validate) — stay general.
+            return False
         return True
 
     def supports_capture(self) -> bool:
         return True
+
+    def close(self) -> None:
+        """Destroy every attached NCCL communicator.
+
+        Must run before ``torch.distributed.destroy_process_group``: the
+        communicators are independent of torch's groups, so nothing else
+        frees them, and a later ``attach`` in the same process would otherwise
+        leak the old ones.
+        """
+        for comm in dict.fromkeys(self._comms.values()):
+            comm.destroy()
+        self._comms.clear()
 
     def execute(
         self,
@@ -273,31 +298,54 @@ class PyNCCLBackend:
         if handler is None:
             raise NotImplementedError(f"PyNCCLBackend.execute: op={op}")
         comm = self._comm_for(
-            pg,
-            mesh_name=kwargs["_mesh_name"],
-            axis=kwargs["_axis"],
-            device=kwargs["_device"],
+            pg, mesh_name=kwargs["_mesh_name"], group=kwargs["_group"]
         )
         return handler(comm, **kwargs)
 
     # --- per-op handlers (take a `comm` first arg) ------------------------
 
     def _h_all_reduce(self, comm, *, input, output, reduce_op, **_):
-        return comm._all_reduce(input, reduce_op, out=output)
+        # NCCL reads and writes raw pointers linearly, so a non-contiguous
+        # input (a sliced view, say) would be reduced in the wrong memory
+        # order — silently. Stage through the dense `output` buffer the op
+        # layer allocated and reduce in place, exactly as NcclBackend does.
+        output.copy_(input)
+        return comm._all_reduce(output, reduce_op)
 
-    def _h_all_gather(self, comm, *, input, output, **_):
-        # ncclAllGather is dim-0; the L4 op layer requests dim=0 here
-        # because GlooBackend / NcclBackend handle dim != 0 via reshape.
-        return comm._all_gather(input, output)
+    def _h_all_gather(self, comm, *, input, output, dim, **_):
+        # ncclAllGather concatenates rank blocks along dim 0. For dim != 0,
+        # gather into a rank-major staging buffer, then move the rank dimension
+        # into place — the same rearrangement NcclBackend uses; plain device
+        # kernels, so it is graph-capture safe. `output` arrives preallocated
+        # in the final layout (phyai.parallel.ops), never in dim-0 layout.
+        x = input.contiguous()
+        if dim == 0:
+            return comm._all_gather(x, output)
+        stacked = torch.empty(
+            (comm.world_size, *x.shape), dtype=x.dtype, device=x.device
+        )
+        comm._all_gather(x, stacked)
+        output.copy_(stacked.movedim(0, dim).contiguous().flatten(dim, dim + 1))
+        return output
 
-    def _h_reduce_scatter(self, comm, *, input, output, reduce_op, **_):
-        return comm._reduce_scatter(input, output, reduce_op)
+    def _h_reduce_scatter(self, comm, *, input, output, dim, reduce_op, **_):
+        # ncclReduceScatter consumes world_size contiguous rank blocks. For
+        # dim != 0, restack the per-rank chunks along a leading rank dimension so
+        # rank r receives the reduction of chunk r (capture-safe).
+        x = input.contiguous()
+        if dim == 0:
+            return comm._reduce_scatter(x, output, reduce_op)
+        stacked = torch.stack(x.chunk(comm.world_size, dim=dim), dim=0)
+        return comm._reduce_scatter(stacked, output, reduce_op)
 
     def _h_broadcast(self, comm, *, input, output, src, **_):
-        return comm._broadcast(input, output, src)
+        # Same staging as all_reduce: the source rank's payload must be dense
+        # before its pointer is handed to NCCL; in-place broadcast is legal.
+        output.copy_(input)
+        return comm._broadcast(output, output, src)
 
     def _h_send(self, comm, *, input, dst, **_):
-        comm._send(input, dst)
+        comm._send(input.contiguous(), dst)
         return None
 
     def _h_recv(self, comm, *, output, src, **_):
@@ -305,87 +353,49 @@ class PyNCCLBackend:
 
     # --- lifecycle --------------------------------------------------------
 
-    def attach(self, mesh: "Mesh", axes: list[str], *, device: torch.device) -> None:
-        """Build per-axis comms eagerly for every axis we expect to use.
+    def attach(self, mesh: "Mesh", groups: list[str], *, device: torch.device) -> None:
+        """Build per-group comms eagerly for every group we expect to use.
 
         Eager construction sidesteps the lazy-init-during-capture trap
         that PyTorch's ProcessGroupNCCL also exhibits — pre-warming
         keeps NCCL's one-time side effects out of the recorded graph.
 
-        Size-1 axes are skipped. Every collective short-circuits at
-        ``axis_size <= 1`` (see :mod:`phyai.parallel.ops`), so such an axis
-        never needs a comm. Skipping it also avoids a ``dist.new_group``
-        deadlock: ``_build_cpu_group_for`` would have each rank create a
-        *single-member* group containing only itself (e.g. rank 0 ->
-        ``new_group([0])``, rank 1 -> ``new_group([1])``), but ``new_group``
-        is a global collective that requires every rank to request the same
-        groups in the same order — disjoint singletons hang. The 5-axis
-        engine mesh (``dp/ep/sp/cp`` at size 1, only ``tp`` > 1) hit this.
-        The skip is consistent across ranks because ``axis_size`` is the
-        mesh dimension width, identical on every rank.
+        The mesh already owns matching CPU bootstrap groups, created in the
+        same order on every rank. Singleton collectives need no communicator.
         """
         if self._nccl is None:
             self._nccl = NCCLLibrary(self._library_path)
-        for axis in axes:
-            if mesh.axis_size(axis) <= 1:
+        shared = {
+            mesh.group_members(name): comm
+            for (mesh_name, name), comm in self._comms.items()
+            if mesh_name == mesh.name
+        }
+        for group in groups:
+            if mesh.group_size(group) <= 1:
                 continue
-            key = (mesh.name, axis)
+            key = (mesh.name, group)
             if key in self._comms:
                 continue
-            device_group = mesh.axis_group(axis)
-            cpu_group = _build_cpu_group_for(device_group)
-            self._comms[key] = _PyNcclComm(
-                device_group=device_group,
-                cpu_group=cpu_group,
-                device=device,
-                nccl=self._nccl,
-            )
+            members = mesh.group_members(group)
+            if members not in shared:
+                shared[members] = _PyNcclComm(
+                    device_group=mesh.group(group),
+                    cpu_group=mesh.cpu_group(group),
+                    device=device,
+                    nccl=self._nccl,
+                )
+            self._comms[key] = shared[members]
 
-    def _comm_for(
-        self,
-        pg: ProcessGroup,
-        *,
-        mesh_name: str,
-        axis: str,
-        device: torch.device,
-    ) -> _PyNcclComm:
-        key = (mesh_name, axis)
+    def attached(self) -> dict[tuple[str, str], torch.device]:
+        """``(mesh_name, group) -> bound device`` for every attached comm."""
+        return {key: comm.device for key, comm in self._comms.items()}
+
+    def _comm_for(self, pg: ProcessGroup, *, mesh_name: str, group: str) -> _PyNcclComm:
+        key = (mesh_name, group)
         comm = self._comms.get(key)
         if comm is None:
             raise RuntimeError(
                 f"PyNCCLBackend.attach() was not called for {key}. "
-                "Pass `pynccl_axes=[...]` to phyai.parallel.init()."
+                "Pass `pynccl_groups=[...]` to phyai.parallel.init()."
             )
         return comm
-
-
-# ----------------------------------------------------------------------------
-# helpers
-# ----------------------------------------------------------------------------
-
-_cpu_group_cache: dict[tuple[int, ...], ProcessGroup] = {}
-
-
-def _build_cpu_group_for(device_group: ProcessGroup) -> ProcessGroup:
-    """Return (or create) a gloo group with the same ranks as
-    ``device_group``. Used solely for unique_id bootstrap.
-
-    ``use_local_synchronization=True`` is essential here: by default
-    ``new_group`` ends with a *world*-wide barrier, so every rank must issue
-    the identical sequence of ``new_group`` calls or it deadlocks. With more
-    than one parallel axis the per-axis subgroups are DISJOINT and differ by
-    rank (e.g. the cfg axis groups ranks ``[0,4]`` on rank 0 but ``[1,5]`` on
-    rank 1) — those are different ``new_group`` calls that would never rendezvous
-    under the global barrier. Local synchronization makes each subgroup barrier
-    only within its own members, so disjoint subgroups are created concurrently
-    (non-member ranks don't join). ``attach`` is still called collectively, so
-    every rank creates exactly its own subgroup per axis.
-    """
-    ranks = tuple(dist.get_process_group_ranks(device_group))
-    if ranks in _cpu_group_cache:
-        return _cpu_group_cache[ranks]
-    pg = dist.new_group(
-        ranks=list(ranks), backend="gloo", use_local_synchronization=True
-    )
-    _cpu_group_cache[ranks] = pg
-    return pg

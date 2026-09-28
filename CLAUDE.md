@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `phyai-model-optimizer/` | Placeholder, no source yet. |
 | `phyai-utils-tools/` | Placeholder, no source yet. |
 
-Hard pins: `torch==2.11`, `flashinfer-python==v0.6.12`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions.
+Hard pins: `torch==2.11`, `flashinfer-python[cu13]==v0.6.17`, `transformers==5.8.1`. Don't bump these casually — green-context and flashinfer behaviour is tied to these versions. (The `[cu13]` extra is required: flashinfer 0.6.17's `gdn_prefill` imports the CuTe DSL unconditionally, and `nvidia-cutlass-dsl` 4.5.x ships the importable `cutlass` module only in its per-CUDA `libs` wheels.)
 
 ## Common commands
 
@@ -45,7 +45,7 @@ uv run phyai-kernel show-env
 
 `phyai-ext` is built automatically by `uv sync` via scikit-build-core; the `tool.uv.cache-keys` block in `phyai-ext/pyproject.toml` invalidates the build when CMake / C++ / CUDA sources change.
 
-CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture that overrides `EngineConfig.device.target = "cpu"` for every test. CUDA tests opt back in explicitly (passing `device="cuda"` or `.cuda()`-ing the module).
+The test suite REQUIRES CUDA — `phyai/tests/conftest.py` aborts collection (`pytest.exit`) on a machine without it. Layer construction uses the engine default `device.target = "cuda"`; numerical tests exercise real CUDA kernels. CPU tensors appear only in device-less logic tests (index arithmetic, policy parsing, weight-loading I/O).
 
 ## Conventions
 
@@ -54,7 +54,7 @@ CPU is the default for tests — `phyai/tests/conftest.py` autouses a fixture th
 
 ## More MUST FOLLOW Conventions provided by human
 
-- all log function in phyai package should use phyai.utils' logging api. U judge using `this_rank_log` or `all_rank_log`
+- all log functions in the phyai package should use phyai.utils' logging api: get the module logger with `get_logger(__name__)` (not `logging.getLogger`). Then `logger.info_rank0(...)` when only rank 0 should say it, plain `logger.info(...)` when every rank should — the `[rank R/W]` label is added by the formatter, and is empty in a single-process run. `logger.warning_once(...)` for anything on a per-request or per-layer path. Never pass a logger or a level as an argument.
 - Using ENGLISH for comment.
 - Be aware that phyai is a general inference engine for physical AI. Do not modify general components(such as phyai.layers, phyai.runtime) in phyai when supporting new models. Unless lack of layers, or lack of phyai's system components. Modify phyai's general components is a big deal, you should tell user first, let them agree.
 - When user want you to commit to github. You should run pre-commit first.

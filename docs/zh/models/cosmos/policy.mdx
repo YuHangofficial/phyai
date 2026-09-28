@@ -1,0 +1,522 @@
+---
+title: "Cosmos3 Policy"
+description: "在单卡或多卡上运行 Cosmos3 policy、forward dynamics 和 inverse dynamics"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano-Policy-DROID"
+  subtitle="Action / Policy · DROID · 单卡或多卡"
+  icon="C"
+  rows={{
+    "模型类型": "World Foundation Model · Action Policy",
+    "权重": <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID</a>,
+    "模式": ["policy", "forward_dynamics", "inverse_dynamics"],
+    "运行入口": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3PolicyScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3_policy</code>,
+    "默认 domain": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">droid_lerobot</code>,
+    "默认动作块": "16 steps",
+    "内部动作宽度": "64",
+    "参数精度": "bf16",
+  }}
+/>
+
+# 概述
+
+Cosmos3 的 policy 路径和文生视频不是一回事。它是模型里会看场景、会读任务、会想下一步怎么动的那部分。给它一帧 observation 和一句任务，它预测一段 action chunk；给它一段 action，它推演一个可能的未来；给它一段已经发生的 transition，它反推中间用了什么动作。
+
+这一页用的是 <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>。想要 action 输出时，别拿通用的 `Cosmos3-Nano` 生成 checkpoint 来代替；那条路在 [Cosmos3 生成模式](/zh/models/cosmos/generation)。
+
+一个 `cosmos3_policy` 插件承担三种 mode，单卡多卡都行：
+
+| Mode | 输入 | 输出 |
+| --- | --- | --- |
+| `policy` | observation 图或视频 + prompt | action chunk，需要的话再加一段 rollout 视频 |
+| `forward_dynamics` | observation + prompt + 已知 action | rollout 视频，action 保留在输出里 |
+| `inverse_dynamics` | observation 视频 + prompt | 解释这段 transition 的 action chunk |
+
+<Note>
+  `examples/cosmos3/run_cosmos3_policy.py` 接好了三种 mode。它以 `decode_video=True` 运行，action 存成 JSON，返回像素时再写一段 rollout mp4。加 `--cfg 2` 或 `--tp N` 就换到 managed worker 上跑。它一次只处理一个请求，是演示，不是服务。
+</Note>
+
+# 架构
+
+policy 路径和生成路径共用 Cosmos3 transformer。请求里多了 action latent、domain id 和 mode。视频和动作走同一个去噪循环，mode 只决定谁是干净的条件、谁要被生成。
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/cosmos3" defaultOpen>
+    <Tree.File name="main_cosmos3_policy.py" />
+    <Tree.File name="scheduler_cosmos3_policy.py" />
+    <Tree.File name="model_runner_policy_cosmos3.py" />
+    <Tree.File name="model_runner_vae_cosmos3.py" />
+    <Tree.File name="modeling_cosmos3.py" />
+    <Tree.File name="vae_wan.py" />
+    <Tree.File name="sampler_unipc.py" />
+  </Tree.Folder>
+</Tree>
+
+| 组件 | 职责 |
+| --- | --- |
+| `Cosmos3PolicyEntry` | 加载 transformer；`decode_video=True` 时再加载 VAE |
+| `Cosmos3PolicyScheduler` | 按 mode 组织干净 mask 和加噪 mask，然后跑 UniPC |
+| `Cosmos3ActionRunner` | 调用 transformer，返回视频和动作两路 velocity |
+| `Cosmos3PolicyProcessor` | 准备 observation、prompt、action padding 和 domain id；对输出做切片和反归一化 |
+
+# 三种 mode
+
+`policy` 是控制环的形状：observation 加任务进去，action chunk 出来。第一帧 observation 是干净条件，后面的视频和动作都从噪声里生成。它回答的是“看到这个场景，机器人该做什么”。
+
+`forward_dynamics` 把 observation 和一段已知 action 交给模型，要它把视频推出来。action 是干净条件，视频是目标。它回答的是“这么动，接下来会发生什么”。这个 mode 必须传 `--action-file`。
+
+`inverse_dynamics` 反过来。给它一段视频，它恢复出能解释这段变化的 action chunk。整段视频都是干净的，动作从噪声里恢复。它回答的是“从 A 到 B，中间做了什么”。
+
+# 输入规范
+
+`Cosmos3PolicyProcessor.preprocess()` 接收一个 dict。示例脚本从命令行参数拼出它：
+
+```python
+raw_input = {
+    "images": observation,
+    "task": prompt,
+    "cond_action": action,  # 仅 forward_dynamics 需要
+}
+```
+
+| 字段 | 类型 | 备注 |
+| --- | --- | --- |
+| `images` | 图片路径、PIL image、numpy array、torch tensor，或它们的 list | 单图算一帧；list 是多帧 observation |
+| `task` / `prompt` | `str` 或 `list[str]` | list 时取第一条 |
+| `cond_action` / `action` | list、numpy array 或 `torch.Tensor` | 只有 `forward_dynamics` 需要 |
+| `domain_name` / `domain_id` | `str` 或 `int` | 覆盖 processor 的默认值 |
+| `mode` | `str` | 覆盖 processor 的默认值 |
+
+图像会变成 `(1, 3, T, H, W)`，范围 `[-1, 1]`。传 `--video` 时脚本读前 `action_chunk_size + 1` 帧，视频不够长就重复最后一帧。
+
+# Domain 与 action 维度
+
+action 有两个宽度。`action_dim` 是模型内部宽度，默认 `64`；`raw_action_dim` 是机器人动作空间的真实宽度。processor 把条件 action 补到 `action_dim`，再把输出切回 `raw_action_dim`。
+
+| `domain_name` | `domain_id` | `raw_action_dim` |
+| --- | ---: | ---: |
+| `bridge_orig_lerobot` | 7 | 10 |
+| `droid_lerobot` | 8 | 10 |
+| `agibotworld` | 15 | 29 |
+| `fractal` | 20 | 10 |
+
+整数 `domain_id` 不带宽度信息，要一并传 `--raw-action-dim`。
+
+# 运行路径
+
+<Steps>
+  <Step title="准备权重">
+    下载 <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>。policy 路径至少需要：
+
+    ```text
+    /path/to/Cosmos3-Nano-Policy-DROID/
+      transformer/
+      text_tokenizer/
+      scheduler/
+      vae/             # decode_video=True 时需要
+    ```
+  </Step>
+
+  <Step title="构造 Engine">
+    插件名是 `"cosmos3_policy"`。`decode_video=True` 时会加载 VAE，解码后的 rollout 像素随 action 一起返回。
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_policy",
+            plugin_args=Cosmos3PolicyArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=None,
+                decode_video=True,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+
+    `use_karras_sigmas=None` 从 checkpoint 读采样调度；传 `False` 则改用 linear flow 加 `flow_shift`。
+  </Step>
+
+  <Step title="构造 Processor">
+    processor 负责缩放和补齐 observation、分词 prompt、补齐 action、解析 domain id，最后给输出切片。
+
+    ```python
+    import torch
+
+    from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device="cuda",
+        params_dtype=torch.bfloat16,
+    )
+    ```
+  </Step>
+
+  <Step title="Preprocess 输入">
+    ```python
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    ```
+
+    `processed.video_shape` 还是像素尺寸，构造请求时用 `pixel_to_latent_shape` 换成 latent grid。
+  </Step>
+
+  <Step title="构造 Request">
+    ```python
+    from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to("cuda"),
+        text_mask=processed.text_mask.to("cuda"),
+        neg_text_ids=processed.neg_text_ids.to("cuda"),
+        neg_text_mask=processed.neg_text_mask.to("cuda"),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(
+            device="cuda", dtype=torch.bfloat16
+        ),
+        cond_action=(
+            processed.cond_action.to(device="cuda", dtype=torch.bfloat16)
+            if processed.cond_action is not None
+            else None
+        ),
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+    ```
+  </Step>
+
+  <Step title="Step 和后处理">
+    ```python
+    result = engine.step(request)
+    output = processor.postprocess(result)
+    action = output["action"]
+    pixels = output.get("pixels")
+    ```
+
+    `action` 总会返回，形状 `(1, action_chunk, raw_action_dim)`。引擎带 `decode_video=True` 时还有 `pixels`，范围 `[0, 1]`。
+  </Step>
+</Steps>
+
+# 脚本示例
+
+从单张图预测 action：
+
+```bash
+uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot picks up the cup" \
+    --domain-name droid_lerobot \
+    --out .cache/cosmos3_policy_out
+```
+
+`.cache/` 下会落两个文件：`cosmos3_policy_out_action.json` 是 action chunk，`cosmos3_policy_out.mp4` 在解码了像素时出现。
+
+用已知 action 推演视频：
+
+```bash
+uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot pushes the object forward" \
+    --domain-name droid_lerobot \
+    --mode forward_dynamics \
+    --action-file action.json \
+    --out .cache/cosmos3_forward_out
+```
+
+`action.json` 两种写法都行，数值只是占位。DROID 的动作宽度是 `10`；chunk 短于 `action_chunk_size` 时，processor 重复最后一步补齐。
+
+```json
+{
+  "shape": [2, 10],
+  "dtype": "float32",
+  "data": [
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  ]
+}
+```
+
+```json
+{
+  "action_chunks": [
+    [
+      [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ]
+  ]
+}
+```
+
+从一段 observation 视频反推 action：
+
+```bash
+uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --video obs.mp4 \
+    --prompt "robot moves the cup to the right" \
+    --domain-name droid_lerobot \
+    --mode inverse_dynamics \
+    --condition-frames 0,1 \
+    --out .cache/cosmos3_inverse_out
+```
+
+不传 `--condition-frames` 时，单图以第 `0` 帧为条件，视频以第 `0,1` 帧为条件。
+
+# 输出后处理
+
+`Cosmos3PolicyProcessor.postprocess()` 从结果里取出 `action`，切到 `raw_action_dim`，如果给了 `action_stats_path`，再反归一化回物理单位：
+
+| `action_normalization` | 需要的 stats 字段 |
+| --- | --- |
+| `meanstd` | `mean`、`std` |
+| `minmax` | `min`、`max` |
+| `quantile` | `q01`、`q99` |
+| `quantile_rot` | `global_raw.q01`、`global_raw.q99` |
+
+没有 stats，action 就保持模型输出的归一化尺度。换 embodiment 时，权重、domain 和 stats 要一起换。
+
+# 多卡运行
+
+policy 插件用的 `ParallelConfig` 字段和生成插件一样。`tp_size` 切分 transformer，是这里真正有用的开关：示例用 `guidance_scale=1.0`，CFG 是关着的，`cfg_size=2` 只会多算一个随后被丢掉的分支（scheduler 见到会打 warning）。一次运行要 `cfg_size * tp_size` 张卡，在启动进程上用 `CUDA_VISIBLE_DEVICES` 选。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot picks up the cup" \
+    --domain-name droid_lerobot \
+    --tp 2 \
+    --out .cache/cosmos3_policy_tp2
+```
+
+Python 里给 `EngineConfig` 加上 `parallel`，processor 用 `device="cpu"` 构造，请求就留在 CPU 上，GPU 归 worker。引擎放在 `if __name__ == "__main__":` 后面，因为 worker 用 `spawn` 启动，会重新 import 主模块。`deployment` 参数可选，这里只用来延长启动超时。
+
+```python
+import torch
+
+from phyai import DeploymentConfig, Engine, EngineArgs
+from phyai.engine_config import (
+    AttentionParallelConfig,
+    DenseParallelConfig,
+    DeviceConfig,
+    EngineConfig,
+    ParallelConfig,
+    RuntimeConfig,
+)
+from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+from phyai.server import WorkerSupervisorConfig
+from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+tp_size = 2  # transformer tensor parallelism; one GPU per rank
+
+
+def main() -> None:
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_policy",
+            plugin_args=Cosmos3PolicyArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=None,
+                decode_video=True,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                parallel=ParallelConfig(
+                    dense=DenseParallelConfig(tp_size=tp_size),
+                    attention=AttentionParallelConfig(tp_size=tp_size),
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        ),
+        deployment=DeploymentConfig(
+            process_config=WorkerSupervisorConfig(startup_timeout_s=1800.0),
+        ),
+    )
+    assert engine.mode == "local"
+
+    try:
+        processor = Cosmos3PolicyProcessor(
+            tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+            height=480,
+            width=832,
+            num_frames=17,
+            mode="policy",
+            domain_name="droid_lerobot",
+            action_chunk_size=16,
+            fps=24.0,
+            image_size=480,
+            prompt_format="json",
+            view_point="ego_view",
+            cond_frame_indexes=(0,),
+            device="cpu",  # the workers own the GPUs; inputs stay on the CPU
+            params_dtype=torch.bfloat16,
+        )
+        processed = processor.preprocess(
+            {
+                "images": "/path/to/observation.png",
+                "task": "robot picks up the cup",
+            }
+        )
+        request = Cosmos3ActionRequest(
+            text_ids=processed.text_ids,
+            text_mask=processed.text_mask,
+            neg_text_ids=processed.neg_text_ids,
+            neg_text_mask=processed.neg_text_mask,
+            video_shape=pixel_to_latent_shape(*processed.video_shape),
+            mode=processed.mode,
+            domain_id=processed.domain_id,
+            action_chunk=processed.action_chunk,
+            raw_action_dim=processed.raw_action_dim,
+            cond_video_pixels=processed.pixel_values,
+            cond_action=processed.cond_action,
+            cond_frame_indexes=processed.cond_frame_indexes,
+            fps=24.0,
+            num_inference_steps=30,
+            guidance_scale=1.0,
+            seed=42,
+        )
+
+        result = engine.step(request)
+        output = processor.postprocess(result)
+        print(output["action"].shape)
+    finally:
+        engine.close()
+
+
+# Workers start with the "spawn" method and re-import this module, so the
+# engine must sit behind the guard.
+if __name__ == "__main__":
+    main()
+```
+
+`engine.step()` 返回的是 output rank 上张量的 CUDA-IPC view，postprocessor 会把 action 搬到 CPU，有像素时一起搬。`tp_size` 要同时整除 attention head 数和 KV head 数（这个 checkpoint 是 1、2、4 或 8），dense 与 attention 的 TP 保持一致。多副本和外部启动器见 [并行服务](/zh/deployment/parallel-serving)。
+
+# 完整代码
+
+```python
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+device = "cuda"
+dtype = torch.bfloat16
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3_policy",
+        plugin_args=Cosmos3PolicyArgs(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=None,
+            decode_video=True,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device=device,
+        params_dtype=dtype,
+    )
+
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to(device),
+        text_mask=processed.text_mask.to(device),
+        neg_text_ids=processed.neg_text_ids.to(device),
+        neg_text_mask=processed.neg_text_mask.to(device),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(device=device, dtype=dtype),
+        cond_action=(
+            processed.cond_action.to(device=device, dtype=dtype)
+            if processed.cond_action is not None
+            else None
+        ),
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+
+    result = engine.step(request)
+    output = processor.postprocess(result)
+    print(output["action"].shape)
+finally:
+    engine.close()
+```

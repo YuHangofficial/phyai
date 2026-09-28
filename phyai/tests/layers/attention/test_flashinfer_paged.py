@@ -1,14 +1,12 @@
-"""Tests for the flashinfer paged-KV attention backends (AR + Diffusion).
+"""Tests for the flashinfer paged-KV attention backend.
 
 Gated on CUDA + flashinfer-python. Exercises the 4-hook lifecycle
 (:meth:`init_cuda_graph_state` -> :meth:`init_capture_metadata` ->
 :meth:`replay_metadata` -> :meth:`forward`) and numerical agreement
-with a reference path. The paged stacks are flashinfer-only, so the
+with a reference path. The paged stack is flashinfer-only, so the
 reference is the no-cache :class:`Attention` layer's eager backend on
 CPU fp32 (a single full-sample contiguous-slot paged read reduces to
-the same softmax as a ragged no-cache prefill). Parametrized over both
-AR and Diffusion stacks since their flashinfer paged backends are
-byte-identical implementations today.
+the same softmax as a ragged no-cache prefill).
 """
 
 from __future__ import annotations
@@ -18,17 +16,13 @@ import torch
 
 from phyai.cache import KVCachePool
 from phyai.layers.attention import (
-    ARAttention,
-    ARAttnCtx,
-    ARAttnMetadata,
     Attention,
     AttnLayout,
     AttnMode,
-    DiffusionAttention,
-    DiffusionAttnCtx,
-    DiffusionAttnMetadata,
-    get_ar_backend_factory,
-    get_diffusion_backend_factory,
+    FlashInferPagedBackend,
+    PagedAttention,
+    PagedAttnCtx,
+    PagedAttnMetadata,
 )
 
 
@@ -42,33 +36,12 @@ def _has_flashinfer() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and _has_flashinfer()),
-    reason="flashinfer paged backends require CUDA + flashinfer-python.",
+    not _has_flashinfer(),
+    reason="flashinfer paged backend requires flashinfer-python.",
 )
 
 
-_PAGED_FLAVORS = ("ar", "diffusion")
-
-
-def _layer_cls(flavor: str):
-    return ARAttention if flavor == "ar" else DiffusionAttention
-
-
-def _ctx_cls(flavor: str):
-    return ARAttnCtx if flavor == "ar" else DiffusionAttnCtx
-
-
-def _meta_cls(flavor: str):
-    return ARAttnMetadata if flavor == "ar" else DiffusionAttnMetadata
-
-
-def _factory_for(flavor: str, name: str):
-    if flavor == "ar":
-        return get_ar_backend_factory(name)
-    return get_diffusion_backend_factory(name)
-
-
-def _make_pool_and_layer(flavor: str):
+def _make_pool_and_layer():
     """Build a small KV pool + paged layer on CUDA."""
     H, H_kv, D = 4, 2, 64
     pool = KVCachePool(
@@ -79,7 +52,7 @@ def _make_pool_and_layer(flavor: str):
         dtype=torch.float16,
         device=torch.device("cuda"),
     )
-    layer = _layer_cls(flavor)(
+    layer = PagedAttention(
         num_heads=H,
         head_dim=D,
         layer_id=0,
@@ -90,9 +63,9 @@ def _make_pool_and_layer(flavor: str):
     return pool, layer, (H, H_kv, D)
 
 
-def _meta_for(flavor: str, *, B: int, N: int, kv_indices, last_page, write_indices):
+def _meta_for(*, B: int, N: int, kv_indices, last_page, write_indices):
     cu_q = torch.tensor([0, N], dtype=torch.int32, device="cuda") if B == 1 else None
-    return _meta_cls(flavor)(
+    return PagedAttnMetadata(
         mode=AttnMode.PREFILL,
         layout=AttnLayout.RAGGED_3D,
         batch_size=B,
@@ -105,15 +78,14 @@ def _meta_for(flavor: str, *, B: int, N: int, kv_indices, last_page, write_indic
     )
 
 
-@pytest.mark.parametrize("flavor", _PAGED_FLAVORS)
-def test_flashinfer_paged_4_hook_lifecycle(flavor: str):
+def test_flashinfer_paged_4_hook_lifecycle():
     """init_cuda_graph_state -> init_capture_metadata -> replay_metadata.
 
     Plan handle wrapper identity is stable across init_capture_metadata
     + replay_metadata calls (graph capture invariant).
     """
-    pool, layer, (H, H_kv, D) = _make_pool_and_layer(flavor)
-    backend = _factory_for(flavor, "flashinfer")(None)
+    pool, layer, (H, H_kv, D) = _make_pool_and_layer()
+    backend = FlashInferPagedBackend(None)
 
     backend.init_cuda_graph_state(
         max_batch_size=1,
@@ -125,7 +97,6 @@ def test_flashinfer_paged_4_hook_lifecycle(flavor: str):
     )
 
     seed_meta = _meta_for(
-        flavor,
         B=1,
         N=8,
         kv_indices=torch.arange(8, dtype=torch.int32, device="cuda"),
@@ -136,7 +107,6 @@ def test_flashinfer_paged_4_hook_lifecycle(flavor: str):
     wrapper_after_capture = plan.wrapper
 
     new_meta = _meta_for(
-        flavor,
         B=1,
         N=4,
         kv_indices=torch.arange(4, dtype=torch.int32, device="cuda"),
@@ -150,8 +120,7 @@ def test_flashinfer_paged_4_hook_lifecycle(flavor: str):
     )
 
 
-@pytest.mark.parametrize("flavor", _PAGED_FLAVORS)
-def test_flashinfer_paged_matches_eager_single_sample(flavor: str):
+def test_flashinfer_paged_matches_eager_single_sample():
     """flashinfer paged output ~= no-cache eager output for the same Q/K/V.
 
     For a single full-sample batch with contiguous slots, the paged read
@@ -159,7 +128,7 @@ def test_flashinfer_paged_matches_eager_single_sample(flavor: str):
     as a ragged no-cache prefill with ``cu_seqlens_q = cu_seqlens_kv =
     [0, N]`` and ``causal=False``.
     """
-    pool, layer, (H, H_kv, D) = _make_pool_and_layer(flavor)
+    pool, layer, (H, H_kv, D) = _make_pool_and_layer()
     N = 4
     torch.manual_seed(0)
     q = torch.randn(N, H, D, dtype=torch.float16, device="cuda")
@@ -168,7 +137,6 @@ def test_flashinfer_paged_matches_eager_single_sample(flavor: str):
     write_indices = torch.arange(N, dtype=torch.int64, device="cuda")
 
     meta = _meta_for(
-        flavor,
         B=1,
         N=N,
         kv_indices=torch.arange(N, dtype=torch.int32, device="cuda"),
@@ -176,7 +144,7 @@ def test_flashinfer_paged_matches_eager_single_sample(flavor: str):
         write_indices=write_indices,
     )
 
-    fi = _factory_for(flavor, "flashinfer")(None)
+    fi = FlashInferPagedBackend(None)
     fi.init_cuda_graph_state(
         max_batch_size=1,
         max_num_tokens=N,
@@ -186,7 +154,7 @@ def test_flashinfer_paged_matches_eager_single_sample(flavor: str):
         layer_proto=layer,
     )
     fi_plan = fi.init_forward_metadata(meta)
-    ctx_fi = _ctx_cls(flavor)(
+    ctx_fi = PagedAttnCtx(
         backend=fi,
         plan=fi_plan,
         mode=AttnMode.PREFILL,
@@ -218,9 +186,8 @@ def test_flashinfer_paged_matches_eager_single_sample(flavor: str):
     assert torch.allclose(out_fi.cpu().float(), out_e, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("flavor", _PAGED_FLAVORS)
 @pytest.mark.parametrize("n_q,n_kv", [(4, 8), (8, 3)])
-def test_flashinfer_paged_cross_attention_sq_ne_skv(flavor: str, n_q: int, n_kv: int):
+def test_flashinfer_paged_cross_attention_sq_ne_skv(n_q: int, n_kv: int):
     """Paged read with S_q != S_kv (cross-attention / extend).
 
     Q has ``n_q`` rows; K/V have ``n_kv`` rows written to ``n_kv`` slots.
@@ -230,7 +197,7 @@ def test_flashinfer_paged_cross_attention_sq_ne_skv(flavor: str, n_q: int, n_kv:
     no-cache eager Attention with a rectangular ``cu_seqlens_q != cu_seqlens_kv``
     and ``causal=False``.
     """
-    pool, layer, (H, H_kv, D) = _make_pool_and_layer(flavor)
+    pool, layer, (H, H_kv, D) = _make_pool_and_layer()
     torch.manual_seed(0)
     q = torch.randn(n_q, H, D, dtype=torch.float16, device="cuda")
     k = torch.randn(n_kv, H_kv, D, dtype=torch.float16, device="cuda")
@@ -238,7 +205,7 @@ def test_flashinfer_paged_cross_attention_sq_ne_skv(flavor: str, n_q: int, n_kv:
     # K/V rows pair 1:1 with the slots they are scattered into.
     write_indices = torch.arange(n_kv, dtype=torch.int64, device="cuda")
 
-    meta = _meta_cls(flavor)(
+    meta = PagedAttnMetadata(
         mode=AttnMode.PREFILL,
         layout=AttnLayout.RAGGED_3D,
         batch_size=1,
@@ -250,7 +217,7 @@ def test_flashinfer_paged_cross_attention_sq_ne_skv(flavor: str, n_q: int, n_kv:
         write_indices=write_indices,
     )
 
-    fi = _factory_for(flavor, "flashinfer")(None)
+    fi = FlashInferPagedBackend(None)
     fi.init_cuda_graph_state(
         max_batch_size=1,
         max_num_tokens=max(n_q, n_kv),
@@ -260,7 +227,7 @@ def test_flashinfer_paged_cross_attention_sq_ne_skv(flavor: str, n_q: int, n_kv:
         layer_proto=layer,
     )
     fi_plan = fi.init_forward_metadata(meta)
-    ctx_fi = _ctx_cls(flavor)(
+    ctx_fi = PagedAttnCtx(
         backend=fi,
         plan=fi_plan,
         mode=AttnMode.PREFILL,
@@ -289,22 +256,21 @@ def test_flashinfer_paged_cross_attention_sq_ne_skv(flavor: str, n_q: int, n_kv:
     assert torch.allclose(out_fi.cpu().float(), out_e, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("flavor", _PAGED_FLAVORS)
-def test_flashinfer_paged_rejects_kv_write_mismatch(flavor: str):
+def test_flashinfer_paged_rejects_kv_write_mismatch():
     """The layer enforces K/V row count == write_indices length, not == q.
 
     A K/V batch whose row count disagrees with ``ctx.write_indices`` is a
     caller bug (the scattered rows would not line up with their slots) and
     must raise — independently of how many query rows there are.
     """
-    pool, layer, (H, H_kv, D) = _make_pool_and_layer(flavor)
+    pool, layer, (H, H_kv, D) = _make_pool_and_layer()
     q = torch.randn(4, H, D, dtype=torch.float16, device="cuda")
     k = torch.randn(8, H_kv, D, dtype=torch.float16, device="cuda")
     v = torch.randn(8, H_kv, D, dtype=torch.float16, device="cuda")
     # write_indices has 6 slots but K/V have 8 rows -> mismatch.
     write_indices = torch.arange(6, dtype=torch.int64, device="cuda")
 
-    fi = _factory_for(flavor, "flashinfer")(None)
+    fi = FlashInferPagedBackend(None)
     fi.init_cuda_graph_state(
         max_batch_size=1,
         max_num_tokens=8,
@@ -313,7 +279,7 @@ def test_flashinfer_paged_rejects_kv_write_mismatch(flavor: str):
         params_dtype=torch.float16,
         layer_proto=layer,
     )
-    meta = _meta_cls(flavor)(
+    meta = PagedAttnMetadata(
         mode=AttnMode.PREFILL,
         layout=AttnLayout.RAGGED_3D,
         batch_size=1,
@@ -324,7 +290,7 @@ def test_flashinfer_paged_rejects_kv_write_mismatch(flavor: str):
         paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32, device="cuda"),
         write_indices=write_indices,
     )
-    ctx_fi = _ctx_cls(flavor)(
+    ctx_fi = PagedAttnCtx(
         backend=fi,
         plan=fi.init_forward_metadata(meta),
         mode=AttnMode.PREFILL,

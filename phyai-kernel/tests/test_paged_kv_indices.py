@@ -15,15 +15,9 @@ Test grid covers:
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 import phyai_kernel
-
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -77,75 +71,49 @@ def _run(req_to_token, req_pool_indices, page_kernel_lens, kv_start_idx):
 # --------------------------------------------------------------------------- #
 
 
-def test_contiguous_layout_no_start():
-    """Contiguous slots, full span from position 0."""
-    max_batch, max_ctx = 4, 32
-    req_to_token = torch.arange(max_batch * max_ctx, dtype=torch.int32).reshape(
-        max_batch, max_ctx
+def test_contiguous_layouts_including_an_empty_request_and_a_multi_block_span():
+    """Contiguous slots from position 0; a zero-length request contributes
+    nothing and does not shift its neighbours; a span longer than the kernel's
+    512-wide block exercises the loop."""
+    small = torch.arange(4 * 32, dtype=torch.int32).reshape(4, 32)
+    out, ref = _run(
+        small,
+        torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        torch.tensor([5, 0, 3, 10], dtype=torch.int32),
+        None,
     )
-    req_pool_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
-    page_kernel_lens = torch.tensor([5, 8, 3, 10], dtype=torch.int32)
-
-    out, ref = _run(req_to_token, req_pool_indices, page_kernel_lens, None)
+    assert torch.equal(out, ref)
+    long = torch.arange(2 * 2048, dtype=torch.int32).reshape(2, 2048)
+    out, ref = _run(
+        long,
+        torch.tensor([0, 1], dtype=torch.int32),
+        torch.tensor([1500, 2000], dtype=torch.int32),
+        None,
+    )
     assert torch.equal(out, ref)
 
 
-def test_shuffled_noncontiguous_layout():
-    """Physical slots are shuffled — the gather must follow req_to_token."""
+def test_shuffled_layouts_with_and_without_a_prefix_skip():
+    """Physical slots are shuffled, so the gather must follow req_to_token;
+    kv_start_idx selects a per-request sub-window (the S_q != S_kv enabler)."""
     torch.manual_seed(0)
-    max_batch, max_ctx = 6, 64
-    req_to_token = (
-        torch.randperm(max_batch * max_ctx, dtype=torch.int64)
-        .to(torch.int32)
-        .reshape(max_batch, max_ctx)
+    shuffled = torch.randperm(6 * 64, dtype=torch.int64).to(torch.int32).reshape(6, 64)
+    out, ref = _run(
+        shuffled,
+        torch.tensor([5, 0, 3], dtype=torch.int32),
+        torch.tensor([12, 40, 7], dtype=torch.int32),
+        None,
     )
-    req_pool_indices = torch.tensor([5, 0, 3], dtype=torch.int32)
-    page_kernel_lens = torch.tensor([12, 40, 7], dtype=torch.int32)
-
-    out, ref = _run(req_to_token, req_pool_indices, page_kernel_lens, None)
     assert torch.equal(out, ref)
-
-
-def test_with_kv_start_idx_prefix_skip():
-    """kv_start_idx selects a per-request sub-window (S_q != S_kv enabler)."""
-    torch.manual_seed(1)
-    max_batch, max_ctx = 4, 128
-    req_to_token = (
-        torch.randperm(max_batch * max_ctx, dtype=torch.int64)
-        .to(torch.int32)
-        .reshape(max_batch, max_ctx)
+    windowed = (
+        torch.randperm(4 * 128, dtype=torch.int64).to(torch.int32).reshape(4, 128)
     )
-    req_pool_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
-    page_kernel_lens = torch.tensor([16, 20, 8, 30], dtype=torch.int32)
-    kv_start_idx = torch.tensor([4, 0, 10, 50], dtype=torch.int32)
-
-    out, ref = _run(req_to_token, req_pool_indices, page_kernel_lens, kv_start_idx)
-    assert torch.equal(out, ref)
-
-
-def test_empty_request_in_batch():
-    """A zero-length request contributes nothing and does not shift others."""
-    max_batch, max_ctx = 3, 16
-    req_to_token = torch.arange(max_batch * max_ctx, dtype=torch.int32).reshape(
-        max_batch, max_ctx
+    out, ref = _run(
+        windowed,
+        torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        torch.tensor([16, 20, 8, 30], dtype=torch.int32),
+        torch.tensor([4, 0, 10, 50], dtype=torch.int32),
     )
-    req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int32)
-    page_kernel_lens = torch.tensor([4, 0, 6], dtype=torch.int32)
-
-    out, ref = _run(req_to_token, req_pool_indices, page_kernel_lens, None)
-    assert torch.equal(out, ref)
-
-
-def test_long_span_spans_multiple_blocks():
-    """A span longer than the kernel's 512 BLOCK_SIZE exercises the loop."""
-    max_batch, max_ctx = 2, 2048
-    req_to_token = torch.arange(max_batch * max_ctx, dtype=torch.int32).reshape(
-        max_batch, max_ctx
-    )
-    req_pool_indices = torch.tensor([0, 1], dtype=torch.int32)
-    page_kernel_lens = torch.tensor([1500, 2000], dtype=torch.int32)
-
-    out, ref = _run(req_to_token, req_pool_indices, page_kernel_lens, None)
     assert torch.equal(out, ref)
 
 

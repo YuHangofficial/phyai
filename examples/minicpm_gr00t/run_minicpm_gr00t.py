@@ -35,7 +35,7 @@ from transformers import AutoProcessor
 
 from phyai.engine import Engine, EngineArgs
 from phyai.models.minicpm_gr00t.main_minicpm_gr00t import MiniCPMGR00TArgs
-from phyai.models.minicpm_gr00t.scheduler_ws1_minicpm_gr00t import (
+from phyai.models.minicpm_gr00t.scheduler_minicpm_gr00t import (
     MiniCPMGR00TRequest,
 )
 from phyai_utils_tools.models.minicpm_gr00t import (

@@ -78,7 +78,7 @@ Follow these steps in order.
   to define the mapping.
 - Validate the configuration in `__post_init__`, such as GQA divisibility and even `head_dim`.
 - Give every numeric parameter a reasonable default so `XxxConfig()` can be constructed without
-  arguments for CPU tests.
+  arguments in tests.
 
 ### 2. Modeling (`modeling_<model>.py`)
 
@@ -99,7 +99,7 @@ Follow these steps in order.
 
 ```python
 class XxxModel(nn.Module):
-    def __init__(self, config: XxxConfig, *, params_dtype=torch.bfloat16, device="cpu"):
+    def __init__(self, config: XxxConfig, *, params_dtype=torch.bfloat16, device=None):
         ...
 
     def forward(self, inputs, ...) -> output:
@@ -183,15 +183,19 @@ class XxxModel(nn.Module):
 
 ### Testing
 
-7. **Layer-level tests** belong in `phyai/tests/`; they can run in CI in CPU mode.
-8. **Model-level tests** that require full weights or GPU belong in `.cache/`, because CI does not
+7. **Layer-level tests** belong in `phyai/tests/`; the suite requires CUDA and runs real kernels.
+8. **Model-level tests** that require full weights belong in `.cache/`, because CI does not
    have enough resources for them.
-9. `conftest.py` automatically overrides `device.target = "cpu"`. CUDA tests must opt in explicitly.
+9. `conftest.py` aborts collection on a machine without CUDA; layers construct on the engine
+   default `device.target = "cuda"`.
 
 ### Style
 
-10. **Logging:** use `this_rank_log` or `all_rank_log` from `phyai.utils`; do not call `print`
-    directly.
+10. **Logging:** get the module logger with `get_logger(__name__)` from `phyai.utils`; never
+    `logging.getLogger`. Use `logger.info_rank0(...)` for rank-0-only lines, plain
+    `logger.info(...)` when every rank should log (the `[rank R/W]` label comes from the
+    formatter), and `logger.warning_once(...)` on per-request / per-layer paths. Do not pass a
+    logger or a level as an argument, and do not call `print` directly.
 11. **Comments:** write all comments in English.
 12. **Naming:** public by default. Do not add leading underscores casually. Expose singletons through
     `get_*()` getters.

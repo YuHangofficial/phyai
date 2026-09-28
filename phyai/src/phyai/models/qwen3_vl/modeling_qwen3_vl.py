@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config, resolve_engine_defaults
-from phyai.layers.attention.attention.layer import Attention
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.layers.attention.nocache.layer import Attention
 from phyai.layers.conv import Conv3d
 from phyai.layers.layer_norm import LayerNorm, RMSNorm
 from phyai.layers.linear import ReplicatedLinear
@@ -26,7 +26,7 @@ from phyai.weights.shards import replicated
 
 
 if TYPE_CHECKING:
-    from phyai.layers.attention import ARAttnCtx
+    from phyai.layers.attention import PagedAttnCtx
 
 
 def get_vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
@@ -442,9 +442,7 @@ class Qwen3VLVisionModel(nn.Module):
         prefix: str = "visual",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -569,9 +567,7 @@ class Qwen3VLTextModel(nn.Module):
         text_attn_kind: str = "attention",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config
@@ -652,7 +648,7 @@ class Qwen3VLTextModel(nn.Module):
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        attn_ctx: "ARAttnCtx | None" = None,
+        attn_ctx: "PagedAttnCtx | None" = None,
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         return_pre_norm_hidden_state: bool = False,
@@ -704,9 +700,7 @@ class Qwen3VLModel(nn.Module):
         vision_attn_backend: str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.spatial_merge_size = config.vision.spatial_merge_size
         self.visual = Qwen3VLVisionModel(
@@ -990,9 +984,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         model_prefix = f"{prefix}.model" if prefix else "model"
         self.model = Qwen3VLModel(

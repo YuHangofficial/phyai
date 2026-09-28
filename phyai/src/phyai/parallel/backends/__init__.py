@@ -9,14 +9,12 @@ Currently registered:
 they never fight over the same PG. Registration order in ``init`` decides
 which one wins when multiple are eligible (e.g., NcclBackend vs PyNCCL on
 the same NCCL PG; PyNCCL wins under capture).
-
-``TorchDistBackend`` is exported as an alias for ``NcclBackend``.
 """
 
 from __future__ import annotations
 
 from phyai.parallel.backends.gloo import GlooBackend
 from phyai.parallel.backends.pynccl import PyNCCLBackend
-from phyai.parallel.backends.torch_dist import NcclBackend, TorchDistBackend
+from phyai.parallel.backends.torch_dist import NcclBackend
 
-__all__ = ["NcclBackend", "GlooBackend", "PyNCCLBackend", "TorchDistBackend"]
+__all__ = ["NcclBackend", "GlooBackend", "PyNCCLBackend"]

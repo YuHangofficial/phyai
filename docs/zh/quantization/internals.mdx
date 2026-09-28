@@ -87,25 +87,24 @@ NVFP4 一个字节存两个 E2M1 值，所以逻辑上的 `(N, K)` 权重实际�
 
 它比另外两个 spec 多做一件事：从高精度 checkpoint 现场量化。`load_weight` 发现进来的是 bf16/fp16/fp32 权重时，先存进 `_nvfp4_pending_weight`；`process_after_loading` 再调 `quantize_loaded_weight` 打包。`128x4` 布局的量化走 FlashInfer 的 `nvfp4_quantize`，需要 CUDA。
 
-# 前向：spec_id 决定 kernel
+# 前向：kernel catalog 决定 kernel
 
-层不自己写 fp8 / cutlass / marlin 的分支。`LinearBase.forward` 把 `spec.spec_id` 交给 dispatcher，由它选 kernel：
+层不自己写 fp8 / cutlass / marlin 的分支。`LinearBase.forward` 把这次调用描述成结构化事实——来自 `spec.physical_signature` 的精确存储格式、dtype、以及 `M`/`N`/`K`——由 kernel selector 选出能力声明匹配的 catalog 行：
 
 ```python
-kernel = get_linear_dispatcher().select(
-    spec_id=self.spec.spec_id,
-    M=_M_of(x), N=self.out_features, K=self.in_features,
-    in_dtype=x.dtype, out_dtype=self.params_dtype,
+kernel = _resolve_linear_kernel(
+    self, x, M=_M_of(x), N=self.out_features, K=self.in_features
 )
+y = kernel.execute(self, x, bias)
 ```
 
-dispatcher（`layers/linear/dispatch.py`）的缓存 key 是 `(spec_id, M_bucket, N, K, in_dtype, out_dtype, sm, mode)`，所以 decode（M 小）和 prefill（M 大）能落到不同 kernel。各 spec 的 `spec_id`：
+选择结果按层由 `CallSite` 记忆，键只覆盖 catalog 行和当前 policy 真正读取的事实（dtype、`N`/`K`、量化签名、执行模式），重复调用只花一次字典查找。哪种存储格式跑在哪里，由 `phyai/kernel/ops/gemm.py` 里的 catalog 行逐条声明：
 
-| spec | spec_id 示例 |
+| spec | physical signature |
 | --- | --- |
-| `Bf16Spec` | `bf16` |
-| `Fp8Spec` | `fp8_per_channel` · `fp8_per_tensor` · `fp8_block_128_128` |
-| `Nvfp4Spec` | `nvfp4_block_16_128x4` · `nvfp4_block_16_linear` |
+| `Bf16Spec` | `format=bf16` |
+| `Fp8Spec` | `format=fp8_e4m3`，`granularity=per_tensor / per_channel / block` |
+| `Nvfp4Spec` | `format=nvfp4`，`layout=128x4 / linear` |
 
 # 扩展
 

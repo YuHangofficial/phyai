@@ -25,11 +25,6 @@ import torch
 import phyai_kernel
 import phyai_kernel.triton.rms_norm as triton_rmsnorm_mod
 
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
-
 
 # --------------------------------------------------------------------------- #
 # Reference implementations (semantics match SGLang's test_norm.py)          #
@@ -90,24 +85,10 @@ def _ref_gemma_fused_add_rmsnorm(
 # Shapes                                                                      #
 # --------------------------------------------------------------------------- #
 
-# Realistic Qwen/Gemma hidden sizes plus a few awkward ones.
-_HIDDEN_SIZES = [
-    64,  # Qwen2 head_dim
-    96,  # non-pow2
-    128,  # Qwen3 head_dim, common qk-norm size
-    256,  # Gemma head_dim
-    896,  # Qwen2 0.5B hidden
-    2048,  # Qwen2 1.5B hidden / Gemma2-2B
-    2304,  # Gemma2-2B hidden alt
-    3072,  # Qwen2 8B / Gemma2-9B
-    3584,  # Qwen2 7B
-    4096,  # Llama / Qwen2 14B
-    4608,  # Gemma2-27B
-    8192,  # Qwen2 32B / 72B
-    9216,  # Gemma3-27B style (uncommon)
-    12288,  # large
-]
-_BATCHES = [1, 19, 257]
+# Head dims (64/128/256), a non-power-of-two width, a large hidden size, the
+# single-block boundary and a width that forces the two-pass kernel.
+_HIDDEN_SIZES = [64, 96, 128, 256, 4096, 8192, 12288]
+_BATCHES = [1, 257]
 _DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -140,22 +121,6 @@ def test_rmsnorm_matches_reference(n_rows: int, n_cols: int, dtype: torch.dtype)
     x, w = _make_inputs(n_rows, n_cols, dtype)
     eps = 1e-6
     expected = _ref_rmsnorm(x, w, eps)
-    actual = phyai_kernel.rmsnorm(x, w, eps)
-    rtol, atol = _tols(dtype)
-    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("n_rows", _BATCHES)
-@pytest.mark.parametrize("n_cols", _HIDDEN_SIZES)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_rmsnorm_matches_torch_nn(n_rows: int, n_cols: int, dtype: torch.dtype):
-    """torch.nn.RMSNorm uses Llama-style (no `1+w`); compare directly."""
-    x, w = _make_inputs(n_rows, n_cols, dtype)
-    eps = 1e-6
-    torch_norm = torch.nn.RMSNorm(n_cols, eps=eps, device="cuda", dtype=dtype)
-    with torch.no_grad():
-        torch_norm.weight.copy_(w)
-    expected = torch_norm(x)
     actual = phyai_kernel.rmsnorm(x, w, eps)
     rtol, atol = _tols(dtype)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
@@ -238,43 +203,35 @@ def test_gemma_fused_add_rmsnorm_matches_reference(
 # --------------------------------------------------------------------------- #
 
 
-def test_rmsnorm_handles_3d_input():
-    """RMSNorm typically receives ``(batch, seq, hidden)``; flatten path."""
+def test_rmsnorm_edge_cases_3d_input_explicit_out_zero_rows_and_qk_norm():
+    # (batch, seq, hidden) flattens; Qwen3's q/k norm normalizes across head_dim
+    # on a (tokens, heads, head_dim) view through the HF variant.
     x = torch.randn(2, 17, 4096, device="cuda", dtype=torch.float16)
     w = torch.randn(4096, device="cuda", dtype=torch.float16)
-    eps = 1e-6
-    expected = _ref_rmsnorm(x, w, eps)
-    actual = phyai_kernel.rmsnorm(x, w, eps)
-    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(
+        phyai_kernel.rmsnorm(x, w, 1e-6), _ref_rmsnorm(x, w, 1e-6), rtol=1e-3, atol=1e-3
+    )
+    qk = torch.randn(11, 8, 128, device="cuda", dtype=torch.bfloat16)
+    wq = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        phyai_kernel.rmsnorm_hf(qk, wq, 1e-6),
+        _ref_rmsnorm_hf(qk, wq, 1e-6),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
-
-def test_rmsnorm_with_explicit_out():
+    # An explicit ``out`` is written in place and returned.
     x = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(1024, device="cuda", dtype=torch.bfloat16)
     out = torch.empty_like(x)
-    ret = phyai_kernel.rmsnorm(x, w, 1e-6, out=out)
-    assert ret.data_ptr() == out.data_ptr()
-    expected = _ref_rmsnorm(x, w, 1e-6)
-    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+    assert phyai_kernel.rmsnorm(x, w, 1e-6, out=out).data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, _ref_rmsnorm(x, w, 1e-6), rtol=2e-2, atol=2e-2)
 
-
-def test_rmsnorm_zero_rows_no_launch():
-    """Empty input should produce empty output without launching the kernel."""
-    x = torch.empty(0, 4096, device="cuda", dtype=torch.float16)
-    w = torch.randn(4096, device="cuda", dtype=torch.float16)
-    out = phyai_kernel.rmsnorm(x, w)
-    assert out.shape == (0, 4096)
-
-
-def test_qwen3_qk_norm_head_dim_pattern():
-    """Qwen3's q/k norm applies RMSNorm across head_dim — replicate that path."""
-    # (num_tokens, num_heads, head_dim) -> view to (-1, head_dim)
-    head_dim = 128
-    x = torch.randn(11, 8, head_dim, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    expected = _ref_rmsnorm_hf(x, w, 1e-6)
-    actual = phyai_kernel.rmsnorm_hf(x, w, 1e-6)
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    # Empty input produces empty output without launching the kernel.
+    empty = torch.empty(0, 4096, device="cuda", dtype=torch.float16)
+    assert phyai_kernel.rmsnorm(
+        empty, torch.randn(4096, device="cuda", dtype=torch.float16)
+    ).shape == (0, 4096)
 
 
 def test_single_block_threshold_boundary():

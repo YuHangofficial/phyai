@@ -1,40 +1,23 @@
-"""phyai.parallel — distributed primitives by named axis.
-
-Quick start:
-
-    import torch.distributed as dist
-    import phyai.parallel as P
-
-    dist.init_process_group("nccl")
-    P.init(layout=(8,), mesh_dim_names=("tp",))   # default mesh, NCCL backend
-
-    # In model code:
-    y = P.all_reduce(x, axis="tp")
-
-CPU / gloo:
-
-    dist.init_process_group("gloo")
-    P.init(layout=(2,), mesh_dim_names=("tp",), device="cpu", backend="gloo")
-"""
+"""Distributed primitives over explicit logical groups."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Iterator
-
 import torch
 import torch.distributed as torch_dist
-from torch.distributed.device_mesh import init_device_mesh
 
 from phyai.parallel.backend import Backend, Op, Topology
-from phyai.parallel.dispatch import Dispatcher, get_dispatcher, set_dispatcher
-from phyai.parallel.exceptions import (
-    CaptureUnsafeError,
-    CommTimeoutError,
-    NoBackendError,
-    PhyaiDistError,
+from phyai.parallel.config import ParallelConfig
+from phyai.parallel.dispatch import (
+    Dispatcher,
+    get_dispatcher,
+    reset_dispatcher,
+    set_dispatcher,
 )
+from phyai.parallel.exceptions import NoBackendError, PhyaiDistError
+from phyai.parallel.layout import GROUP_NAMES, WORLD, RankLayout, build_rank_layout
 from phyai.parallel.mesh import Mesh
+from phyai.parallel.process_groups import ProcessGroupPool
+from phyai.parallel.topology import PlacementEntry, probe_placement
 from phyai.parallel.ops import (
     all_gather,
     all_reduce,
@@ -48,151 +31,72 @@ from phyai.parallel.ops import (
 from phyai.parallel.registry import DefaultPolicy, ForcedPolicy, Policy, Registry
 from phyai.parallel.state import (
     Mode,
+    clear_meshes,
     current_mode,
     default_mesh,
     graph_capture,
     register_mesh,
+    registered_meshes,
     use_mesh,
 )
-from phyai.parallel.backends import (
-    GlooBackend,
-    NcclBackend,
-    PyNCCLBackend,
-    TorchDistBackend,  # alias for NcclBackend
-)
+from phyai.parallel.backends import GlooBackend, NcclBackend, PyNCCLBackend
+from phyai.utils import get_logger
+
+logger = get_logger(__name__)
 
 
-def _resolve_backend(backend: str | None) -> str:
-    """Resolve a ``backend`` choice ('auto' / None / explicit) into a
-    concrete name by inspecting the world process group."""
-    if backend in (None, "auto"):
-        wb = torch_dist.get_backend()
-        if wb in ("nccl", "gloo"):
-            return wb
-        # Unknown / non-standard backend (e.g. mpi, custom) — return as-is;
-        # the caller should explicitly opt in if they want phyai support.
-        return wb
-    return backend
-
-
-class _DegenerateTorchMesh:
-    """Stand-in for ``torch.distributed.DeviceMesh`` at world_size=1.
-
-    ``init_device_mesh`` requires a live process group, but at ws=1 the
-    process group is never read — every collective in ``phyai.parallel.ops``
-    short-circuits when ``axis_size <= 1`` and ``Mesh.axis_group`` is only
-    consulted on the >1 path. So we expose just the surface that
-    ``phyai.parallel.mesh.Mesh`` actually queries (``mesh_dim_names``,
-    ``size``, ``get_local_rank``); ``get_group`` raises so a regression
-    that tries to call collectives at ws=1 is caught loudly.
-    """
-
-    def __init__(self, mesh_dim_names: tuple[str, ...]) -> None:
-        self.mesh_dim_names = tuple(mesh_dim_names)
-
-    def size(self, dim: int | None = None) -> int:
-        return 1
-
-    def get_local_rank(self, axis: str) -> int:
-        return 0
-
-    def get_group(self, axis: str):
-        raise RuntimeError(
-            "phyai.parallel: ws=1 mesh has no ProcessGroup; collectives "
-            "should have short-circuited before reaching axis_group()."
-        )
-
-
-def init(
-    *,
-    layout: tuple[int, ...] | list[int],
-    mesh_dim_names: tuple[str, ...],
-    device: str | torch.device | None = None,
-    backend: str | None = None,
-    enable_pynccl: bool = True,
-    pynccl_axes: list[str] | None = None,
-    pynccl_library_path: str | None = None,
-) -> Mesh:
-    """Initialise phyai.parallel.
-
-    Must be called collectively on all ranks AFTER
-    ``torch.distributed.init_process_group`` has returned.
-
-    Args:
-        layout: mesh shape, e.g. ``(8,)`` for TP=8 or ``(2, 4)`` for
-            (DP=2, TP=4). Product must equal ``dist.get_world_size()``.
-        mesh_dim_names: names for each axis, e.g. ``("tp",)``.
-        device: device type the mesh will run on. If None, derived from
-            ``backend`` (``"cuda"`` for nccl, ``"cpu"`` for gloo).
-        backend: which torch.distributed backend the registered phyai
-            backend(s) should target. One of ``"nccl"``, ``"gloo"``, or
-            ``None``/``"auto"`` to auto-detect from the world PG.
-        enable_pynccl: register the PyNCCL backend in addition to
-            ``NcclBackend``. PyNCCL is preferred under graph capture.
-            Automatically disabled when ``backend="gloo"``.
-        pynccl_axes: which axes to build PyNCCL communicators for. If
-            None, defaults to all ``mesh_dim_names``.
-        pynccl_library_path: override path to libnccl.so.
-
-    Returns:
-        The default :class:`Mesh`.
-    """
-    expected = 1
-    for s in layout:
-        expected *= s
-
-    if not torch_dist.is_initialized():
-        # Single-rank short-circuit: at ws=1, every collective in
-        # `phyai.parallel.ops` returns a clone before consulting the
-        # mesh's process group, so we don't need ``init_process_group``
-        # at all. Build a degenerate ``DeviceMesh`` stand-in and an
-        # empty dispatcher — neither is ever invoked, but downstream
-        # code can still call ``resolve_mesh("model")`` /
-        # ``mesh.axis_size("tp")`` and get sensible answers.
-        if expected == 1:
-            mesh = Mesh(
-                _DegenerateTorchMesh(mesh_dim_names),
-                name="model",
-            )
-            register_mesh(mesh)
-            set_dispatcher(Dispatcher(registry=Registry()))
-            return mesh
-        raise RuntimeError(
-            "phyai.parallel.init: torch.distributed must be initialised first "
-            "(call torch.distributed.init_process_group(...))"
-        )
-
-    if expected != torch_dist.get_world_size():
-        raise ValueError(
-            f"layout product ({expected}) != world_size ({torch_dist.get_world_size()})"
-        )
-
-    resolved_backend = _resolve_backend(backend)
-
+def _resolve_backend(backend: str | None, device: str | torch.device | None) -> str:
+    if backend not in (None, "auto"):
+        return backend
+    world_backend = str(torch_dist.get_backend())
+    if world_backend in ("nccl", "gloo"):
+        return world_backend
     if device is None:
-        device = "cpu" if resolved_backend == "gloo" else "cuda"
-    device_type = str(torch.device(device).type)
+        return "nccl" if torch.cuda.is_available() else "gloo"
+    return "nccl" if torch.device(device).type == "cuda" else "gloo"
 
-    torch_mesh = init_device_mesh(
-        device_type,
-        tuple(layout),
-        mesh_dim_names=tuple(mesh_dim_names),
-    )
-    mesh = Mesh(torch_mesh, name="model")
-    register_mesh(mesh)
 
+def resolve_collective_device(device: str | torch.device | None) -> torch.device:
+    """Resolve the CUDA device this rank's NCCL collectives bind.
+
+    ``None`` and a bare ``"cuda"`` resolve to the device the caller pinned
+    before :func:`init` — the engine pins in ``init_cuda`` / ``init_dist``,
+    and spawned workers pin their placement index — so under full device
+    visibility the communicator lands on this rank's own GPU rather than on
+    ``rank % device_count`` arithmetic that only held with per-worker
+    ``CUDA_VISIBLE_DEVICES`` masks. An explicit ``"cuda:K"`` is honored
+    as-is. Non-CUDA devices are a configuration error here: an NCCL
+    registry without a CUDA device cannot work.
+    """
+    if device is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    resolved = device if isinstance(device, torch.device) else torch.device(device)
+    if resolved.type != "cuda":
+        raise ValueError(f"NCCL collectives require a CUDA device, got {device!r}.")
+    if resolved.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
+def _make_registry(
+    mesh: Mesh,
+    *,
+    backend: str,
+    device: str | torch.device | None,
+    enable_pynccl: bool,
+    pynccl_groups: list[str] | None,
+    pynccl_library_path: str | None,
+) -> Registry:
     registry = Registry()
-
-    if resolved_backend == "nccl":
-        # PyNCCL first (preferred for graph-capture ops), then NcclBackend.
+    if backend == "nccl":
         if enable_pynccl:
             pynccl = PyNCCLBackend(library_path=pynccl_library_path)
-            axes = (
-                list(pynccl_axes) if pynccl_axes is not None else list(mesh_dim_names)
-            )
-            local_rank = torch_dist.get_rank() % max(torch.cuda.device_count(), 1)
-            dev = torch.device(f"cuda:{local_rank}")
-            pynccl.attach(mesh, axes, device=dev)
+            groups = list(mesh.group_names) if pynccl_groups is None else pynccl_groups
+            try:
+                pynccl.attach(mesh, groups, device=resolve_collective_device(device))
+            except BaseException:
+                pynccl.close()
+                raise
             registry.register(
                 pynccl,
                 prefer_for={
@@ -205,60 +109,241 @@ def init(
                 },
             )
         registry.register(NcclBackend())
-
-    elif resolved_backend == "gloo":
-        # PyNCCL is NCCL-only — silently skip.
+    elif backend == "gloo":
         registry.register(GlooBackend())
-
     else:
         raise ValueError(
-            f"phyai.parallel.init: unsupported backend {resolved_backend!r}. "
-            f"Use 'nccl', 'gloo', or 'auto'."
+            f"phyai.parallel.init: unsupported backend {backend!r}. "
+            "Use 'nccl', 'gloo', or 'auto'."
         )
+    try:
+        registry.validate(
+            group_sizes={mesh.group_size(name) for name in mesh.group_names}
+        )
+    except BaseException:
+        for registered in registry.all():
+            registered.close()
+        raise
+    return registry
 
-    registry.validate()
-    set_dispatcher(Dispatcher(registry=registry))
 
+def init(
+    parallel: ParallelConfig,
+    *,
+    replica_world_size: int | None = None,
+    device: str | torch.device | None = None,
+    backend: str | None = None,
+    enable_pynccl: bool = True,
+    pynccl_groups: list[str] | None = None,
+    pynccl_library_path: str | None = None,
+) -> Mesh:
+    """Initialize all logical groups of one serving replica.
+
+    The physical replica world is the size of the initialized torch process
+    group. Without one only a single-rank replica can be initialized; its
+    size is ``replica_world_size`` or is inferred from ``parallel``.
+
+    ``device`` selects the device this rank's NCCL collectives bind (see
+    :func:`resolve_collective_device`): ``None`` or a bare ``"cuda"`` mean
+    the device the caller already pinned, an explicit ``"cuda:K"`` is
+    honored. The value is ignored for gloo, whose collectives are host-side.
+
+    ``pynccl_groups`` names the groups that get a direct NCCL communicator
+    for graph capture. ``None`` attaches every group of the mesh, ``world``
+    included; groups with the same members share one communicator, and a
+    group left out falls back to torch's own NCCL process group.
+    """
+    if not isinstance(parallel, ParallelConfig):
+        raise TypeError(
+            "phyai.parallel.init expects a ParallelConfig, "
+            f"got {type(parallel).__name__}."
+        )
+    if torch_dist.is_initialized():
+        world = torch_dist.get_world_size()
+        if replica_world_size is not None and replica_world_size != world:
+            raise ValueError(
+                f"replica_world_size={replica_world_size} does not match the "
+                f"initialized process group of {world} ranks."
+            )
+    else:
+        world = (
+            parallel.infer_replica_world_size()
+            if replica_world_size is None
+            else replica_world_size
+        )
+        if world > 1:
+            raise RuntimeError(
+                "phyai.parallel.init requires an initialized torch.distributed "
+                f"process group for a multi-rank replica (world_size={world})."
+            )
+    layout = build_rank_layout(parallel.resolve(world))
+    if not torch_dist.is_initialized():
+        mesh = Mesh(layout)
+        register_mesh(mesh)
+        set_dispatcher(Dispatcher(registry=Registry()))
+        return mesh
+
+    resolved_backend = _resolve_backend(backend, device)
+    rank = torch_dist.get_rank()
+    build_cpu = enable_pynccl and resolved_backend == "nccl"
+    pool = ProcessGroupPool(layout, backend=resolved_backend, build_cpu=build_cpu)
+    process_groups: dict[str, torch_dist.ProcessGroup] = {}
+    cpu_groups: dict[str, torch_dist.ProcessGroup] = {}
+    for name in layout.groups:
+        ranks = layout.members_for(name, rank)
+        if len(ranks) > 1:
+            process_groups[name] = pool.get(ranks, resolved_backend)
+            if build_cpu:
+                cpu_groups[name] = pool.get(ranks, "gloo")
+    mesh = Mesh(
+        layout,
+        rank=rank,
+        process_groups=process_groups,
+        cpu_groups=cpu_groups,
+        pool=pool,
+    )
+    # Placement is probed, not configured: node identity and NVML device
+    # index are gathered over the world group, NVLink is checked with NVML.
+    try:
+        probe_device = (
+            resolve_collective_device(device)
+            if resolved_backend == "nccl"
+            else torch.device("cpu")
+        )
+        mesh.set_placement(probe_placement(torch_dist.group.WORLD, device=probe_device))
+    except Exception as error:  # noqa: BLE001 - a probe failure must not fail init
+        logger.warning_rank0(
+            "placement probe failed (%s: %s); using the device-count fallback",
+            type(error).__name__,
+            error,
+        )
+    try:
+        registry = _make_registry(
+            mesh,
+            backend=resolved_backend,
+            device=device,
+            enable_pynccl=enable_pynccl,
+            pynccl_groups=pynccl_groups,
+            pynccl_library_path=pynccl_library_path,
+        )
+        dispatcher = Dispatcher(registry=registry)
+    except BaseException:
+        mesh.close()
+        raise
+    register_mesh(mesh)
+    set_dispatcher(dispatcher)
     return mesh
 
 
-@contextmanager
-def on_stream(s: torch.cuda.Stream) -> Iterator[None]:
-    """Run the body on stream ``s``. Capture-safe (sub-stream usage works
-    inside ``torch.cuda.graph`` as long as both streams are in capture
-    state)."""
-    prev = torch.cuda.current_stream()
-    s.wait_stream(prev)
-    with torch.cuda.stream(s):
-        yield
-
-
 def warmup(callable, /, *args, **kwargs) -> object:
-    """Run ``callable`` once on a side stream, triggering each backend's
-    one-time lazy init. Call before entering ``graph_capture()``."""
-    if torch.cuda.is_available():
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+    """Run one call on a CUDA side stream when its tensors live on CUDA.
+
+    Calls whose tensors are on the host run inline: touching ``torch.cuda``
+    for them would create a CUDA context on device 0 in every CPU/gloo worker
+    of a GPU host (and fail outright when that device is full).
+    """
+    tensors = [
+        value for value in (*args, *kwargs.values()) if isinstance(value, torch.Tensor)
+    ]
+    cuda_devices = [tensor.device for tensor in tensors if tensor.device.type == "cuda"]
+    if not cuda_devices:
+        return callable(*args, **kwargs)
+    with torch.cuda.device(cuda_devices[0]):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
             result = callable(*args, **kwargs)
-        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
-    else:
-        # CPU-only: just call.
-        result = callable(*args, **kwargs)
     return result
 
 
+def collective_device(mesh: Mesh, group: str) -> torch.device:
+    """Device that collectives on ``group`` operate on, from its backend.
+
+    NCCL groups move CUDA tensors, gloo groups host tensors. The decision
+    follows the group's backend rather than whether CUDA
+    happens to be available on the host, so a CPU/gloo replica on a GPU box
+    warms and runs on the CPU path it will use.
+    """
+    backend = str(torch_dist.get_backend(mesh.group(group)))
+    if backend == "nccl":
+        return torch.device("cuda", torch.cuda.current_device())
+    if backend == "gloo":
+        return torch.device("cpu")
+    # Composite / unknown backend (an externally created default group):
+    # fall back to the host's capability.
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def warmup_collectives(groups: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    """Build communicators up front with one tiny all-reduce per group.
+
+    The implicit ``world`` group is included by default so its NCCL
+    communicator is built during engine warmup rather than on the first
+    world-spanning collective (for example a tiled VAE decode). Each group is
+    warmed on the device its process group serves (see
+    :func:`collective_device`).
+    """
+    if not torch_dist.is_initialized():
+        return ()
+    mesh = default_mesh()
+    candidates = mesh.group_names if groups is None else groups
+    warmed: list[str] = []
+    for group in candidates:
+        if mesh.group_size(group) <= 1:
+            continue
+        device = collective_device(mesh, group)
+        tensor = torch.zeros(1, dtype=torch.float32, device=device)
+        warmup(all_reduce, tensor, group=group)
+        warmed.append(group)
+    return tuple(warmed)
+
+
+def shutdown() -> None:
+    """Release everything :func:`init` built, leaving torch.distributed alone.
+
+    Closes every registered backend (pynccl destroys its direct NCCL
+    communicators), destroys owned device and CPU groups, and drops the
+    process-level dispatcher and mesh registry so a later :func:`init` in the
+    same process starts clean. Call it before
+    ``torch.distributed.destroy_process_group``. Idempotent.
+    """
+    try:
+        dispatcher = get_dispatcher()
+    except RuntimeError:
+        dispatcher = None
+    error: BaseException | None = None
+    resources = list(dispatcher.registry.all()) if dispatcher is not None else []
+    resources.extend(registered_meshes())
+    for resource in resources:
+        try:
+            resource.close()
+        except BaseException as caught:
+            if error is None:
+                error = caught
+    reset_dispatcher()
+    clear_meshes()
+    if error is not None:
+        raise error
+
+
 __all__ = [
-    # init / state / mesh
     "init",
+    "shutdown",
+    "collective_device",
+    "GROUP_NAMES",
+    "WORLD",
+    "RankLayout",
+    "PlacementEntry",
     "Mesh",
     "Mode",
     "default_mesh",
     "use_mesh",
     "current_mode",
     "graph_capture",
-    # collectives
     "all_reduce",
     "all_gather",
     "reduce_scatter",
@@ -267,14 +352,11 @@ __all__ = [
     "send",
     "recv",
     "barrier",
-    # streams / warmup
-    "on_stream",
     "warmup",
-    # backends (exposed for advanced users to register custom ones)
+    "warmup_collectives",
     "NcclBackend",
     "GlooBackend",
     "PyNCCLBackend",
-    "TorchDistBackend",
     "Backend",
     "Op",
     "Topology",
@@ -284,9 +366,6 @@ __all__ = [
     "ForcedPolicy",
     "Dispatcher",
     "get_dispatcher",
-    # errors
     "PhyaiDistError",
     "NoBackendError",
-    "CommTimeoutError",
-    "CaptureUnsafeError",
 ]

@@ -10,11 +10,11 @@ separate remap when checkpoint keys match the OpenPI / LeRobot layout.
 
 Sections (top -> bottom):
 
-1. **Engine defaults** -- :func:`_resolve_engine_defaults` and
-   :func:`_engine_to_paged_backend`.
+1. **Engine defaults** -- :func:`~phyai.engine_config.resolve_params_dtype` and
+   the kernel catalog's own eligibility rules.
 2. **Vision tower** -- SigLIP-So400m + ``multi_modal_projector``.
 3. **PaliGemma language model** -- gemma_2b text side. Decoder layers
-   use :class:`ARAttention` and run pre-norm GQA attention + gated MLP.
+   use :class:`PagedAttention` and run pre-norm GQA attention + gated MLP.
 4. **Action expert** -- gemma_300m with plain :class:`GemmaRMSNorm`.
    The expert writes Q/K/V in the same joint attention space as the
    text tower, but keeps its own 1024-wide hidden stream via an
@@ -67,83 +67,31 @@ Inference-only -- every parameter is allocated with
 from __future__ import annotations
 
 import math
-import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config
-from phyai.layers.attention.ar import ARAttention, ARAttnCtx
-from phyai.layers.attention.diffusion import DiffusionAttention, DiffusionAttnCtx
 from phyai.layers.conv import Conv2d
-from phyai.layers.layer_norm import GemmaRMSNorm, LayerNorm
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.weights.shards import replicated
+from phyai.layers.layer_norm import LayerNorm, GemmaRMSNorm
 from phyai.layers.linear.layers import (
-    QKVParallelLinear,
     ReplicatedLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from phyai.layers.mlp.dense_mlp import DenseMLP
+from phyai.layers.attention.paged import PagedAttnCtx, PagedAttention
 from phyai.layers.rotary_embedding import RotaryEmbedding
 from phyai.layers.transformer_block import TransformerBlock
-from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
 from phyai.models.pi0.configuration_pi0 import (
-    GemmaExpertConfig,
-    PaliGemmaTextConfig,
     PI0Config,
+    GemmaExpertConfig,
     SiglipVisionConfig,
+    PaliGemmaTextConfig,
 )
-from phyai.weights.shards import replicated
-
-
-def _resolve_engine_defaults(
-    params_dtype: torch.dtype | None,
-    attn_backend: str | None,
-    norm_backend: str | None,
-) -> tuple[torch.dtype, str, str]:
-    """Fill in ``None`` overrides from the process EngineConfig."""
-
-    if (
-        params_dtype is not None
-        and attn_backend is not None
-        and norm_backend is not None
-    ):
-        return params_dtype, attn_backend, norm_backend
-    ec = get_engine_config()
-    return (
-        ec.device.params_dtype if params_dtype is None else params_dtype,
-        ec.backends.attn if attn_backend is None else attn_backend,
-        ec.backends.norm if norm_backend is None else norm_backend,
-    )
-
-
-def _engine_to_paged_backend(attn_backend: str) -> str:
-    """Map :class:`EngineConfig`'s ``attn_backend`` onto the AR / Diffusion
-    paged backend name.
-
-    The AR and Diffusion paged stacks are flashinfer-only (GPU):
-    ``"flashinfer"`` is the only backend registered in either
-    subpackage. ``"sdpa"`` / ``"eager"`` have no paged backend (SDPA
-    cannot read paged KV; there is no CPU reference path), so any
-    non-flashinfer name is rejected here rather than silently coerced.
-    """
-
-    canonical = attn_backend.lower().replace("_", "-")
-    if canonical != "flashinfer":
-        raise ValueError(
-            f"AR / Diffusion paged stacks are flashinfer-only (GPU); got "
-            f"attn_backend={attn_backend!r}. pi0 inference requires "
-            f"backend='flashinfer'."
-        )
-    return canonical
-
-
-def _vision_norm_backend(norm_backend: str, vision_dtype: torch.dtype) -> str:
-    """Pick a norm backend that accepts the vision tower's compute dtype."""
-
-    if norm_backend == "flashinfer" and vision_dtype != torch.bfloat16:
-        return "phyai-kernel"
-    return norm_backend
+from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
 
 
 def _apply_lerobot_rope_precision(
@@ -281,9 +229,7 @@ class SiglipVisionEncoder(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         layer_prefix = f"{prefix}.layers" if prefix else ""
         self.layers = nn.ModuleList(
             [
@@ -332,9 +278,7 @@ class SiglipVisionModel(nn.Module):
         prefix: str = "vision_model",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.prefix = prefix
         self.embeddings = SiglipVisionEmbeddings(
@@ -434,19 +378,16 @@ class PI0VisionTower(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.compute_dtype = params_dtype
         self.io_dtype = io_dtype if io_dtype is not None else params_dtype
-        vision_norm_backend = _vision_norm_backend(norm_backend, params_dtype)
         self.config = config
         self.prefix = prefix
         self.vision_tower = VisionTowerWrapper(
             config,
             params_dtype=params_dtype,
             attn_backend=attn_backend,
-            norm_backend=vision_norm_backend,
+            norm_backend=norm_backend,
             prefix=f"{prefix}.vision_tower" if prefix else "vision_tower",
         )
         self.multi_modal_projector = MultiModalProjector(
@@ -508,9 +449,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.layer_idx = layer_idx
         self.prefix = prefix
@@ -543,19 +482,21 @@ class PaliGemmaDecoderLayer(nn.Module):
             1, self.qkv_proj.num_kv_heads * self.qkv_proj.num_kv_replicas
         )
         self.o_proj = RowParallelLinear(
+            group="attention_tp",
             in_features=config.num_attention_heads * config.head_dim,
             out_features=config.hidden_size,
             bias=False,
             params_dtype=params_dtype,
             prefix=f"{attn_prefix}.o_proj",
         )
-        self.attn = ARAttention(
+        self.attn = PagedAttention(
             num_heads=self.q_heads_local,
             head_dim=config.head_dim,
             layer_id=layer_idx,
             num_kv_heads=self.kv_heads_local,
             causal=False,
-            backend=_engine_to_paged_backend(attn_backend),
+            backend=attn_backend,
+            kernel_role="prefix",
         )
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size,
@@ -592,7 +533,7 @@ class PaliGemmaDecoderLayer(nn.Module):
         h: torch.Tensor,
         position_ids: torch.Tensor,
         rope: RotaryEmbedding,
-        attn_ctx: ARAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         residual = h
         n = self.input_layernorm(h)
@@ -624,9 +565,7 @@ class PaliGemmaLanguageModel(nn.Module):
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.prefix = prefix
         self.embed_tokens = PaliGemmaEmbedTokens(
@@ -664,7 +603,7 @@ class PaliGemmaLanguageModel(nn.Module):
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         rope: RotaryEmbedding,
-        attn_ctx: ARAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         h = inputs_embeds
         for layer in self.layers:
@@ -721,9 +660,7 @@ class PI0ExpertLayer(nn.Module):
                 "PI0ExpertLayer requires GemmaExpertConfig.use_adarms=False; "
                 "AdaRMS conditioning belongs to pi0.5."
             )
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.layer_idx = layer_idx
         self.prefix = prefix
@@ -756,19 +693,21 @@ class PI0ExpertLayer(nn.Module):
             1, self.qkv_proj.num_kv_heads * self.qkv_proj.num_kv_replicas
         )
         self.o_proj = RowParallelLinear(
+            group="attention_tp",
             in_features=config.num_attention_heads * config.head_dim,
             out_features=config.hidden_size,
             bias=False,
             params_dtype=params_dtype,
             prefix=f"{attn_prefix}.o_proj",
         )
-        self.attn = DiffusionAttention(
+        self.attn = PagedAttention(
             num_heads=self.q_heads_local,
             head_dim=config.head_dim,
             layer_id=layer_idx,
             num_kv_heads=self.kv_heads_local,
             causal=False,
-            backend=_engine_to_paged_backend(attn_backend),
+            backend=attn_backend,
+            kernel_role="expert",
         )
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size,
@@ -805,7 +744,7 @@ class PI0ExpertLayer(nn.Module):
         h: torch.Tensor,
         position_ids: torch.Tensor,
         rope: RotaryEmbedding,
-        attn_ctx: DiffusionAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         """Pre-norm self-attention + gated MLP, with KV cache scatter."""
 
@@ -842,9 +781,7 @@ class PI0ExpertStack(nn.Module):
         super().__init__()
         if config.use_adarms:
             raise ValueError("PI0ExpertStack requires use_adarms=False.")
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         self.config = config
         self.prefix = prefix
         layers_prefix = f"{prefix}.layers" if prefix else "layers"
@@ -874,7 +811,7 @@ class PI0ExpertStack(nn.Module):
         h: torch.Tensor,
         position_ids: torch.Tensor,
         rope: RotaryEmbedding,
-        attn_ctx: DiffusionAttnCtx,
+        attn_ctx: PagedAttnCtx,
     ) -> torch.Tensor:
         """Run every expert layer + final RMSNorm."""
 
@@ -1053,9 +990,7 @@ class PI0Model(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = _resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         vision_dtype = (
             vision_params_dtype if vision_params_dtype is not None else params_dtype
         )
@@ -1067,20 +1002,6 @@ class PI0Model(nn.Module):
         self.attn_backend = attn_backend
 
         vision_attn_backend = attn_backend
-        if attn_backend == "flashinfer" and config.vision.head_dim not in (
-            64,
-            128,
-            256,
-        ):
-            vision_attn_backend = "sdpa"
-            warnings.warn(
-                f"PI0Model: vision tower head_dim={config.vision.head_dim} "
-                f"not in flashinfer's supported set {{64, 128, 256}}; "
-                f"vision attention silently downgraded to 'sdpa'. The "
-                f"language + expert joint attention path still uses "
-                f"'flashinfer' as requested.",
-                stacklevel=2,
-            )
 
         self.vision = PI0VisionTower(
             config.vision,

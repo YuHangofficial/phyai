@@ -18,25 +18,26 @@ positions whose id falls outside ``[shard_start, shard_end)`` read as zero.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
+from phyai.kernel.call import CallSite
 
-def _masked_embedding_lookup_eager(
-    input_ids: Tensor,
-    weight: Tensor,
-    shard_start: int,
-    shard_end: int,
-) -> Tensor:
-    """Three-pass reference: mask, gather with safe index, zero-out misses.
 
-    Used as the CPU / non-CUDA fallback for the custom op and as the parity
-    oracle in tests.
+_EMBEDDING_CALL: CallSite | None = None
+
+
+def get_embedding_call() -> CallSite:
+    """The bound call site for the masked lookup.
+
+    There is exactly one lookup in the process, so the binding is a singleton
+    rather than per-layer state -- the op is a free function registered with
+    ``torch.library``, with no module to hang it off.
     """
-    mask = (input_ids >= shard_start) & (input_ids < shard_end)
-    local_ids = torch.where(mask, input_ids - shard_start, torch.zeros_like(input_ids))
-    out = F.embedding(local_ids, weight)
-    return out.masked_fill(~mask.unsqueeze(-1), 0)
+
+    global _EMBEDDING_CALL
+    if _EMBEDDING_CALL is None:
+        _EMBEDDING_CALL = CallSite("embedding", role="vocab.lookup")
+    return _EMBEDDING_CALL
 
 
 @torch.library.custom_op("phyai::masked_embedding_lookup", mutates_args=())
@@ -46,13 +47,20 @@ def _masked_embedding_lookup_op(
     shard_start: int,
     shard_end: int,
 ) -> Tensor:
-    if input_ids.is_cuda and weight.is_cuda:
-        # The Triton kernel lives in phyai-kernel and is bandwidth-bound; it
-        # fuses mask + gather + zero-on-miss into a single pass.
-        from phyai_kernel import masked_embedding_lookup as _triton_lookup
-
-        return _triton_lookup(input_ids, weight, int(shard_start), int(shard_end))
-    return _masked_embedding_lookup_eager(input_ids, weight, shard_start, shard_end)
+    handle = get_embedding_call().select(
+        device=weight.device,
+        dtype={
+            "input": input_ids.dtype,
+            "weight": weight.dtype,
+            "output": weight.dtype,
+        },
+        dims={
+            "tokens": input_ids.numel(),
+            "embedding_dim": weight.shape[-1],
+        },
+        attrs={"shard_start": shard_start, "shard_end": shard_end},
+    )
+    return handle.execute(input_ids, weight, int(shard_start), int(shard_end))
 
 
 @_masked_embedding_lookup_op.register_fake
@@ -78,4 +86,4 @@ def masked_embedding_lookup(
     )
 
 
-__all__ = ["masked_embedding_lookup"]
+__all__ = ["get_embedding_call", "masked_embedding_lookup"]

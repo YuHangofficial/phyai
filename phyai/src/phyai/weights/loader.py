@@ -21,7 +21,6 @@ The whole load chain in one place:
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,11 +33,11 @@ from safetensors import safe_open
 from tqdm.auto import tqdm
 
 from phyai.utils.checkpoint import find_checkpoint_files, resolve_checkpoint
-from phyai.utils.logging import this_rank_log
+from phyai.utils.logging import get_logger
 from phyai.weights.shards import WeightLoader, replicated
 
 
-_logger = logging.getLogger(__name__)
+_logger = get_logger(__name__)
 
 _SAFETENSORS_SUFFIX = ".safetensors"
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".bin", ".pt", ".pth"})
@@ -219,11 +218,8 @@ def _iter_checkpoint_tensor_loaders(
     except RuntimeError as exc:
         if "legacy .tar format" not in str(exc).lower():
             raise
-        this_rank_log(
-            _logger,
-            logging.WARNING,
-            "Loading legacy PyTorch checkpoint %s with weights_only=False",
-            path.name,
+        _logger.warning_rank0(
+            "Loading legacy PyTorch checkpoint %s with weights_only=False", path.name
         )
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state = _unwrap_pytorch_state(checkpoint, path=path)
@@ -406,21 +402,15 @@ def load_pretrained(
 
     if report.casts:
         for hf_key, src_dtype, dst_dtype in report.casts[:10]:
-            this_rank_log(
-                _logger,
-                logging.WARNING,
+            _logger.warning_rank0(
                 "load_pretrained dtype cast at %r: %s -> %s",
                 hf_key,
                 src_dtype,
                 dst_dtype,
             )
 
-    this_rank_log(
-        _logger,
-        logging.INFO,
-        "load_pretrained(%s): %s",
-        _source_label(source),
-        report.summary(),
+    _logger.info_rank0(
+        "load_pretrained(%s): %s", _source_label(source), report.summary()
     )
 
     return report

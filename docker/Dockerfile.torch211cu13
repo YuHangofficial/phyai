@@ -40,8 +40,8 @@ WORKDIR /opt/phyai
 # The ADD of the GitHub commit ref busts the clone layer's cache whenever the
 # requested ref's HEAD moves, so rebuilds pick up new commits on a branch.
 ARG PHYAI_REF=main
-ADD "https://api.github.com/repos/MEmbodied/phyai/commits/${PHYAI_REF}" /tmp/phyai-ref.json
-RUN git clone --recursive https://github.com/MEmbodied/phyai . \
+ADD "https://api.github.com/repos/mingti-org/phyai/commits/${PHYAI_REF}" /tmp/phyai-ref.json
+RUN git clone --recursive https://github.com/mingti-org/phyai . \
     && git checkout "${PHYAI_REF}" \
     && git submodule update --init --recursive
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 
@@ -14,10 +13,10 @@ from phyai.layers.rotary_embedding import (
 from phyai.models.minicpm_gr00t.modeling_minicpm_gr00t import MiniCPMGR00TModel
 from phyai.runtime.cuda_graph_manager import CudaGraph, CudaGraphRegistry
 from phyai.runtime.model_runner import ModelRunner
-from phyai.utils.logging import this_rank_log
+from phyai.utils.logging import get_logger
 
 
-_logger = logging.getLogger(__name__)
+_logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -384,11 +383,9 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         if not self.use_cuda_graph:
             return self._encode_vlm_core(**graph_inputs, layout=layout)
 
-        this_rank_log(
-            _logger,
-            logging.WARNING,
-            "Capturing MiniCPM-GR00T VLM CUDA graph for uncached key %r "
-            "(%d graphs cached).",
+        _logger.warning_rank0(
+            "Capturing MiniCPM-GR00T VLM CUDA graph for uncached key %r (%d "
+            "graphs cached).",
             graph_key,
             len(self._vlm_graphs),
         )
@@ -558,11 +555,9 @@ class MiniCPMGR00TModelRunner(ModelRunner):
         )
         graph = self._action_graphs.get(graph_key)
         if graph is None:
-            this_rank_log(
-                _logger,
-                logging.WARNING,
-                "Capturing MiniCPM-GR00T action CUDA graph for uncached key %r "
-                "(%d graphs cached).",
+            _logger.warning_rank0(
+                "Capturing MiniCPM-GR00T action CUDA graph for uncached key %r (%d "
+                "graphs cached).",
                 graph_key,
                 len(self._action_graphs),
             )

@@ -5,14 +5,18 @@ callers like :func:`phyai.vgpu.topology.round_up_sm_count` expect, and
 raises if CUDA is unavailable. :func:`sm_arch` returns the packed integer
 form (``major * 10 + minor``) used for kernel dispatch keys, with a
 graceful ``0`` fallback so init paths stay safe on developer laptops or
-in forked subprocesses. :func:`init_cuda` / :func:`init_cublas` are the
+in forked subprocesses. :func:`resolve_device` turns a config's device
+string into the concrete device *this* process should own, folding in the
+launcher's ``LOCAL_RANK``. :func:`init_cuda` / :func:`init_cublas` are the
 discrete bootstrap entry points the engine and tests call to pin device
 + default dtype and tune cuBLAS/cuDNN — each is independently callable
 so callers can opt into pieces without committing to the full engine
-orchestration. :func:`print_topology` dumps a per-device summary plus a
-peer-access matrix for the local node; :func:`print_distributed_topology`
-extends that to a multi-node :mod:`torch.distributed` group with per-host
-IB HCAs and GPU↔NIC affinity from ``nvidia-smi topo -m``.
+orchestration. :func:`memory_summary` / :func:`available_memory_bytes`
+report free and total device memory. :func:`print_topology` dumps a per-device summary
+plus a peer-access matrix for the local node;
+:func:`print_distributed_topology` extends that to a multi-node
+:mod:`torch.distributed` group with per-host IB HCAs and GPU↔NIC affinity
+from ``nvidia-smi topo -m``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ import sys
 from typing import TextIO
 
 import torch
+
+from phyai.utils.torch_setup import local_rank
 
 
 def device_capability(
@@ -51,6 +57,15 @@ def current_device() -> torch.device:
 def sm_arch(
     device: "torch.device | str | int | None" = None,
 ) -> int:
+    """Compute capability as ``major * 10 + minor``, or ``0`` without CUDA.
+
+    The ``0`` is a *truth value*, not a version. Callers may test it; they must
+    not compare it. ``phyai.kernel`` uses the opposite convention -- ``None`` for
+    "this device has no compute capability" -- precisely because a 0 that reaches
+    a comparison makes a CPU host read as "too old" rather than "unknown", which
+    is how the old selector reported "no backend available" on CPU.
+    """
+
     if not torch.cuda.is_available():
         return 0
     try:
@@ -62,34 +77,117 @@ def sm_arch(
     return major * 10 + minor
 
 
+def resolve_device(device: "torch.device | str") -> torch.device:
+    """Resolve a config device string to the device this process should own.
+
+    Pure function, no side effects. Three cases:
+
+    * an explicit index (``"cuda:3"``) is returned unchanged — the caller
+      knows what it wants;
+    * a bare ``"cuda"`` under a launcher becomes ``cuda:{LOCAL_RANK}``;
+    * a bare ``"cuda"`` with no launcher becomes ``cuda:0``.
+
+    The middle case is the one that matters. ``EngineConfig.device.target``
+    defaults to plain ``"cuda"``, and pinning that to device 0 means every
+    rank of a ``torchrun`` job binds the same GPU for the whole window
+    between here and the point where the process group is up — so warmup
+    tensors, cuBLAS handles and workspace allocations all land on GPU 0
+    while rank 3 believes it is on GPU 3. Folding ``LOCAL_RANK`` in here
+    makes the very first ``set_device`` correct.
+
+    Non-CUDA devices pass through untouched.
+    """
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    if dev.type != "cuda" or dev.index is not None:
+        return dev
+    return torch.device("cuda", local_rank())
+
+
 def init_cuda(
     device: "torch.device | str",
     params_dtype: torch.dtype,
-) -> torch.dtype:
+) -> None:
     """Pin the CUDA current device and the process default dtype.
 
-    Returns the previously-set ``torch.get_default_dtype()`` so
-    :meth:`Engine.close` can restore it. CPU device is a no-op for the
-    device half (``torch.cuda.set_device`` is skipped) but the dtype
-    pin still happens — fp32 / fp64 weights need it just as much.
+    A CPU device skips ``torch.cuda.set_device``, but the dtype is still
+    pinned because fp32 and fp64 weights need it just as much. The engine
+    keeps this dtype for the lifetime of its inference process, including
+    after shutdown.
+
+    The device is routed through :func:`resolve_device`, so a bare
+    ``"cuda"`` lands on this process's local rank rather than on device 0.
     """
-    saved = torch.get_default_dtype()
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    dev = resolve_device(device)
     if dev.type == "cuda":
-        torch.cuda.set_device(dev.index if dev.index is not None else 0)
+        torch.cuda.set_device(dev)
     torch.set_default_dtype(params_dtype)
-    return saved
 
 
-def init_cublas() -> None:
-    """Tune cuBLAS / cuDNN for inference workloads.
+def init_cublas(*, allow_tf32: bool = False) -> None:
+    """Create the cuBLAS handle up front and set fp32 matmul precision.
 
-    Currently a no-op placeholder — the discrete entry point is in
-    place so future tuning (allow_tf32 toggles, ``CUBLAS_WORKSPACE_CONFIG``,
-    cuDNN benchmark mode) lands in one well-named function rather than
-    drifting into ``Engine.__init__``.
+    The handle is built by running one tiny matmul. That looks pointless
+    and is not: cuBLAS initializes lazily on first use, so without this
+    the cost (and any failure — a missing library, a driver mismatch)
+    surfaces inside whatever happens to issue the first GEMM. That is
+    frequently a warmup step inside CUDA-graph capture, where a lazy
+    initialization is both hard to read in a profile and, for some
+    library versions, illegal.
+
+    ``allow_tf32`` controls the fp32 paths only (``matmul.allow_tf32`` and
+    the equivalent ``set_float32_matmul_precision``). Default off: phyai
+    runs bf16/fp8/nvfp4 weights, where the flag is irrelevant, and the
+    fp32 modules that do exist (ViT stems, time-embedding MLPs) are
+    exactly the places a silent precision drop would be unwelcome.
+
+    cuDNN is deliberately left alone. ``cudnn.benchmark`` re-plans on new
+    shapes, which fights CUDA-graph capture, and cuDNN kernels inside a
+    captured region have already caused hangs in the multi-replica
+    green-context path — so tuning it is an explicit, per-model decision,
+    not a process default.
     """
+    if not torch.cuda.is_available():
+        return None
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+    a = torch.ones((16, 16), dtype=torch.float16, device="cuda")
+    torch.matmul(a, a)
     return None
+
+
+def memory_summary(
+    device: "torch.device | str | int | None" = None,
+) -> tuple[int, int]:
+    """Return ``(free_bytes, total_bytes)`` for ``device``.
+
+    ``(0, 0)`` when CUDA is unavailable or the device cannot be queried,
+    so callers can treat "no numbers" and "no device" identically instead
+    of branching on ``torch.cuda.is_available()`` at every site.
+
+    Reports the *driver's* view (``torch.cuda.mem_get_info``), not
+    torch's allocator view: memory held by another process on the same
+    GPU counts against free, which is the whole point on a shared box.
+    """
+    if not torch.cuda.is_available():
+        return (0, 0)
+    try:
+        free, total = torch.cuda.mem_get_info(device)
+    except (RuntimeError, AssertionError, ValueError):
+        return (0, 0)
+    return (int(free), int(total))
+
+
+def available_memory_bytes(
+    device: "torch.device | str | int | None" = None,
+) -> int:
+    """Return free device memory in bytes, or ``0`` when unavailable."""
+    free, _total = memory_summary(device)
+    return free
+
+
+def format_gib(num_bytes: int) -> str:
+    """``12.34`` for a byte count, for log lines that append ``GiB`` themselves."""
+    return f"{num_bytes / (1 << 30):.2f}"
 
 
 def print_topology(*, file: TextIO | None = None) -> None:
@@ -128,8 +226,8 @@ def print_topology(*, file: TextIO | None = None) -> None:
 
 
 def print_distributed_topology(*, file: TextIO | None = None) -> None:
-    import glob
     import os
+    import glob
     import socket
     import subprocess
 

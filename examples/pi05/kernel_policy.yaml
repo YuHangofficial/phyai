@@ -1,0 +1,13 @@
+# Optional measured policy. Models do not load it automatically; select it with
+# PHYAI_KERNEL_CONFIG when this rule is appropriate for the target hardware.
+
+schema: 1
+rules:
+  - id: pi05-expert-joint-fa2
+    priority: 10
+    match:
+      op: attention_paged
+      role: expert
+      model.family: pi05
+      device.arch: sm90
+    restrict_to: "flashinfer.attention_paged.fa2"

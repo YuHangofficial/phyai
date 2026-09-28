@@ -4,14 +4,14 @@ The package ships the full pi0.5 inference path:
 
 * :mod:`configuration_pi05` — frozen dataclass configs.
 * :mod:`modeling_pi05` — every ``nn.Module`` (vision tower, paligemma
-  language model with :class:`~phyai.layers.attention.ARAttention`,
+  language model with :class:`~phyai.layers.attention.PagedAttention`,
   gemma_300m action expert with
-  :class:`~phyai.layers.attention.DiffusionAttention`, action/time
+  :class:`~phyai.layers.attention.PagedAttention`, action/time
   heads, and the parameter-only :class:`PI05Model` container).
 * :mod:`model_runner_pi05` — the three runners (vision / LLM / expert)
   that wrap captured CUDA graphs around the modeling code.
-* :mod:`scheduler_ws1_pi05` — single-card (world_size=1) end-to-end
-  inference orchestrator with multi-batch support. Owns the
+* :mod:`scheduler_pi05` - per-replica inference orchestrator with multi-batch
+  support. Owns the
   pi0.5-specific batch-layout helpers (cu_seqlens, write-indices,
   padded prefix layout, joint paged_kv_indices interleave).
 

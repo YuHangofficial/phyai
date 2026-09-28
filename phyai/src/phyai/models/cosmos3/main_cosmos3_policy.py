@@ -1,8 +1,7 @@
-"""Cosmos3 action/policy plugin entry — the engine's cosmos3 policy hook."""
+"""Cosmos3 action and policy plugin entry."""
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -10,7 +9,7 @@ from typing import ClassVar
 import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
-from phyai.engine_config import get_engine_config
+from phyai.engine_config import ParallelConfig, get_engine_config
 from phyai.layers.quant.active import load_quant_plan, use_quant_plan
 from phyai.models.cosmos3.configuration_cosmos3 import (
     Cosmos3Config,
@@ -20,17 +19,16 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Transformer,
     cosmos3_weight_remap,
 )
+from phyai.models.cosmos3.parallel_cosmos3 import validate_cosmos3_parallel
+from phyai.models.cosmos3.requests_cosmos3_policy import Cosmos3ActionRequest
 from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
-from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
-    Cosmos3ActionRequest,
-    Cosmos3PolicyScheduler,
-)
+from phyai.models.cosmos3.scheduler_cosmos3_policy import Cosmos3PolicyScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import load_config, this_rank_log
+from phyai.utils import get_logger, load_config
 from phyai.weights import load_pretrained
 
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -55,6 +53,17 @@ class Cosmos3PolicyEntry(Entry):
 
     name: ClassVar[str] = "cosmos3_policy"
     args_cls: ClassVar[type[EntryArgs]] = Cosmos3PolicyArgs
+
+    parallel_domains: ClassVar[frozenset[str]] = frozenset(
+        {"cfg", "dense", "attention"}
+    )
+
+    @classmethod
+    def validate_parallel(
+        cls, parallel: ParallelConfig, replica_world_size: int | None = None
+    ) -> None:
+        super().validate_parallel(parallel, replica_world_size)
+        validate_cosmos3_parallel(parallel, replica_world_size)
 
     def __init__(self) -> None:
         self.transformer: Cosmos3Transformer | None = None
@@ -112,9 +121,7 @@ class Cosmos3PolicyEntry(Entry):
             use_cuda_graph=eng.runtime.use_cuda_graph,
         )
         self.scheduler.setup()
-        this_rank_log(
-            logger,
-            logging.INFO,
+        logger.info_rank0(
             "Cosmos3 policy plugin ready (decode_video=%s, flow_shift=%s, "
             "use_karras_sigmas=%s).",
             self.decode_video,

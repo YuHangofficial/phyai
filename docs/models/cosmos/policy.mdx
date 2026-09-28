@@ -1,0 +1,522 @@
+---
+title: "Cosmos3 Policy Mode"
+description: "Run Cosmos3 policy, forward dynamics, and inverse dynamics on one or more GPUs"
+icon: "rocket"
+---
+
+import { ModelCard } from "/snippets/model-card.jsx"
+
+<ModelCard
+  title="Cosmos3-Nano-Policy-DROID"
+  subtitle="Action / Policy · DROID · Single or Multi-GPU"
+  icon="C"
+  rows={{
+    "Model Type": "World Foundation Model · Action Policy",
+    "Weights": <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer" className="text-sm text-[#003399] dark:text-[#60A5FA] underline underline-offset-2 hover:opacity-80 break-all">huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID</a>,
+    "Modes": ["policy", "forward_dynamics", "inverse_dynamics"],
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">Cosmos3PolicyScheduler</code>,
+    "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">cosmos3_policy</code>,
+    "Default Domain": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">droid_lerobot</code>,
+    "Default Action Chunk": "16 steps",
+    "Internal Action Width": "64",
+    "Param Precision": "bf16",
+  }}
+/>
+
+# Overview
+
+Cosmos3's policy path is a different animal from text-to-video. It is the part of the model that looks at a scene, reads a task, and works out what to do. Give it an observation and a prompt and it predicts an action chunk. Give it an action and it rolls out a plausible future. Give it a transition that already happened and it infers the action in between.
+
+This page uses <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>. Do not swap in the general `Cosmos3-Nano` generation checkpoint when you want actions; that path lives in [Cosmos3 Generation Mode](/models/cosmos/generation).
+
+One plugin, `cosmos3_policy`, serves three modes on one GPU or several:
+
+| Mode | Input | Output |
+| --- | --- | --- |
+| `policy` | Observation image or video + prompt | Action chunk, plus a rollout video if you ask for one |
+| `forward_dynamics` | Observation + prompt + known action | Rollout video, with the action kept in the output |
+| `inverse_dynamics` | Observation video + prompt | The action chunk that explains the transition |
+
+<Note>
+  `examples/cosmos3/run_cosmos3_policy.py` wires all three modes. It runs with `decode_video=True`, saves the action as JSON, and writes a rollout mp4 whenever pixels come back. `--cfg 2` or `--tp N` moves the same run onto managed workers. It handles one request at a time: a demo, not a server.
+</Note>
+
+# Architecture
+
+The policy path shares the Cosmos3 transformer with the generation path. Its request adds an action latent, a domain id, and a mode. Video and action travel through the same denoising loop, and the mode only decides which of them is a clean condition and which is generated.
+
+<Tree>
+  <Tree.Folder name="phyai/src/phyai/models/cosmos3" defaultOpen>
+    <Tree.File name="main_cosmos3_policy.py" />
+    <Tree.File name="scheduler_cosmos3_policy.py" />
+    <Tree.File name="model_runner_policy_cosmos3.py" />
+    <Tree.File name="model_runner_vae_cosmos3.py" />
+    <Tree.File name="modeling_cosmos3.py" />
+    <Tree.File name="vae_wan.py" />
+    <Tree.File name="sampler_unipc.py" />
+  </Tree.Folder>
+</Tree>
+
+| Component | Responsibility |
+| --- | --- |
+| `Cosmos3PolicyEntry` | Loads the transformer, and the VAE when `decode_video=True` |
+| `Cosmos3PolicyScheduler` | Builds the clean and noised masks for the chosen mode, then runs UniPC |
+| `Cosmos3ActionRunner` | Calls the transformer and returns video and action velocities |
+| `Cosmos3PolicyProcessor` | Prepares observation, prompt, action padding, and domain id; slices and denormalizes the output |
+
+# The three modes
+
+`policy` has the shape of a control loop: observation plus task in, action chunk out. The first observation frame is the clean condition; everything after it, video and action alike, is generated from noise. The question it answers is "given this scene, what should the robot do?"
+
+`forward_dynamics` hands the model an observation and a known action and asks for the video. The action is the clean condition and the video is the target. The question is "if the robot does this, what happens next?" This mode needs `--action-file`.
+
+`inverse_dynamics` runs the other way. You give it a video and it recovers the action chunk that would explain the change. The whole video is clean; the action is recovered from noise. The question is "what moved the scene from A to B?"
+
+# Input contract
+
+`Cosmos3PolicyProcessor.preprocess()` takes a dict. The example script builds it from the CLI arguments:
+
+```python
+raw_input = {
+    "images": observation,
+    "task": prompt,
+    "cond_action": action,  # required only for forward_dynamics
+}
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `images` | Image path, PIL image, numpy array, torch tensor, or a list of them | One image is one frame; a list is a multi-frame observation |
+| `task` / `prompt` | `str` or `list[str]` | The first item of a list is used |
+| `cond_action` / `action` | list, numpy array, or `torch.Tensor` | `forward_dynamics` only |
+| `domain_name` / `domain_id` | `str` or `int` | Overrides the processor default |
+| `mode` | `str` | Overrides the processor default |
+
+Images become `(1, 3, T, H, W)` in `[-1, 1]`. With `--video` the script reads the first `action_chunk_size + 1` frames and repeats the last one when the clip is short.
+
+# Domain and action dimensions
+
+Actions have two widths. `action_dim` is the model's internal width, `64` by default. `raw_action_dim` is the real width of the robot's action space. The processor pads conditioning actions up to `action_dim` and slices the output back down to `raw_action_dim`.
+
+| `domain_name` | `domain_id` | `raw_action_dim` |
+| --- | ---: | ---: |
+| `bridge_orig_lerobot` | 7 | 10 |
+| `droid_lerobot` | 8 | 10 |
+| `agibotworld` | 15 | 29 |
+| `fractal` | 20 | 10 |
+
+An integer `domain_id` carries no width, so pass `--raw-action-dim` alongside it.
+
+# Run path
+
+<Steps>
+  <Step title="Prepare weights">
+    Download <a href="https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID" target="_blank" rel="noreferrer">Cosmos3-Nano-Policy-DROID</a>. The policy path needs at least:
+
+    ```text
+    /path/to/Cosmos3-Nano-Policy-DROID/
+      transformer/
+      text_tokenizer/
+      scheduler/
+      vae/             # required when decode_video=True
+    ```
+  </Step>
+
+  <Step title="Construct the engine">
+    The plugin is `"cosmos3_policy"`. With `decode_video=True` the VAE is loaded and decoded rollout pixels come back with the action.
+
+    ```python
+    import torch
+
+    from phyai.engine import Engine, EngineArgs
+    from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+    from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+
+    checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_policy",
+            plugin_args=Cosmos3PolicyArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=None,
+                decode_video=True,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        )
+    )
+    ```
+
+    `use_karras_sigmas=None` reads the schedule from the checkpoint; `False` switches to linear flow with `flow_shift`.
+  </Step>
+
+  <Step title="Construct the processor">
+    The processor resizes and pads the observation, tokenizes the prompt, pads the action, resolves the domain id, and later slices the output.
+
+    ```python
+    import torch
+
+    from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device="cuda",
+        params_dtype=torch.bfloat16,
+    )
+    ```
+  </Step>
+
+  <Step title="Preprocess input">
+    ```python
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    ```
+
+    `processed.video_shape` is still in pixels. Convert it with `pixel_to_latent_shape` when you build the request.
+  </Step>
+
+  <Step title="Build the request">
+    ```python
+    from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to("cuda"),
+        text_mask=processed.text_mask.to("cuda"),
+        neg_text_ids=processed.neg_text_ids.to("cuda"),
+        neg_text_mask=processed.neg_text_mask.to("cuda"),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(
+            device="cuda", dtype=torch.bfloat16
+        ),
+        cond_action=(
+            processed.cond_action.to(device="cuda", dtype=torch.bfloat16)
+            if processed.cond_action is not None
+            else None
+        ),
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+    ```
+  </Step>
+
+  <Step title="Step and postprocess">
+    ```python
+    result = engine.step(request)
+    output = processor.postprocess(result)
+    action = output["action"]
+    pixels = output.get("pixels")
+    ```
+
+    `action` always comes back, shaped `(1, action_chunk, raw_action_dim)`. `pixels` appears when the engine was built with `decode_video=True`, in `[0, 1]`.
+  </Step>
+</Steps>
+
+# Script examples
+
+Predict an action from a single image:
+
+```bash
+uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot picks up the cup" \
+    --domain-name droid_lerobot \
+    --out .cache/cosmos3_policy_out
+```
+
+Two files land in `.cache/`: `cosmos3_policy_out_action.json` with the action chunk, and `cosmos3_policy_out.mp4` when pixels were decoded.
+
+Roll out a video from a known action:
+
+```bash
+uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot pushes the object forward" \
+    --domain-name droid_lerobot \
+    --mode forward_dynamics \
+    --action-file action.json \
+    --out .cache/cosmos3_forward_out
+```
+
+`action.json` takes either of these shapes; the numbers are placeholders. DROID actions are `10` wide, and a chunk shorter than `action_chunk_size` is padded by repeating its last step.
+
+```json
+{
+  "shape": [2, 10],
+  "dtype": "float32",
+  "data": [
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  ]
+}
+```
+
+```json
+{
+  "action_chunks": [
+    [
+      [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ]
+  ]
+}
+```
+
+Recover the action from an observation video:
+
+```bash
+uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --video obs.mp4 \
+    --prompt "robot moves the cup to the right" \
+    --domain-name droid_lerobot \
+    --mode inverse_dynamics \
+    --condition-frames 0,1 \
+    --out .cache/cosmos3_inverse_out
+```
+
+Without `--condition-frames`, an image conditions on frame `0` and a video on frames `0,1`.
+
+# Output postprocessing
+
+`Cosmos3PolicyProcessor.postprocess()` pulls `action` out of the result, slices it to `raw_action_dim`, and, when you gave it `action_stats_path`, denormalizes it back to physical units:
+
+| `action_normalization` | Required stats fields |
+| --- | --- |
+| `meanstd` | `mean`, `std` |
+| `minmax` | `min`, `max` |
+| `quantile` | `q01`, `q99` |
+| `quantile_rot` | `global_raw.q01`, `global_raw.q99` |
+
+Without stats the action stays in the model's normalized scale. Switching embodiment means switching weights, domain, and stats together.
+
+# Multi-GPU execution
+
+The policy plugin takes the same `ParallelConfig` fields as the generation plugin. `tp_size` shards the transformer and is the knob that matters here: the examples run with `guidance_scale=1.0`, so `cfg_size=2` would compute an unconditional branch only to discard it (the scheduler warns when it sees this). A run needs `cfg_size * tp_size` GPUs, picked with `CUDA_VISIBLE_DEVICES` on the launching process.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 uv run python examples/cosmos3/run_cosmos3_policy.py \
+    --checkpoint /path/to/Cosmos3-Nano-Policy-DROID \
+    --image observation.png \
+    --prompt "robot picks up the cup" \
+    --domain-name droid_lerobot \
+    --tp 2 \
+    --out .cache/cosmos3_policy_tp2
+```
+
+In Python, add a `parallel` block to `EngineConfig` and build the processor with `device="cpu"`, so the request stays on the CPU while the workers own the GPUs. Keep the engine behind an `if __name__ == "__main__":` guard, because workers start with `spawn` and re-import the main module. The `deployment` argument is optional and only extends the startup timeout here.
+
+```python
+import torch
+
+from phyai import DeploymentConfig, Engine, EngineArgs
+from phyai.engine_config import (
+    AttentionParallelConfig,
+    DenseParallelConfig,
+    DeviceConfig,
+    EngineConfig,
+    ParallelConfig,
+    RuntimeConfig,
+)
+from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+from phyai.server import WorkerSupervisorConfig
+from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+tp_size = 2  # transformer tensor parallelism; one GPU per rank
+
+
+def main() -> None:
+    engine = Engine(
+        EngineArgs(
+            plugin="cosmos3_policy",
+            plugin_args=Cosmos3PolicyArgs(
+                checkpoint_dir=checkpoint_dir,
+                flow_shift=10.0,
+                use_karras_sigmas=None,
+                decode_video=True,
+            ),
+            config=EngineConfig(
+                device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
+                parallel=ParallelConfig(
+                    dense=DenseParallelConfig(tp_size=tp_size),
+                    attention=AttentionParallelConfig(tp_size=tp_size),
+                ),
+                runtime=RuntimeConfig(use_cuda_graph=False),
+            ),
+        ),
+        deployment=DeploymentConfig(
+            process_config=WorkerSupervisorConfig(startup_timeout_s=1800.0),
+        ),
+    )
+    assert engine.mode == "local"
+
+    try:
+        processor = Cosmos3PolicyProcessor(
+            tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+            height=480,
+            width=832,
+            num_frames=17,
+            mode="policy",
+            domain_name="droid_lerobot",
+            action_chunk_size=16,
+            fps=24.0,
+            image_size=480,
+            prompt_format="json",
+            view_point="ego_view",
+            cond_frame_indexes=(0,),
+            device="cpu",  # the workers own the GPUs; inputs stay on the CPU
+            params_dtype=torch.bfloat16,
+        )
+        processed = processor.preprocess(
+            {
+                "images": "/path/to/observation.png",
+                "task": "robot picks up the cup",
+            }
+        )
+        request = Cosmos3ActionRequest(
+            text_ids=processed.text_ids,
+            text_mask=processed.text_mask,
+            neg_text_ids=processed.neg_text_ids,
+            neg_text_mask=processed.neg_text_mask,
+            video_shape=pixel_to_latent_shape(*processed.video_shape),
+            mode=processed.mode,
+            domain_id=processed.domain_id,
+            action_chunk=processed.action_chunk,
+            raw_action_dim=processed.raw_action_dim,
+            cond_video_pixels=processed.pixel_values,
+            cond_action=processed.cond_action,
+            cond_frame_indexes=processed.cond_frame_indexes,
+            fps=24.0,
+            num_inference_steps=30,
+            guidance_scale=1.0,
+            seed=42,
+        )
+
+        result = engine.step(request)
+        output = processor.postprocess(result)
+        print(output["action"].shape)
+    finally:
+        engine.close()
+
+
+# Workers start with the "spawn" method and re-import this module, so the
+# engine must sit behind the guard.
+if __name__ == "__main__":
+    main()
+```
+
+`engine.step()` returns CUDA-IPC views of the output rank's tensors; the postprocessor moves the action, and the pixels when there are any, to the CPU. `tp_size` must divide both the attention heads and the KV heads (1, 2, 4, or 8 for this checkpoint), with dense and attention TP kept equal. Replicas and external launchers are covered in [Parallel serving](/deployment/parallel-serving).
+
+# Full example
+
+```python
+import torch
+
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.cosmos3 import Cosmos3ActionRequest, pixel_to_latent_shape
+from phyai.models.cosmos3.main_cosmos3_policy import Cosmos3PolicyArgs
+from phyai_utils_tools.models.cosmos3 import Cosmos3PolicyProcessor
+
+checkpoint_dir = "/path/to/Cosmos3-Nano-Policy-DROID"
+device = "cuda"
+dtype = torch.bfloat16
+
+engine = Engine(
+    EngineArgs(
+        plugin="cosmos3_policy",
+        plugin_args=Cosmos3PolicyArgs(
+            checkpoint_dir=checkpoint_dir,
+            flow_shift=10.0,
+            use_karras_sigmas=None,
+            decode_video=True,
+        ),
+        config=EngineConfig(
+            device=DeviceConfig(target=device, params_dtype=dtype),
+            runtime=RuntimeConfig(use_cuda_graph=False),
+        ),
+    )
+)
+
+try:
+    processor = Cosmos3PolicyProcessor(
+        tokenizer_name_or_path=f"{checkpoint_dir}/text_tokenizer",
+        height=480,
+        width=832,
+        num_frames=17,
+        mode="policy",
+        domain_name="droid_lerobot",
+        action_chunk_size=16,
+        fps=24.0,
+        image_size=480,
+        prompt_format="json",
+        view_point="ego_view",
+        cond_frame_indexes=(0,),
+        device=device,
+        params_dtype=dtype,
+    )
+
+    processed = processor.preprocess(
+        {
+            "images": "/path/to/observation.png",
+            "task": "robot picks up the cup",
+        }
+    )
+    request = Cosmos3ActionRequest(
+        text_ids=processed.text_ids.to(device),
+        text_mask=processed.text_mask.to(device),
+        neg_text_ids=processed.neg_text_ids.to(device),
+        neg_text_mask=processed.neg_text_mask.to(device),
+        video_shape=pixel_to_latent_shape(*processed.video_shape),
+        mode=processed.mode,
+        domain_id=processed.domain_id,
+        action_chunk=processed.action_chunk,
+        raw_action_dim=processed.raw_action_dim,
+        cond_video_pixels=processed.pixel_values.to(device=device, dtype=dtype),
+        cond_action=(
+            processed.cond_action.to(device=device, dtype=dtype)
+            if processed.cond_action is not None
+            else None
+        ),
+        cond_frame_indexes=processed.cond_frame_indexes,
+        fps=24.0,
+        num_inference_steps=30,
+        guidance_scale=1.0,
+        seed=42,
+    )
+
+    result = engine.step(request)
+    output = processor.postprocess(result)
+    print(output["action"].shape)
+finally:
+    engine.close()
+```

@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from phyai.engine_config import get_engine_config, resolve_engine_defaults
-from phyai.layers.attention.attention.layer import Attention
+from phyai.engine_config import get_engine_config, resolve_params_dtype
+from phyai.layers.attention.nocache.layer import Attention
 from phyai.layers.layer_norm import RMSNorm
 from phyai.layers.linear import (
     QKVParallelLinear,
@@ -265,6 +265,7 @@ class Cosmos3CausalAttention(nn.Module):
         self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
             hidden_size,
+            group="attention_tp",
             bias=False,
             input_is_parallel=True,
             params_dtype=params_dtype,
@@ -351,6 +352,7 @@ class Cosmos3CrossAttention(nn.Module):
         self.to_out = RowParallelLinear(
             num_attention_heads * head_dim,
             hidden_size,
+            group="attention_tp",
             bias=False,
             input_is_parallel=True,
             params_dtype=params_dtype,
@@ -625,9 +627,7 @@ class Cosmos3Transformer(nn.Module):
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
-        params_dtype, attn_backend, norm_backend = resolve_engine_defaults(
-            params_dtype, attn_backend, norm_backend
-        )
+        params_dtype = resolve_params_dtype(params_dtype)
         if device is None:
             device = get_engine_config().device.target
         self.config = config

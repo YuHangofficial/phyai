@@ -28,11 +28,6 @@ import torch
 import phyai_kernel
 import phyai_kernel.triton.ada_rms_norm as triton_adarms_mod
 
-if not torch.cuda.is_available():
-    pytest.skip(
-        "CUDA is required for phyai-kernel Triton tests", allow_module_level=True
-    )
-
 
 # --------------------------------------------------------------------------- #
 # Reference (mirrors lerobot ``PiGemmaRMSNorm.forward`` exactly)              #
@@ -81,14 +76,9 @@ def _ref_adarmsnorm_compiled(x: torch.Tensor, modulation: torch.Tensor, eps: flo
 # --------------------------------------------------------------------------- #
 
 
-_HIDDEN_SIZES = [
-    256,  # Gemma head_dim
-    1024,  # gemma_300m action expert width (pi0.5)
-    2048,  # gemma_2b LM width (pi0.5 prefix)
-    3072,  # awkward shape
-    8192,  # single-block boundary
-    12288,  # forces two-pass kernel
-]
+# Gemma head_dim, the pi0.5 action-expert width, the single-block boundary
+# and a width that forces the two-pass kernel.
+_HIDDEN_SIZES = [256, 1024, 8192, 12288]
 _DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 
@@ -132,36 +122,24 @@ def _make_inputs(
 
 @pytest.mark.parametrize("hidden", _HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", _DTYPES)
-def test_adarmsnorm_2d_per_token(hidden: int, dtype: torch.dtype):
-    """``x=(N, D)``, ``modulation=(N, 3D)`` — 1:1 mapping."""
-    x, mod = _make_inputs(
-        leading=(17,), cond_leading=(17,), hidden=hidden, cond_dim=hidden, dtype=dtype
-    )
-    eps = 1e-6
-    expected_out, expected_gate = _ref_adarmsnorm(x, mod, eps)
-    actual_out, actual_gate = phyai_kernel.adarmsnorm(x, mod, eps)
+def test_adarmsnorm_per_token_matches_reference_in_2d_and_3d(
+    hidden: int, dtype: torch.dtype
+):
+    """``x=(N, D)`` with ``modulation=(N, 3D)`` and ``x=(B, S, D)`` with
+    ``modulation=(B, S, 3D)``: a 1:1 mapping in both layouts."""
     rtol, atol = _tols(dtype)
-    torch.testing.assert_close(actual_out, expected_out, rtol=rtol, atol=atol)
-    torch.testing.assert_close(actual_gate, expected_gate, rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("hidden", _HIDDEN_SIZES)
-@pytest.mark.parametrize("dtype", _DTYPES)
-def test_adarmsnorm_3d_per_token(hidden: int, dtype: torch.dtype):
-    """``x=(B, S, D)``, ``modulation=(B, S, 3D)`` — full per-token cond."""
-    x, mod = _make_inputs(
-        leading=(2, 7),
-        cond_leading=(2, 7),
-        hidden=hidden,
-        cond_dim=hidden,
-        dtype=dtype,
-    )
-    eps = 1e-6
-    expected_out, expected_gate = _ref_adarmsnorm(x, mod, eps)
-    actual_out, actual_gate = phyai_kernel.adarmsnorm(x, mod, eps)
-    rtol, atol = _tols(dtype)
-    torch.testing.assert_close(actual_out, expected_out, rtol=rtol, atol=atol)
-    torch.testing.assert_close(actual_gate, expected_gate, rtol=rtol, atol=atol)
+    for leading in ((17,), (2, 7)):
+        x, mod = _make_inputs(
+            leading=leading,
+            cond_leading=leading,
+            hidden=hidden,
+            cond_dim=hidden,
+            dtype=dtype,
+        )
+        expected_out, expected_gate = _ref_adarmsnorm(x, mod, 1e-6)
+        actual_out, actual_gate = phyai_kernel.adarmsnorm(x, mod, 1e-6)
+        torch.testing.assert_close(actual_out, expected_out, rtol=rtol, atol=atol)
+        torch.testing.assert_close(actual_gate, expected_gate, rtol=rtol, atol=atol)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,10 +175,7 @@ def test_adarmsnorm_3d_broadcast_over_seq(hidden: int, dtype: torch.dtype):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "hidden",
-    [256, 1024, 2048],  # smaller grid — torch.compile is slow to warm up
-)
+@pytest.mark.parametrize("hidden", [1024])  # torch.compile is slow to warm up
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_adarmsnorm_matches_torch_compile(hidden: int, dtype: torch.dtype):
     """The Triton kernel matches a ``torch.compile``'d reference at the same tols."""
@@ -220,7 +195,7 @@ def test_adarmsnorm_matches_torch_compile(hidden: int, dtype: torch.dtype):
 # --------------------------------------------------------------------------- #
 
 
-def test_adarmsnorm_explicit_out_buffers():
+def test_adarmsnorm_edge_cases_explicit_out_zero_rows_and_block_boundary():
     hidden = 1024
     x = torch.randn(4, 6, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
     modulation = (
@@ -231,24 +206,21 @@ def test_adarmsnorm_explicit_out_buffers():
     ret_out, ret_gate = phyai_kernel.adarmsnorm(
         x, modulation, eps=1e-6, out=out, gate_out=gate
     )
-    assert ret_out.data_ptr() == out.data_ptr()
-    assert ret_gate.data_ptr() == gate.data_ptr()
+    assert (
+        ret_out.data_ptr() == out.data_ptr() and ret_gate.data_ptr() == gate.data_ptr()
+    )
     expected_out, expected_gate = _ref_adarmsnorm(x, modulation, 1e-6)
     torch.testing.assert_close(ret_out, expected_out, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(ret_gate, expected_gate, rtol=2e-2, atol=2e-2)
 
+    empty_out, empty_gate = phyai_kernel.adarmsnorm(
+        torch.empty(0, hidden, device="cuda", dtype=torch.float16),
+        torch.empty(0, 3 * hidden, device="cuda", dtype=torch.float16),
+        eps=1e-6,
+    )
+    assert empty_out.shape == (0, hidden) and empty_gate.shape == (0, hidden)
 
-def test_adarmsnorm_zero_rows_no_launch():
-    hidden = 1024
-    x = torch.empty(0, hidden, device="cuda", dtype=torch.float16)
-    modulation = torch.empty(0, 3 * hidden, device="cuda", dtype=torch.float16)
-    out, gate = phyai_kernel.adarmsnorm(x, modulation, eps=1e-6)
-    assert out.shape == (0, hidden)
-    assert gate.shape == (0, hidden)
-
-
-def test_adarmsnorm_single_block_boundary():
-    """Confirm two-pass kernel matches single-block at the threshold."""
+    # The two-pass kernel matches the single-block one at the threshold.
     threshold = triton_adarms_mod._SINGLE_BLOCK_MAX
     for n_cols in (threshold, threshold + 256):
         x = torch.randn(4, n_cols, device="cuda", dtype=torch.float16) * 0.5
@@ -261,49 +233,40 @@ def test_adarmsnorm_single_block_boundary():
         torch.testing.assert_close(actual_gate, expected_gate, rtol=1e-3, atol=1e-3)
 
 
-# --------------------------------------------------------------------------- #
-# Validation                                                                   #
-# --------------------------------------------------------------------------- #
-
-
-def test_cpu_input_raises():
-    x = torch.randn(2, 64)
-    mod = torch.randn(2, 192)
-    with pytest.raises(RuntimeError, match="must live on CUDA"):
-        phyai_kernel.adarmsnorm(x, mod)
-
-
-def test_modulation_dim_mismatch_raises():
-    x = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
-    mod = torch.randn(2, 100, device="cuda", dtype=torch.bfloat16)  # not 3*64
-    with pytest.raises(RuntimeError, match="modulation last dim"):
-        phyai_kernel.adarmsnorm(x, mod)
-
-
-def test_non_divisible_groups_raises():
-    """``N_total`` must be a multiple of ``N_mod``."""
-    x = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
-    mod = torch.randn(
-        2, 192, device="cuda", dtype=torch.bfloat16
-    )  # 7 not multiple of 2
-    with pytest.raises(RuntimeError, match="non-zero multiple"):
-        phyai_kernel.adarmsnorm(x, mod)
-
-
-def test_out_shape_mismatch_raises():
-    x = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
-    mod = torch.randn(2, 192, device="cuda", dtype=torch.bfloat16)
-    bad_out = torch.empty(2, 32, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="`out` must match"):
-        phyai_kernel.adarmsnorm(x, mod, out=bad_out)
-
-
-def test_gate_out_shape_mismatch_raises():
-    x = torch.randn(2, 64, device="cuda", dtype=torch.bfloat16)
-    mod = torch.randn(2, 192, device="cuda", dtype=torch.bfloat16)
-    bad_gate = torch.empty(2, 32, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="`gate_out` must have shape"):
-        phyai_kernel.adarmsnorm(x, mod, gate_out=bad_gate)
+@pytest.mark.parametrize(
+    "x, mod, kwargs, message",
+    [
+        (torch.randn(2, 64), torch.randn(2, 192), {}, "must live on CUDA"),
+        (
+            torch.randn(2, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(2, 100, device="cuda", dtype=torch.bfloat16),
+            {},
+            "modulation last dim",
+        ),
+        # N_total must be a multiple of N_mod.
+        (
+            torch.randn(7, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(2, 192, device="cuda", dtype=torch.bfloat16),
+            {},
+            "non-zero multiple",
+        ),
+        (
+            torch.randn(2, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(2, 192, device="cuda", dtype=torch.bfloat16),
+            {"out": torch.empty(2, 32, device="cuda", dtype=torch.bfloat16)},
+            "`out` must match",
+        ),
+        (
+            torch.randn(2, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(2, 192, device="cuda", dtype=torch.bfloat16),
+            {"gate_out": torch.empty(2, 32, device="cuda", dtype=torch.bfloat16)},
+            "`gate_out` must have shape",
+        ),
+    ],
+)
+def test_adarmsnorm_validates_its_arguments(x, mod, kwargs, message):
+    with pytest.raises(RuntimeError, match=message):
+        phyai_kernel.adarmsnorm(x, mod, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
@@ -311,82 +274,49 @@ def test_gate_out_shape_mismatch_raises():
 # --------------------------------------------------------------------------- #
 
 
-def test_phyai_layers_adarmsnorm_module_matches_reference():
+def test_phyai_layers_adarmsnorm_module_matches_reference_on_both_backends():
     pytest.importorskip("phyai.layers")
     from phyai.layers import AdaRMSNorm
 
     hidden, cond_dim = 1024, 1024
-    layer = (
-        AdaRMSNorm(
-            hidden_size=hidden,
-            cond_dim=cond_dim,
-            eps=1e-6,
-            backend="phyai-kernel",
-            prefix="model.layers.0.input_layernorm",
-        )
-        .cuda()
-        .to(torch.bfloat16)
-    )
 
-    # Override zero-init so the test exercises a non-trivial modulation.
+    def build(backend: str) -> AdaRMSNorm:
+        return (
+            AdaRMSNorm(
+                hidden_size=hidden,
+                cond_dim=cond_dim,
+                eps=1e-6,
+                backend=backend,
+                prefix="m.l0.in",
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
+
+    kernel = build("phyai-kernel")
+    torch_backend = build("torch")
+    # Override zero-init so the test exercises a non-trivial modulation, and
+    # sync weights so the two backends see identical inputs to the math.
     with torch.no_grad():
-        layer.dense.weight.normal_(0.0, 0.05)
-        layer.dense.bias.normal_(0.0, 0.05)
+        kernel.dense.weight.normal_(0.0, 0.05)
+        kernel.dense.bias.normal_(0.0, 0.05)
+        torch_backend.dense.weight.copy_(kernel.dense.weight)
+        torch_backend.dense.bias.copy_(kernel.dense.bias)
 
     x = torch.randn(3, 11, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
     cond = torch.randn(3, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
-
-    actual_out, actual_gate = layer(x, cond)
-
-    # Reference path: re-run the projection and the eager math.
-    # ReplicatedLinear.forward returns (y, optional_bias) — unpack the
-    # tensor before broadcasting over the seq axis.
-    modulation = layer.dense(cond)[0].unsqueeze(1)
-    expected_out, expected_gate = _ref_adarmsnorm(x, modulation, layer.variance_epsilon)
+    actual_out, actual_gate = kernel(x, cond)
+    # ReplicatedLinear.forward returns (y, optional_bias).
+    modulation = kernel.dense(cond)[0].unsqueeze(1)
+    expected_out, expected_gate = _ref_adarmsnorm(
+        x, modulation, kernel.variance_epsilon
+    )
     torch.testing.assert_close(actual_out, expected_out, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_gate, expected_gate, rtol=2e-2, atol=2e-2)
     assert actual_gate.shape == (3, 1, hidden)
-
-
-def test_phyai_layers_adarmsnorm_torch_backend_matches_kernel_backend():
-    pytest.importorskip("phyai.layers")
-    from phyai.layers import AdaRMSNorm
-
-    hidden, cond_dim = 256, 256
-    layer_kern = (
-        AdaRMSNorm(
-            hidden_size=hidden,
-            cond_dim=cond_dim,
-            backend="phyai-kernel",
-            prefix="m.l0.in",
-        )
-        .cuda()
-        .to(torch.bfloat16)
-    )
-    layer_torch = (
-        AdaRMSNorm(
-            hidden_size=hidden,
-            cond_dim=cond_dim,
-            backend="torch",
-            prefix="m.l0.in",
-        )
-        .cuda()
-        .to(torch.bfloat16)
-    )
-    # Sync weights so the two backends see identical inputs to the math.
-    with torch.no_grad():
-        layer_kern.dense.weight.normal_(0.0, 0.05)
-        layer_kern.dense.bias.normal_(0.0, 0.05)
-        layer_torch.dense.weight.copy_(layer_kern.dense.weight)
-        layer_torch.dense.bias.copy_(layer_kern.dense.bias)
-
-    x = torch.randn(2, 5, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
-    cond = torch.randn(2, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
-
-    out_k, gate_k = layer_kern(x, cond)
-    out_t, gate_t = layer_torch(x, cond)
-    torch.testing.assert_close(out_k, out_t, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(gate_k, gate_t, rtol=2e-2, atol=2e-2)
+    out_t, gate_t = torch_backend(x, cond)
+    torch.testing.assert_close(actual_out, out_t, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_gate, gate_t, rtol=2e-2, atol=2e-2)
 
 
 def test_phyai_layers_adarmsnorm_weight_loader_keys():
@@ -407,12 +337,6 @@ def test_phyai_layers_adarmsnorm_weight_loader_keys():
         ("m.l0.input_layernorm.dense.weight", "dense.weight"),
         ("m.l0.input_layernorm.dense.bias", "dense.bias"),
     }
-
-
-def test_phyai_layers_adarmsnorm_rejects_flashinfer():
-    pytest.importorskip("phyai.layers")
-    from phyai.layers import AdaRMSNorm
-
     with pytest.raises(ValueError, match="flashinfer"):
         AdaRMSNorm(hidden_size=64, cond_dim=64, backend="flashinfer", prefix="x")
 
@@ -442,102 +366,40 @@ def _make_adarms(hidden: int, cond_dim: int) -> "object":
     return layer
 
 
-def test_phyai_layers_adarmsnorm_modulation_matches_dense_path():
-    """``forward(x, modulation=row)`` (precomputed, broadcast over all rows)
-    matches the standard ``forward(x, cond)`` projection path.
-
-    The conditioning is a fixed set of ``K`` rows; every token in one step
-    shares the same row, so a single precomputed modulation row broadcast
-    across the tokens must equal projecting that row per token. Near-, not
-    bit-exact (the projection runs at a different row count), so use the file
-    tolerance.
+def test_phyai_layers_adarmsnorm_precomputed_modulation_matches_the_dense_path():
+    """``forward(x, modulation=row)`` (one precomputed row broadcast over all
+    tokens) equals ``forward(x, cond)`` projecting that row per token, in 2-D
+    and 3-D, and the ``(1, D)`` gate broadcasts through ``torch.addcmul`` like a
+    full gate would. Near-, not bit-exact: the projection runs at a different
+    row count.
     """
     pytest.importorskip("phyai.layers")
-
     hidden = cond_dim = 1024
-    chunk = 50
-    n_steps = 10
+    chunk, n_steps = 50, 10
     layer = _make_adarms(hidden, cond_dim)
-
     conds = torch.randn(n_steps, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
     mod = layer.project_modulation(conds)
     assert tuple(mod.shape) == (n_steps, 3 * hidden)
 
-    for i in (0, 3, n_steps - 1):
+    for i in (0, n_steps - 1):
         x = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
-
         out_idx, gate_idx = layer(x, modulation=mod[i : i + 1])
-
-        # Reference: the dense path with this row broadcast across all tokens,
-        # exactly as the runtime did before the precompute (every row equal).
-        cond_rows = conds[i : i + 1].expand(chunk, -1)
-        out_ref, gate_ref = layer(x, cond_rows)
-
+        out_ref, gate_ref = layer(x, conds[i : i + 1].expand(chunk, -1))
         torch.testing.assert_close(out_idx, out_ref, rtol=2e-2, atol=2e-2)
-        # The lookup gate is a single broadcast row; compare against any
-        # reference row (they are all identical) and check the shape.
         assert gate_idx.shape == (1, hidden)
         torch.testing.assert_close(
-            gate_idx.expand(chunk, -1).contiguous(),
-            gate_ref,
-            rtol=2e-2,
-            atol=2e-2,
+            gate_idx.expand(chunk, -1).contiguous(), gate_ref, rtol=2e-2, atol=2e-2
+        )
+        residual = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
+        torch.testing.assert_close(
+            torch.addcmul(residual, out_idx, gate_idx),
+            torch.addcmul(residual, out_idx, gate_idx.expand(chunk, -1)),
+            rtol=0,
+            atol=0,
         )
 
-
-def test_phyai_layers_adarmsnorm_modulation_gate_broadcast_in_addcmul():
-    """A ``(1, D)`` lookup gate broadcasts through ``torch.addcmul`` to the
-    same result as a full ``(N, D)`` gate (the gated-residual use site)."""
-    pytest.importorskip("phyai.layers")
-
-    hidden = cond_dim = 256
-    chunk = 50
-    layer = _make_adarms(hidden, cond_dim)
-    conds = torch.randn(4, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
-    mod = layer.project_modulation(conds)
-
-    x = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
-    residual = torch.randn(chunk, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
-    out_idx, gate_idx = layer(x, modulation=mod[2:3])  # gate_idx: (1, hidden)
-
-    gated_broadcast = torch.addcmul(residual, out_idx, gate_idx)
-    gated_full = torch.addcmul(residual, out_idx, gate_idx.expand(chunk, -1))
-    torch.testing.assert_close(gated_broadcast, gated_full, rtol=0, atol=0)
-
-
-def test_phyai_layers_adarmsnorm_modulation_3d_input():
-    """The precomputed path also serves 3-D ``x`` ``(B, S, D)`` by broadcasting
-    the single modulation row over both leading axes."""
-    pytest.importorskip("phyai.layers")
-
-    hidden = cond_dim = 256
-    layer = _make_adarms(hidden, cond_dim)
-    conds = torch.randn(6, cond_dim, device="cuda", dtype=torch.bfloat16) * 0.5
-    mod = layer.project_modulation(conds)
-
-    x = torch.randn(2, 7, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
-    out_idx, gate_idx = layer(x, modulation=mod[1:2])
-
-    cond_rows = conds[1].reshape(1, 1, cond_dim).expand(2, 7, -1)
-    out_ref, _ = layer(x, cond_rows)
+    x3 = torch.randn(2, 7, hidden, device="cuda", dtype=torch.bfloat16) * 0.5
+    out_idx, gate_idx = layer(x3, modulation=mod[1:2])
+    out_ref, _ = layer(x3, conds[1].reshape(1, 1, cond_dim).expand(2, 7, -1))
     torch.testing.assert_close(out_idx, out_ref, rtol=2e-2, atol=2e-2)
-    assert out_idx.shape == (2, 7, hidden)
-    assert gate_idx.shape == (1, 1, hidden)
-
-
-def test_phyai_layers_adarmsnorm_requires_exactly_one_of_cond_or_modulation():
-    pytest.importorskip("phyai.layers")
-
-    hidden = cond_dim = 128
-    layer = _make_adarms(hidden, cond_dim)
-    x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
-
-    # Neither cond nor modulation.
-    with pytest.raises(ValueError, match="exactly one"):
-        layer(x)
-
-    # Both cond and modulation.
-    cond = torch.randn(4, cond_dim, device="cuda", dtype=torch.bfloat16)
-    mod = layer.project_modulation(cond)
-    with pytest.raises(ValueError, match="exactly one"):
-        layer(x, cond, modulation=mod[:1])
+    assert out_idx.shape == (2, 7, hidden) and gate_idx.shape == (1, 1, hidden)

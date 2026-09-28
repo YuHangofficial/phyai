@@ -1,19 +1,15 @@
-"""TorchKernel — PyTorch-native fallback (``F.linear`` / ``_scaled_mm``).
+"""PyTorch-native GEMMs — the always-available fallback.
 
-Always present (registered last when iterating the decorator-gathered
-list in :func:`phyai.layers.linear.init`) so ``validate()`` can find a
-candidate for every probed spec. The fp8 paths require sm≥89; block-fp8
-falls back to a dequant + ``F.linear`` reference path that is correct
-but slow.
+``F.linear`` and ``torch._scaled_mm``. These rows are registered
+unconditionally, so ``validate()`` can find a candidate for every probed spec
+regardless of what is installed. The fp8 paths require sm89+; block-fp8 falls
+back to a dequantize + ``F.linear`` reference that is correct but slow.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
-from phyai.layers.linear.backend import Granularity, KernelProbe
-from phyai.layers.linear.registry import register_linear_kernel
 
 
 _FP8_E4M3_AMAX = 448.0
@@ -54,9 +50,19 @@ def _linear_nvfp4_scale(
     scale: torch.Tensor,
     weight_shape: tuple[int, ...],
 ) -> torch.Tensor:
-    """Return the logical ``(N, K//16)`` scale view from a padded scale tensor."""
+    """Return the logical ``(N, K//16)`` scale view.
+
+    The reference path accepts both the simple ``linear`` layout and the
+    FlashInfer ``128x4`` padded layout. The latter stores one scale row per
+    128 output channels and four K-block columns per scale column, so expand
+    those tiles before slicing the logical matrix.
+    """
     N, K_half = weight_shape
     k_blocks = (K_half * 2) // 16
+    if scale.shape[0] < N:
+        scale = scale.repeat_interleave(128, dim=0)
+    if scale.shape[1] < k_blocks:
+        scale = scale.repeat_interleave(4, dim=1)
     return scale[:N, :k_blocks]
 
 
@@ -69,135 +75,107 @@ def _dequant_nvfp4_weight(layer: torch.nn.Module) -> torch.Tensor:
     return fp4 * scale * global_scale
 
 
-@register_linear_kernel()
-class TorchKernel:
-    """F.linear + torch._scaled_mm paths. Always registered as a fallback."""
+# --------------------------------------------------------------------------- #
+# GEMM entry points
+# --------------------------------------------------------------------------- #
+#
+# Module-level functions, not methods on a namespace class. They never touched
+# ``self`` -- the class existed only to group them, which cost a stringly-typed
+# ``importlib`` + two ``getattr`` calls at the one place that binds them, and
+# forced the tests to instantiate a stateless object to reach a private method.
+#
+# Which of these runs, and on what hardware, is declared in
+# :mod:`phyai.kernel.ops.gemm`: one catalog row per storage format, each naming
+# its own eligibility conditions.
+#
+# fp8 paths prefer ``spec.quantize_activation`` for uniformity.
 
-    name = "torch"
 
-    def supports_capture(self) -> bool:
-        return True
+def gemm_fp8_per_tensor(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    spec = layer.spec
+    act = spec.quantize_activation(x, layer)
+    # _scaled_mm wants (M, K) x (K, N). We stored weight as (N, K)
+    # row-major; ``.t()`` gives the column-major (K, N) view that
+    # cuBLASLt requires.
+    K = act.x.shape[-1]
+    x_2d = act.x.reshape(-1, K)
+    # Per-tensor weight scale after process_after_loading is
+    # per-channel shape (N,); broadcast it as (1, N).
+    w_scale = layer.weight_scale
+    if w_scale.ndim == 1:
+        w_scale = w_scale.reshape(1, -1).contiguous()
+    # Static per-tensor input scale with shape (M, 1).
+    a_scale = layer.input_scale
+    if a_scale.ndim == 1 and a_scale.numel() == 1:
+        a_scale = a_scale.view(1, 1).expand(x_2d.shape[0], 1).contiguous()
+    out = torch._scaled_mm(
+        x_2d,
+        layer.weight.t(),
+        scale_a=a_scale,
+        scale_b=w_scale,
+        bias=bias,
+        out_dtype=x.dtype,
+    )
+    return out.reshape(*x.shape[:-1], -1)
 
-    def can_handle(self, probe: KernelProbe) -> bool:
-        if probe.spec_id == "bf16":
-            return True
-        if probe.spec_id.startswith("fp8_"):
-            # torch._scaled_mm requires sm89+ and K dim divisible by 16.
-            if probe.sm < 89:
-                return False
-            if probe.spec_id.startswith("fp8_block_"):
-                # Dequant reference path — works everywhere the dtype exists.
-                return True
-            if probe.K % 16 != 0 or probe.N % 16 != 0:
-                return False
-            return True
-        if probe.spec_id == "nvfp4_block_16_linear":
-            return True
-        return False
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        spec = layer.spec
-        if spec.spec_id == "bf16":
-            return F.linear(x, layer.weight, bias)
+def gemm_fp8_per_channel(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    spec = layer.spec
+    act = spec.quantize_activation(x, layer)
+    K = act.x.shape[-1]
+    x_2d = act.x.reshape(-1, K)
+    # act.x_scale has the same leading shape as x (per-token scalar per row).
+    a_scale = act.x_scale.reshape(-1, 1)
+    b_scale = layer.weight_scale.reshape(1, -1)
+    out = torch._scaled_mm(
+        x_2d,
+        layer.weight.t(),
+        scale_a=a_scale,
+        scale_b=b_scale,
+        bias=bias,
+        out_dtype=x.dtype,
+    )
+    return out.reshape(*x.shape[:-1], -1)
 
-        if spec.spec_id == "fp8_per_tensor":
-            return self._fp8_per_tensor(layer, x, bias)
-        if spec.spec_id == "fp8_per_channel":
-            return self._fp8_per_channel(layer, x, bias)
-        if spec.spec_id.startswith("fp8_block_"):
-            return self._fp8_block(layer, x, bias)
-        if spec.spec_id == "nvfp4_block_16_linear":
-            return self._nvfp4_reference(layer, x, bias)
 
-        raise RuntimeError(f"TorchKernel got unhandled spec_id={spec.spec_id!r}")
+def gemm_fp8_block(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Reference dequant + F.linear path. Correct but not fast —
+    flashinfer's ``gemm_fp8_nt_groupwise`` is the intended winner."""
+    spec = layer.spec
+    assert spec.block_shape is not None
+    w = layer.weight.to(x.dtype) * _expand_block_scale(
+        layer.weight_scale,
+        tuple(layer.weight.shape),
+        spec.block_shape,
+    ).to(x.dtype)
+    return F.linear(x, w, bias)
 
-    # ------------------------------------------------------------------
-    # fp8 paths — prefer spec.quantize_activation for uniformity
-    # ------------------------------------------------------------------
 
-    def _fp8_per_tensor(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        spec = layer.spec
-        act = spec.quantize_activation(x, layer)
-        # _scaled_mm wants (M, K) x (K, N). We stored weight as (N, K)
-        # row-major; ``.t()`` gives the column-major (K, N) view that
-        # cuBLASLt requires.
-        K = act.x.shape[-1]
-        x_2d = act.x.reshape(-1, K)
-        # Per-tensor weight scale after process_after_loading is
-        # per-channel shape (N,); broadcast it as (1, N).
-        w_scale = layer.weight_scale
-        if w_scale.ndim == 1:
-            w_scale = w_scale.reshape(1, -1).contiguous()
-        # Static per-tensor input scale with shape (M, 1).
-        a_scale = layer.input_scale
-        if a_scale.ndim == 1 and a_scale.numel() == 1:
-            a_scale = a_scale.view(1, 1).expand(x_2d.shape[0], 1).contiguous()
-        out = torch._scaled_mm(
-            x_2d,
-            layer.weight.t(),
-            scale_a=a_scale,
-            scale_b=w_scale,
-            bias=bias,
-            out_dtype=x.dtype,
-        )
-        return out.reshape(*x.shape[:-1], -1)
+def gemm_nvfp4_reference(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Reference dequant + F.linear path. Correct but not fast."""
+    w = _dequant_nvfp4_weight(layer).to(x.dtype)
+    return F.linear(x, w, bias)
 
-    def _fp8_per_channel(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        spec = layer.spec
-        act = spec.quantize_activation(x, layer)
-        K = act.x.shape[-1]
-        x_2d = act.x.reshape(-1, K)
-        # act.x_scale has the same leading shape as x (per-token scalar per row).
-        a_scale = act.x_scale.reshape(-1, 1)
-        b_scale = layer.weight_scale.reshape(1, -1)
-        out = torch._scaled_mm(
-            x_2d,
-            layer.weight.t(),
-            scale_a=a_scale,
-            scale_b=b_scale,
-            bias=bias,
-            out_dtype=x.dtype,
-        )
-        return out.reshape(*x.shape[:-1], -1)
 
-    def _fp8_block(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Reference dequant + F.linear path. Correct but not fast —
-        flashinfer's ``gemm_fp8_nt_groupwise`` is the intended winner."""
-        spec = layer.spec
-        assert spec.block_shape is not None
-        w = layer.weight.to(x.dtype) * _expand_block_scale(
-            layer.weight_scale,
-            tuple(layer.weight.shape),
-            spec.block_shape,
-        ).to(x.dtype)
-        return F.linear(x, w, bias)
-
-    def _nvfp4_reference(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Reference dequant + F.linear path. Correct but not fast."""
-        w = _dequant_nvfp4_weight(layer).to(x.dtype)
-        return F.linear(x, w, bias)
+__all__ = [
+    "gemm_fp8_block",
+    "gemm_fp8_per_channel",
+    "gemm_fp8_per_tensor",
+    "gemm_nvfp4_reference",
+]

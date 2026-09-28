@@ -16,7 +16,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
     "Tags": ["VLA", "flow-matching", "PaliGemma", "SigLIP", "single-GPU"],
     "Image Input": "2 or 3 RGB cameras · 224×224",
     "Tokenizer Length": "48",
-    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">PI0WS1Scheduler</code>,
+    "Entry Point": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">PI0Scheduler</code>,
     "Plugin": <code className="px-2 py-0.5 rounded bg-[#003399]/10 dark:bg-[#60A5FA]/15 text-[#003399] dark:text-[#60A5FA] text-xs font-mono">pi0</code>,
     "Param Precision": "bf16, with fp32 vision by default",
     "Action Chunk": "50 steps × 32 dims",
@@ -27,7 +27,7 @@ import { ModelCard } from "/snippets/model-card.jsx"
 
 pi0 turns camera views, task text, and robot state into a chunk of future actions. Its `ws1` path keeps the entire inference path on one GPU. The vision and language stacks build a reusable prefix; conditioned on that prefix and the robot state, the action expert turns noise into an action chunk through flow matching.
 
-`PI0WS1Scheduler` implements only this single-GPU path. It has no tensor parallelism, continuous batching, or preemption.
+`PI0Scheduler` implements only this single-GPU path. It has no tensor parallelism, continuous batching, or preemption.
 
 <Note>
   Robot state enters pi0 as a numeric token on the expert side. In pi0.5, discretized state bins become part of the language prompt instead.
@@ -40,7 +40,7 @@ The request enters PhyAI through its <Tooltip headline="Engine + plugin" tip="En
 <Tree>
   <Tree.Folder name="phyai/src/phyai/models/pi0" defaultOpen>
     <Tree.File name="main_pi0.py" />
-    <Tree.File name="scheduler_ws1_pi0.py" />
+    <Tree.File name="scheduler_pi0.py" />
     <Tree.File name="model_runner_pi0.py" />
     <Tree.File name="modeling_pi0.py" />
     <Tree.File name="configuration_pi0.py" />
@@ -55,7 +55,7 @@ The request enters PhyAI through its <Tooltip headline="Engine + plugin" tip="En
 | `PI0VisionRunner` | Runs the vision tower, with optional CUDA graph capture |
 | `PI0LLMRunner` | Runs the PaliGemma prefix pass and writes prefix K/V into the shared cache |
 | `PI0ExpertRunner` | Runs the expert state/action passes for each flow-matching step |
-| `PI0WS1Scheduler` | Orchestrates one complete inference request on a single GPU |
+| `PI0Scheduler` | Orchestrates one complete inference request on a single GPU |
 
 # Model layout
 
@@ -181,7 +181,7 @@ For each request, the runners refresh their static input buffers and replay the 
     `PI0Processor`, provided by `phyai-utils-tools`, converts raw robot observations into the tensors expected by `PI0Request`.
 
     ```python
-    from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request
+    from phyai.models.pi0.scheduler_pi0 import PI0Request
     from phyai_utils_tools.models.pi0 import PI0Processor
 
     processor = PI0Processor(
@@ -281,7 +281,7 @@ The default leaves the vision tower in fp32. Add `--vision-dtype bfloat16` only 
 
 # Current limitations
 
-Graph reuse depends on fixed geometry. `PI0WS1Scheduler` fixes `max_batch_size` when the single-GPU engine is built, while CUDA graph capture also fixes the camera count, image size, and tokenizer length. Changing any of them requires a new engine. The vision tower replays once for each real batch item rather than batching those items together.
+Graph reuse depends on fixed geometry. `PI0Scheduler` fixes `max_batch_size` when the single-GPU engine is built, while CUDA graph capture also fixes the camera count, image size, and tokenizer length. Changing any of them requires a new engine. The vision tower replays once for each real batch item rather than batching those items together.
 
 The scheduler begins after preprocessing. Image resize, tokenization, state padding, and action unnormalization belong to `PI0Processor`; requests passed directly to the engine must already satisfy that contract.
 
@@ -296,7 +296,7 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi0.configuration_pi0 import PI0Config
 from phyai.models.pi0.main_pi0 import PI0Args
-from phyai.models.pi0.scheduler_ws1_pi0 import PI0Request
+from phyai.models.pi0.scheduler_pi0 import PI0Request
 from phyai.utils import load_config
 
 CHECKPOINT_DIR = Path("/path/to/pi0_pytorch")

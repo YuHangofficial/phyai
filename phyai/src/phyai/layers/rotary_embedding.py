@@ -73,18 +73,7 @@ import torch
 import torch.nn as nn
 
 from phyai.engine_config import get_engine_config
-
-
-_VALID_BACKENDS: tuple[str, ...] = ("flashinfer", "eager")
-
-
-def _resolve_backend(name: str) -> str:
-    canonical = name.replace("_", "-").lower()
-    if canonical not in _VALID_BACKENDS:
-        raise ValueError(
-            f"Unknown RoPE backend {name!r}; expected one of {_VALID_BACKENDS!r}."
-        )
-    return canonical
+from phyai.kernel.call import CallSite, backend_preference
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +234,61 @@ def _apply_interleaved(
     return q_out, k_out
 
 
+def gather_cos_sin(
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    interleave: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather cos/sin rows from a ``(max_pos, rotary_dim)`` cache.
+
+    The cache stores concatenated ``[cos | sin]`` halves. The returned
+    tensors have shape ``(*positions.shape, rotary_dim)`` in the cache
+    dtype, laid out for the requested geometry: rotate-half duplicates
+    each half along the last dim (``[c0, c1, ..., c0, c1, ...]``);
+    interleave repeats each entry twice in place (``[c0, c0, c1, c1, ...]``).
+    """
+    pos = positions.to(cos_sin_cache.device).long()
+    cs = cos_sin_cache[pos]  # (*pos.shape, rotary_dim)
+    cos_h, sin_h = cs.chunk(2, dim=-1)  # each (*pos.shape, rotary_dim/2)
+    if interleave:
+        return (
+            cos_h.repeat_interleave(2, dim=-1),
+            sin_h.repeat_interleave(2, dim=-1),
+        )
+    return torch.cat([cos_h, cos_h], dim=-1), torch.cat([sin_h, sin_h], dim=-1)
+
+
+def apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    interleave: bool = False,
+    rotary_dim: int | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Rotate Q/K with caller-supplied cos/sin, partial-rotary aware.
+
+    Rotates the leading ``rotary_dim`` channels (default: all of them)
+    and passes the trailing channels through unchanged. The head axis is
+    auto-broadcast via ``unsqueeze_dim=-2``, matching phyai's
+    ``(..., H, D)`` layout for both padded and ragged inputs.
+    """
+    apply_fn = _apply_interleaved if interleave else apply_rotary_pos_emb
+    cos = cos.to(dtype=q.dtype, device=q.device)
+    sin = sin.to(dtype=q.dtype, device=q.device)
+    if rotary_dim is not None and rotary_dim < q.shape[-1]:
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+        q_rot, k_rot = apply_fn(q_rot, k_rot, cos, sin, unsqueeze_dim=-2)
+        return (
+            torch.cat([q_rot, q_pass], dim=-1),
+            torch.cat([k_rot, k_pass], dim=-1),
+        )
+    return apply_fn(q, k, cos, sin, unsqueeze_dim=-2)
+
+
 def compute_cos_sin_from_inv_freq(
     positions: torch.Tensor,
     inv_freq: torch.Tensor,
@@ -393,7 +437,7 @@ class RotaryEmbedding(nn.Module):
         rope_scaling: dict | None = None,
         partial_rotary_factor: float = 1.0,
         interleave: bool = False,
-        backend: str = "flashinfer",
+        backend: str | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
@@ -429,19 +473,20 @@ class RotaryEmbedding(nn.Module):
         self.rope_scaling = dict(rope_scaling or {})
         self.partial_rotary_factor = partial_rotary_factor
         self.interleave = interleave
-        self.backend = _resolve_backend(backend)
+        self.backend = backend
+        self.kernel_role = "rope"
+        self._prefer = backend_preference("rope", backend)
+        # One CallSite per layer: static facts live on the site, per-call
+        # selection is a pay-per-use memo hit instead of a fresh query.
+        self._call_site = CallSite(
+            "rope",
+            role=self.kernel_role,
+            prefer=self._prefer,
+            dims={"head_dim": head_dim, "rotary_dim": rotary_dim},
+            attrs={"rope_type": rope_type, "interleave": interleave},
+        )
         if device is None:
             device = get_engine_config().device.target
-
-        if self.backend == "flashinfer":
-            # Fail fast at construction rather than at first forward.
-            try:
-                import flashinfer.rope  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "backend='flashinfer' but flashinfer is not installed; "
-                    "either install flashinfer-python or pass backend='eager'."
-                ) from e
 
         inv_freq, attention_scaling = ROPE_INV_FREQ_FNS[rope_type](
             rotary_dim, rope_theta, device=device, **self.rope_scaling
@@ -477,9 +522,28 @@ class RotaryEmbedding(nn.Module):
         call.
         """
         self._check_shapes(positions, q, k)
-        if self.backend == "flashinfer":
-            return self._forward_flashinfer(positions, q, k)
-        return self._forward_eager(positions, q, k)
+        if self.cos_sin_cache.device != q.device:
+            # Checked here rather than inside one kernel's body: a module whose
+            # buffers live on another device is a caller mistake, and letting
+            # selection quietly fall back to a device-matching implementation
+            # would hide it.
+            raise RuntimeError(
+                f"cos_sin_cache is on {self.cos_sin_cache.device} but q is on "
+                f"{q.device}; call ``rotary_emb.to(q.device)`` once before "
+                f"forward."
+            )
+        tokens = int(q.shape[0] * q.shape[1] if q.dim() == 4 else q.shape[0])
+        handle = self._call_site.select(
+            device=q.device,
+            dtype={"input": q.dtype},
+            dims={
+                "tokens": tokens,
+                "heads_q": q.shape[-2],
+                "heads_k": k.shape[-2],
+            },
+            attrs={"rank": q.dim()},
+        )
+        return handle.execute(positions, q, k, self.cos_sin_cache)
 
     def _check_shapes(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
@@ -515,77 +579,6 @@ class RotaryEmbedding(nn.Module):
                     f"k={tuple(k.shape)}."
                 )
 
-    # ---------------------------- flashinfer ---------------------------- #
-
-    def _forward_flashinfer(
-        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from flashinfer.rope import apply_rope_with_cos_sin_cache
-
-        if self.cos_sin_cache.device != q.device:
-            raise RuntimeError(
-                f"cos_sin_cache is on {self.cos_sin_cache.device} but q is on "
-                f"{q.device}; call ``rotary_emb.to(q.device)`` once before "
-                f"forward."
-            )
-
-        orig_q_shape = q.shape
-        orig_k_shape = k.shape
-        if q.dim() == 4:
-            B, S = q.shape[0], q.shape[1]
-            H_q = q.shape[2]
-            H_k = k.shape[2]
-            nnz = B * S
-            flat_q = q.reshape(nnz, H_q * self.head_dim)
-            flat_k = k.reshape(nnz, H_k * self.head_dim)
-            pos = positions
-            if pos.dim() == 1:
-                if pos.shape[0] != S:
-                    raise ValueError(
-                        f"1-D positions length {pos.shape[0]} does not "
-                        f"match S={S} for 4-D q."
-                    )
-                pos = pos.unsqueeze(0).expand(B, S)
-            elif pos.shape != (B, S):
-                raise ValueError(
-                    f"positions shape {tuple(pos.shape)} != (B, S)=({B}, {S})."
-                )
-            flat_pos = pos.reshape(nnz)
-        else:  # 3-D
-            nnz = q.shape[0]
-            H_q = q.shape[1]
-            H_k = k.shape[1]
-            flat_q = q.reshape(nnz, H_q * self.head_dim)
-            flat_k = k.reshape(nnz, H_k * self.head_dim)
-            if positions.dim() != 1 or positions.shape[0] != nnz:
-                raise ValueError(
-                    f"positions shape {tuple(positions.shape)} does not "
-                    f"match (nnz,)=({nnz},) for 3-D q."
-                )
-            flat_pos = positions
-        flat_pos = flat_pos.contiguous().to(torch.int32)
-
-        q_out, k_out = apply_rope_with_cos_sin_cache(
-            positions=flat_pos,
-            query=flat_q.contiguous(),
-            key=flat_k.contiguous(),
-            head_size=self.head_dim,
-            cos_sin_cache=self.cos_sin_cache,
-            is_neox=not self.interleave,
-        )
-        return q_out.view(orig_q_shape), k_out.view(orig_k_shape)
-
-    # ------------------------------ eager ------------------------------ #
-
-    def _forward_eager(
-        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Eager path: gather cos/sin from the cache and apply via
-        # :meth:`apply`. Sharing the apply path with the
-        # precomputed-cos/sin route keeps the two numerically identical.
-        cos, sin = self.get_cos_sin(positions)
-        return self.apply(q, k, cos, sin)
-
     # ------------------------------------------------------------------ #
     # Precomputed cos/sin                                                #
     # ------------------------------------------------------------------ #
@@ -615,16 +608,7 @@ class RotaryEmbedding(nn.Module):
             :meth:`apply` (which uses ``unsqueeze_dim=-2``) or with their
             own unsqueeze.
         """
-        pos = positions.to(self.cos_sin_cache.device).long()
-        cs = self.cos_sin_cache[pos]  # (*pos.shape, rotary_dim)
-        cos_h, sin_h = cs.chunk(2, dim=-1)  # each (*pos.shape, rotary_dim/2)
-        if self.interleave:
-            cos = cos_h.repeat_interleave(2, dim=-1)
-            sin = sin_h.repeat_interleave(2, dim=-1)
-        else:
-            cos = torch.cat([cos_h, cos_h], dim=-1)
-            sin = torch.cat([sin_h, sin_h], dim=-1)
-        return cos, sin
+        return gather_cos_sin(self.cos_sin_cache, positions, interleave=self.interleave)
 
     def apply(
         self,
@@ -642,18 +626,14 @@ class RotaryEmbedding(nn.Module):
         matching phyai's ``(..., H, D)`` layout for both padded and
         ragged inputs.
         """
-        apply_fn = _apply_interleaved if self.interleave else apply_rotary_pos_emb
-        cos = cos.to(dtype=q.dtype, device=q.device)
-        sin = sin.to(dtype=q.dtype, device=q.device)
-        if self.rotary_dim < self.head_dim:
-            q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
-            k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
-            q_rot, k_rot = apply_fn(q_rot, k_rot, cos, sin, unsqueeze_dim=-2)
-            return (
-                torch.cat([q_rot, q_pass], dim=-1),
-                torch.cat([k_rot, k_pass], dim=-1),
-            )
-        return apply_fn(q, k, cos, sin, unsqueeze_dim=-2)
+        return apply_rope(
+            q,
+            k,
+            cos,
+            sin,
+            interleave=self.interleave,
+            rotary_dim=self.rotary_dim,
+        )
 
     # ------------------------------------------------------------------ #
 
@@ -715,6 +695,13 @@ class InterleavedMRotaryEmbedding(RotaryEmbedding):
     backend:
         Defaults to ``"eager"`` — the flashinfer fused kernel has no mRoPE
         path, and :meth:`get_cos_sin` is backend-independent regardless.
+
+        Deliberately *not* ``None`` like the base class. ``None`` means "let the
+        catalog decide", and the catalog does not model mRoPE: ``flashinfer.rope``
+        declares a dtype and a ``rotary_dim == head_dim`` requirement, nothing
+        about interleaved sections, so it would look eligible and then compute
+        the wrong thing. Declare that constraint on the catalog row before
+        loosening this.
     """
 
     def __init__(
@@ -791,9 +778,11 @@ class InterleavedMRotaryEmbedding(RotaryEmbedding):
 __all__ = [
     "RotaryEmbedding",
     "InterleavedMRotaryEmbedding",
+    "apply_rope",
     "apply_rotary_pos_emb",
     "compute_cos_sin_from_inv_freq",
     "compute_qwen3vl_mrope_cos_sin_from_inv_freq",
+    "gather_cos_sin",
     "rotate_half",
     "ROPE_INV_FREQ_FNS",
 ]

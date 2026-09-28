@@ -40,9 +40,9 @@ from phyai.models.minicpm_gr00t.model_runner_minicpm_gr00t import (
     build_vision_position_ids,
     group_spatial_2x2,
 )
-from phyai.models.minicpm_gr00t.scheduler_ws1_minicpm_gr00t import (
+from phyai.models.minicpm_gr00t.scheduler_minicpm_gr00t import (
     MiniCPMGR00TRequest,
-    MiniCPMGR00TWS1Scheduler,
+    MiniCPMGR00TScheduler,
 )
 
 
@@ -74,7 +74,7 @@ __all__ = [
     "MiniCPMGR00TVLM",
     "MiniCPMGR00TVisionLayout",
     "MiniCPMGR00TRequest",
-    "MiniCPMGR00TWS1Scheduler",
+    "MiniCPMGR00TScheduler",
     "build_action_time_sinusoid",
     "build_dit_time_sinusoid",
     "build_vision_layout",

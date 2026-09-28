@@ -23,17 +23,13 @@ from phyai.models.cosmos3.modeling_cosmos3 import (
     cosmos3_weight_remap,
 )
 from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
-from phyai.models.cosmos3.scheduler_ws1_cosmos3 import (
+from phyai.models.cosmos3.requests_cosmos3 import (
     Cosmos3T2VRequest,
-    Cosmos3T2VScheduler,
     pixel_to_latent_shape,
 )
-from phyai.models.cosmos3.scheduler_ws1_cosmos3_policy import (
-    Cosmos3ActionRequest,
-    Cosmos3PolicyScheduler,
-)
-from phyai.models.cosmos3.scheduler_wn_cosmos3 import Cosmos3T2VWNScheduler
-from phyai.models.cosmos3.scheduler_wn_cosmos3_policy import Cosmos3PolicyWNScheduler
+from phyai.models.cosmos3.requests_cosmos3_policy import Cosmos3ActionRequest
+from phyai.models.cosmos3.scheduler_cosmos3 import Cosmos3T2VScheduler
+from phyai.models.cosmos3.scheduler_cosmos3_policy import Cosmos3PolicyScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
 
 
@@ -51,8 +47,6 @@ __all__ = [
     "cosmos3_avae_weight_remap",
     "Cosmos3T2VScheduler",
     "Cosmos3PolicyScheduler",
-    "Cosmos3T2VWNScheduler",
-    "Cosmos3PolicyWNScheduler",
     "Cosmos3T2VRunner",
     "Cosmos3ActionRunner",
     "Cosmos3VAERunner",

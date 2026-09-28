@@ -10,12 +10,19 @@ dependencies = [
     "torch==2.11.0",
     "safetensors",
     "torchvision==0.26.0",
-    "flashinfer-python==v0.6.12",
+    "flashinfer-python[cu13]==v0.6.17",
     "flash-linear-attention>=0.5.1",
     "transformers==5.8.1",
     "huggingface-hub",
     "tqdm",
+    "pyyaml",
+    "setproctitle",
+    "flash-qla",
+    "nvidia-ml-py",
 ]
+
+[project.scripts]
+phyai = "phyai.cli:main"
 
 [project.optional-dependencies]
 ext = ["phyai-ext"]
