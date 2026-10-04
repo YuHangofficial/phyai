@@ -1201,8 +1201,8 @@ class LingBotV2TokenMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         mesh = resolve_mesh("model")
-        self.tp_size = mesh.axis_size("tp")
-        self.tp_rank = mesh.axis_local_rank("tp")
+        self.tp_size = mesh.group_size("moe_tp")
+        self.tp_rank = mesh.group_rank("moe_tp")
         if config.moe_intermediate_size % self.tp_size != 0:
             raise ValueError(
                 f"moe_intermediate_size={config.moe_intermediate_size} must be "
@@ -1236,13 +1236,13 @@ class LingBotV2TokenMoE(nn.Module):
                     offset=0,
                     size=local_intermediate,
                     dim=1,
-                    axis="tp",
+                    group="moe_tp",
                 ),
                 "gate": _Leg(
                     offset=local_intermediate,
                     size=local_intermediate,
                     dim=1,
-                    axis="tp",
+                    group="moe_tp",
                 ),
             },
             mesh=mesh,
@@ -1260,7 +1260,7 @@ class LingBotV2TokenMoE(nn.Module):
         self.expert_down_proj.hf_keys = [(f"{prefix}.experts.down_proj", None)]
         self.expert_down_proj.weight_loader = sharded(
             dim=2,
-            axis="tp",
+            group="moe_tp",
             mesh=mesh,
         )
 
@@ -1307,7 +1307,7 @@ class LingBotV2TokenMoE(nn.Module):
             tp_rank=self.tp_rank,
         )
         if self.tp_size > 1:
-            routed = P.all_reduce(routed, axis="tp")
+            routed = P.all_reduce(routed, group="moe_tp", mesh=mesh)
 
         shared = self.shared_expert(hidden_flat)
         return (routed + shared).reshape(original_shape)

@@ -309,7 +309,6 @@ def main() -> None:
                 ),
                 runtime=RuntimeConfig(
                     use_cuda_graph=True,
-                    force_linear_kernel=args.linear_kernel,
                 ),
             ),
         )
