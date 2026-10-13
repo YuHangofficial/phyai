@@ -17,6 +17,7 @@ from torch import nn
 
 import phyai.parallel as P
 from phyai.layers.mlp import DenseMLP
+from phyai.kernel.call import CallSite
 from phyai.layers.conv import Conv3d
 from phyai.layers.quant import Bf16Spec
 from phyai.engine_config import get_engine_config, resolve_params_dtype
@@ -85,37 +86,6 @@ def _official_topk_router(
     if routed_scaling_factor != 1.0:
         routing_weights = routing_weights * routed_scaling_factor
     return routing_weights, selected_experts
-
-
-def _flashinfer_fused_moe(
-    hidden_states: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    fc1_expert_weights: torch.Tensor,
-    fc2_expert_weights: torch.Tensor,
-    *,
-    tp_size: int,
-    tp_rank: int,
-) -> torch.Tensor:
-    """Run only selected SwiGLU experts with FlashInfer CUTLASS MoE."""
-    from flashinfer.fused_moe import cutlass_fused_moe
-
-    # LingBot rounds routing weights to the model dtype before expert compute,
-    # while FlashInfer requires token_final_scales to be stored as FP32.
-    token_final_scales = routing_weights.float()
-    token_selected_experts = selected_experts.to(torch.int32)
-    outputs = cutlass_fused_moe(
-        hidden_states,
-        token_selected_experts,
-        token_final_scales,
-        fc1_expert_weights,
-        fc2_expert_weights,
-        hidden_states.dtype,
-        quant_scales=None,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-    )
-    return outputs[0]
 
 
 def get_vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
@@ -1228,6 +1198,15 @@ class LingBotV2TokenMoE(nn.Module):
             config.moe_intermediate_size // self.tp_size
         )
 
+        # Expert geometry is fixed at construction, so it belongs on the
+        # call site; only the token count varies between calls.
+        self._moe_call = CallSite(
+            "moe",
+            role="lingbot_v2.token_moe",
+            dims={"hidden": hidden_size},
+            attrs={"activation": "swiglu"},
+        )
+
         # FlashInfer SwiGLU expects FC1 in [up, gate] order. Fuse and TP-shard
         # the public checkpoint's separate [E, I, H] tensors at load time.
         self.expert_gate_up_proj = nn.Parameter(
@@ -1313,7 +1292,15 @@ class LingBotV2TokenMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
         routing_weights = routing_weights.to(hidden_flat.dtype)
-        routed = _flashinfer_fused_moe(
+        selection = self._moe_call.select(
+            device=hidden_flat.device,
+            dtype={
+                "input": hidden_flat.dtype,
+                "weight": self.expert_gate_up_proj.dtype,
+            },
+            dims={"tokens": hidden_flat.shape[0]},
+        )
+        routed = selection.execute(
             hidden_flat,
             selected_experts,
             routing_weights,
