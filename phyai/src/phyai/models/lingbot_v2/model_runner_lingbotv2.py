@@ -910,9 +910,14 @@ class LingBotV2ExpertRunner(ModelRunner):
         )
 
         for layer in self.expert_stack.layers:
+            input_modulation = layer.input_layernorm.compute_modulation(cond)
+            post_modulation = layer.post_attention_layernorm.compute_modulation(cond)
+
             state_hidden = layer(
                 state_hidden,
                 cond=cond,
+                input_modulation=input_modulation,
+                post_modulation=post_modulation,
                 rope=self.mrope,
                 cos=state_cos,
                 sin=state_sin,
@@ -922,6 +927,8 @@ class LingBotV2ExpertRunner(ModelRunner):
             action_hidden = layer(
                 action_hidden,
                 cond=cond,
+                input_modulation=input_modulation,
+                post_modulation=post_modulation,
                 rope=self.mrope,
                 cos=action_cos,
                 sin=action_sin,

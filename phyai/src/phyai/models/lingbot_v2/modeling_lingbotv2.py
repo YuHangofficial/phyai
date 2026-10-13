@@ -1116,7 +1116,21 @@ class LingBotV2AdaRMSNorm(nn.Module):
             if self.beta.bias is not None:
                 self.beta.bias.zero_()
 
-    def forward(self, hidden_states: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def compute_modulation(
+        self, cond: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute condition-dependent gamma and beta once."""
+        gamma, _ = self.gamma(cond.to(self.gamma.weight.dtype))
+        beta, _ = self.beta(cond.to(self.beta.weight.dtype))
+        return gamma, beta
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Apply RMS normalization modulated by the diffusion condition."""
 
         input_dtype = hidden_states.dtype
@@ -1124,8 +1138,10 @@ class LingBotV2AdaRMSNorm(nn.Module):
         variance = normed.square().mean(dim=-1, keepdim=True)
         normed = normed * torch.rsqrt(variance + self.variance_epsilon)
         normed = self.weight.float() * normed
-        gamma, _ = self.gamma(cond.to(self.gamma.weight.dtype))
-        beta, _ = self.beta(cond.to(self.beta.weight.dtype))
+        if modulation is None:
+            gamma, beta = self.compute_modulation(cond)
+        else:
+            gamma, beta = modulation
         while gamma.dim() < normed.dim():
             gamma = gamma.unsqueeze(-2)
             beta = beta.unsqueeze(-2)
@@ -1413,11 +1429,15 @@ class LingBotV2ExpertLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_ctx: PagedAttnCtx,
+        input_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+        post_modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Apply joint diffusion attention, normalization, and the MLP path."""
 
         residual = hidden_states
-        normed = self.input_layernorm(hidden_states, cond)
+        normed = self.input_layernorm(
+            hidden_states, cond, modulation=input_modulation
+        )
         fused, _ = self.qkv_proj(normed)
         q, k, v = self._split_qkv(fused, hidden_states.shape[:-1])
         # Official joint attention promotes every stream's Q/K/V before MRoPE.
@@ -1437,7 +1457,9 @@ class LingBotV2ExpertLayer(nn.Module):
         attn_out, _ = self.o_proj(attn_out)
         hidden_states = residual + attn_out
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states, cond)
+        hidden_states = self.post_attention_layernorm(
+            hidden_states, cond, modulation=post_modulation
+        )
         return residual + self.mlp(hidden_states)
 
 
