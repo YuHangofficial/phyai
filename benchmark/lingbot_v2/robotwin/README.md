@@ -146,7 +146,23 @@ The output contains:
 - `lingbot-v2-robotwin-success.csv`;
 - `lingbot-v2-robotwin-success.md`.
 
-Each backend output also contains `protocol.env`. A result directory is
-rejected when its recorded instruction split, simulator source hash, seed, or
-task config differs from the requested run. This prevents `--resume` from
-mixing results produced under different simulator contracts.
+Each backend output also contains `protocol.env`, the evaluation protocol its
+logs were produced under. It records:
+
+- `schema` -- manifest format version;
+- `policy_name` -- backend label (`LingBotV2_Official` or `LingBotV2_PHYAI`);
+- `endpoint` -- the `host:port` of the bridge that served the run;
+- `task_config` -- the RoboTwin task config name;
+- `task_config_sha256` -- SHA-256 of that task config file;
+- `instruction_type` -- `seen` or `unseen`;
+- `execution_mode` -- the action execution mode (`chunk`);
+- `seed_group` -- the RoboTwin seed group;
+- `expert_check` -- whether expert filtering was enabled;
+- `action_type` -- the action space (`joint`);
+- `eval_script_sha256` -- SHA-256 of the RoboTwin evaluation script.
+
+The whole manifest is compared, so a difference in any field rejects the
+directory -- not only the instruction split, evaluation-script hash, seed, or
+task config. Rerunning against a different bridge port, for example, is
+refused even though the simulator contract is unchanged. This prevents
+`--resume` from mixing results produced under different simulator contracts.

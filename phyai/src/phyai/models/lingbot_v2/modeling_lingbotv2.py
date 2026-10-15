@@ -1187,6 +1187,10 @@ class LingBotV2TokenMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         mesh = resolve_mesh("model")
+        # `forward` runs the tensor-parallel collective, so the mesh has to
+        # outlive `__init__`; keeping it as a local alone made the
+        # `tp_size > 1` branch raise NameError at the first step.
+        self.mesh = mesh
         self.tp_size = mesh.group_size("moe_tp")
         self.tp_rank = mesh.group_rank("moe_tp")
         if config.moe_intermediate_size % self.tp_size != 0:
@@ -1310,7 +1314,10 @@ class LingBotV2TokenMoE(nn.Module):
             tp_rank=self.tp_rank,
         )
         if self.tp_size > 1:
-            routed = P.all_reduce(routed, group="moe_tp", mesh=mesh)
+            # Only the routed expert output is reduced.  The shared expert
+            # is replicated, so folding it in here would multiply its
+            # contribution by tp_size.
+            routed = P.all_reduce(routed, group="moe_tp", mesh=self.mesh)
 
         shared = self.shared_expert(hidden_flat)
         return (routed + shared).reshape(original_shape)

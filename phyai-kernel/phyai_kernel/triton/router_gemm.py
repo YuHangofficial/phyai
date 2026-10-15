@@ -157,6 +157,27 @@ def _check_inputs(
                 "phyai_kernel.triton.fp32_router_gemm: `out` must be a "
                 "contiguous float32 tensor with the expected shape and device"
             )
+        # The kernel stores `out` while other programs may still be loading
+        # `x`, `weight`, or `bias`, so an aliased `out` silently corrupts its
+        # own inputs -- one program's store can land before another
+        # program's load.  Storage identity is compared instead of byte
+        # ranges because a strided input's accessed range is not bounded by
+        # ``numel * element_size``, which would make a range test unsound.
+        # The price is that a provably disjoint `out` carved from the same
+        # allocation is refused too; pass a separate buffer instead.
+        if out.numel() > 0:
+            for name, source in (("x", x), ("weight", weight), ("bias", bias)):
+                if source is None or source.numel() == 0:
+                    continue
+                if (
+                    out.untyped_storage().data_ptr()
+                    == source.untyped_storage().data_ptr()
+                ):
+                    raise RuntimeError(
+                        "phyai_kernel.triton.fp32_router_gemm: `out` must "
+                        f"not share storage with `{name}`; pass a "
+                        "separate buffer"
+                    )
 
 
 def fp32_router_gemm(
@@ -211,26 +232,35 @@ def fp32_router_gemm(
     block_n = triton.next_power_of_2(min(N, 32))
     block_k = 128
     grid = (M, triton.cdiv(N, block_n))
-    _fp32_router_gemm_kernel[grid](
-        x_2d,
-        weight,
-        bias_ptr,
-        output_2d,
-        M,
-        N,
-        K,
-        x_2d.stride(0),
-        x_2d.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        bias.stride(0) if has_bias else 0,
-        output_2d.stride(0),
-        output_2d.stride(1),
-        HAS_BIAS=has_bias,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        num_warps=4,
-    )
+    # Triton launches on the *current* device, which is not necessarily
+    # `x.device`.  Entering the input's device keeps the launch and its
+    # stream on the tensors' device, and the caller's device is restored
+    # even when the launch raises.
+    origin_device = torch.cuda.current_device()
+    try:
+        with torch.cuda.device(x.device):
+            _fp32_router_gemm_kernel[grid](
+                x_2d,
+                weight,
+                bias_ptr,
+                output_2d,
+                M,
+                N,
+                K,
+                x_2d.stride(0),
+                x_2d.stride(1),
+                weight.stride(0),
+                weight.stride(1),
+                bias.stride(0) if has_bias else 0,
+                output_2d.stride(0),
+                output_2d.stride(1),
+                HAS_BIAS=has_bias,
+                BLOCK_N=block_n,
+                BLOCK_K=block_k,
+                num_warps=4,
+            )
+    finally:
+        torch.cuda.set_device(origin_device)
     return output
 
 

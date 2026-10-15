@@ -75,8 +75,12 @@ def spy(monkeypatch):
     return calls
 
 
-def build_module():
-    """Assemble the module the way its own ``__init__`` would, minus the mesh."""
+def build_module(*, tp_size: int = 1, mesh=None):
+    """Assemble the module the way its own ``__init__`` would.
+
+    ``tp_size`` and ``mesh`` are parameters because ``forward`` reads both:
+    the tensor-parallel collective needs the mesh stored at construction.
+    """
     module = LingBotV2TokenMoE.__new__(LingBotV2TokenMoE)
     torch.nn.Module.__init__(module)
 
@@ -84,7 +88,8 @@ def build_module():
     module.num_experts = NUM_EXPERTS
     module.top_k = TOP_K
     module.routed_scaling_factor = 1.0
-    module.tp_size = 1
+    module.tp_size = tp_size
+    module.mesh = mesh
     module.tp_rank = 0
     module.intermediate_size_per_partition = INTERMEDIATE
     module.gate = _Gate(
@@ -226,3 +231,95 @@ def test_only_the_first_output_is_used_and_the_shared_expert_is_added(spy):
     assert out.dtype is torch.bfloat16
     # The decoy second output would give a different constant.
     assert torch.equal(out, torch.full_like(out, ROUTED_RESULT + SHARED_RESULT))
+
+
+# --------------------------------------------------------------------------- #
+# Tensor parallelism
+# --------------------------------------------------------------------------- #
+
+
+def test_tp_collective_covers_the_routed_experts_only(spy, monkeypatch) -> None:
+    """``tp_size > 1`` must reduce the routed output and nothing else.
+
+    Two things are pinned here.  The shared expert is replicated, so folding
+    it into the reduction would scale its contribution by ``tp_size``; and the
+    mesh must survive construction, without which the branch raised
+    ``NameError`` before it could reduce anything.
+
+    The collective is intercepted, so this verifies the control flow and the
+    reduced operand -- not a real two-rank reduction, which needs two GPUs and
+    is NOT VERIFIED here.  ``spy`` still replaces only the leaf kernel, so the
+    module's own forward runs.
+    """
+
+    import phyai.parallel as P
+
+    recorded: list = []
+
+    def _recording_all_reduce(tensor, **kwargs):
+        recorded.append((tensor, kwargs))
+        return tensor
+
+    monkeypatch.setattr(P, "all_reduce", _recording_all_reduce)
+
+    # tp_size == 1: the branch is skipped entirely.
+    run_forward(build_module(tp_size=1, mesh=None))
+    assert recorded == []
+
+    # tp_size == 2: exactly one collective, over the routed output alone.
+    sentinel = object()
+    run_forward(build_module(tp_size=2, mesh=sentinel))
+
+    assert len(recorded) == 1
+    reduced, kwargs = recorded[0]
+    assert kwargs["group"] == "moe_tp"
+    assert kwargs["mesh"] is sentinel
+    # The stub kernel returns ROUTED_RESULT and the shared expert adds
+    # SHARED_RESULT, so a reduced value of ROUTED_RESULT alone proves the
+    # shared expert was not folded into the reduction.
+    assert torch.equal(reduced, torch.full_like(reduced, ROUTED_RESULT))
+
+
+def test_real_construction_stores_the_mesh_on_the_module() -> None:
+    """``__init__`` itself must keep the mesh that ``forward`` reduces with.
+
+    Every other test in this file assembles the module through ``__new__`` and
+    assigns ``mesh`` by hand, so this is the only one that exercises the
+    assignment added in ``__init__``.  Without it, deleting that line would
+    leave the whole suite green while reintroducing the NameError.
+    """
+
+    from phyai.engine_config import ParallelConfig
+    from phyai.parallel.mesh import Mesh
+    from phyai.parallel.state import _meshes, register_mesh
+    from phyai.parallel.layout import build_rank_layout
+    from phyai.models.lingbot_v2.configuration_lingbotv2 import LingBotV2MoEConfig
+
+    saved = dict(_meshes)
+    try:
+        register_mesh(Mesh(build_rank_layout(ParallelConfig()), name="model"))
+        module = LingBotV2TokenMoE(
+            HIDDEN,
+            LingBotV2MoEConfig(
+                num_experts=NUM_EXPERTS,
+                top_k=TOP_K,
+                moe_intermediate_size=INTERMEDIATE,
+                shared_expert_intermediate_size=INTERMEDIATE,
+                router_activation="sigmoid",
+                normalize_topk_prob=True,
+                routed_scaling_factor=1.0,
+                router_bias=False,
+                use_router_correction_bias=True,
+                shared_expert_gate=False,
+            ),
+            params_dtype=torch.bfloat16,
+            device="cuda",
+            prefix="",
+        )
+
+        # An unset attribute would raise AttributeError here, not read as None.
+        assert module.mesh is not None
+        assert module.tp_size == 1
+    finally:
+        _meshes.clear()
+        _meshes.update(saved)

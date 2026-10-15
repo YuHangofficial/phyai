@@ -89,10 +89,17 @@ for path in "$runner" "$summarizer" "$sim_client"; do
 done
 
 mkdir -p "${output}/official" "${output}/phyai"
+# `--tasks` overrides `--num-tasks`, so report the selection the run will
+# actually evaluate instead of a count that no longer describes it.
+if [[ -n "$task_list" ]]; then
+  tasks_display="$task_list"
+else
+  tasks_display="$num_tasks"
+fi
 echo "RoboTwin paired evaluation"
 echo "Official endpoint: ${official_host}:${official_port}"
 echo "PHYAI endpoint   : ${phyai_host}:${phyai_port}"
-echo "tasks            : $num_tasks"
+echo "tasks            : $tasks_display"
 echo "episodes/task    : $test_num"
 echo "instruction type : $instruction_type"
 echo "bridge mode      : $execution_mode"
