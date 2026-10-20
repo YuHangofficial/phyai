@@ -7,9 +7,9 @@ and the ``main_*`` plugin module that self-registers with
 config helpers.
 
 Models are imported by their full path (``from phyai.models.pi05 import
-...``) or pulled in implicitly when :mod:`phyai.engine` registers its
-plugins; this package intentionally re-exports nothing so importing it
-stays free of any heavy model dependency.
+...``) or loaded on demand when :mod:`phyai.engine` resolves a built-in
+plugin; this package intentionally re-exports nothing so importing it stays
+free of any heavy model dependency.
 """
 
 from __future__ import annotations

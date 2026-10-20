@@ -1,0 +1,16 @@
+{
+  "name": "agibot_forward_dynamics",
+  "model_mode": "forward_dynamics",
+  "prompt": "Pickup items in the supermarket",
+  "vision_path": "example_action_fd_agibotworld_first_frame.png",
+  "action_path": "example_action_fd_agibotworld_action_chunks.json",
+  "domain_name": "agibotworld",
+  "view_point": "concat_view",
+  "fps": 10,
+  "image_size": 480,
+  "action_chunk_size": 16,
+  "num_steps": 30,
+  "guidance": 1.0,
+  "shift": 10.0,
+  "seed": 0
+}

@@ -35,7 +35,12 @@ def resolve_use_karras_sigmas(value: bool | None, ckpt: str | Path) -> bool:
 
 
 class UniPCMultistepSampler:
-    """Order-2 UniPC (bh2) for flow-prediction / predict-x0 sampling."""
+    """Order-2 UniPC (bh2) for flow-prediction / predict-x0 sampling.
+
+    ``base_shift=None`` retains the legacy native linear schedule. An explicit
+    base shift constructs FP32 training-grid endpoints before ``flow_shift`` is
+    applied to the inference grid, matching the public framework's convention.
+    """
 
     def __init__(
         self,
@@ -46,6 +51,7 @@ class UniPCMultistepSampler:
         sigma_max: float = 200.0,
         karras_rho: float = 7.0,
         flow_shift: float = 1.0,
+        base_shift: float | None = None,
         use_karras_sigmas: bool = True,
         lower_order_final: bool = True,
     ) -> None:
@@ -55,6 +61,7 @@ class UniPCMultistepSampler:
         self.sigma_max = float(sigma_max)
         self.karras_rho = float(karras_rho)
         self.flow_shift = float(flow_shift)
+        self.base_shift = None if base_shift is None else float(base_shift)
         self.use_karras_sigmas = bool(use_karras_sigmas)
         self.lower_order_final = bool(lower_order_final)
         self.solver_type = "bh2"
@@ -107,8 +114,15 @@ class UniPCMultistepSampler:
                     1.0, 1.0 / self.num_train_timesteps, self.num_train_timesteps
                 )[::-1]
             )
-            base = shift * base / (1.0 + (shift - 1.0) * base)
-            sigma_max, sigma_min = float(base[0]), float(base[-1])
+            if self.base_shift is None:
+                base = shift * base / (1.0 + (shift - 1.0) * base)
+                sigma_max, sigma_min = float(base[0]), float(base[-1])
+            else:
+                # The public framework builds its training-grid endpoints in
+                # FP32 using a separate base shift before inference shifting.
+                base = torch.from_numpy(base).float()
+                base = self.base_shift * base / (1.0 + (self.base_shift - 1.0) * base)
+                sigma_max, sigma_min = base[0].item(), base[-1].item()
             sigmas = np.linspace(sigma_max, sigma_min, n + 1)[:-1]
             sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
         timesteps = (sigmas * self.num_train_timesteps).copy()

@@ -48,11 +48,23 @@
                 ]
               },
               {
+                "group": "MolmoAct2",
+                "pages": [
+                  "models/molmoact2/inference"
+                ]
+              },
+              {
                 "group": "Cosmos",
                 "pages": [
                   "models/cosmos/generation",
                   "models/cosmos/policy",
                   "models/cosmos/processors"
+                ]
+              },
+              {
+                "group": "Qwen-Image",
+                "pages": [
+                  "models/qwen-image/generation"
                 ]
               }
             ]
@@ -60,14 +72,13 @@
           {
             "group": "Quantization",
             "pages": [
-              "quantization/overview",
-              "quantization/configuration",
-              "quantization/internals"
+              "quantization/overview"
             ]
           },
           {
             "group": "Deployment",
             "pages": [
+              "deployment/server-gateway",
               "deployment/parallel-serving"
             ]
           },
@@ -122,11 +133,23 @@
                 ]
               },
               {
+                "group": "MolmoAct2",
+                "pages": [
+                  "zh/models/molmoact2/inference"
+                ]
+              },
+              {
                 "group": "Cosmos",
                 "pages": [
                   "zh/models/cosmos/generation",
                   "zh/models/cosmos/policy",
                   "zh/models/cosmos/processors"
+                ]
+              },
+              {
+                "group": "Qwen-Image",
+                "pages": [
+                  "zh/models/qwen-image/generation"
                 ]
               }
             ]
@@ -134,14 +157,13 @@
           {
             "group": "量化",
             "pages": [
-              "zh/quantization/overview",
-              "zh/quantization/configuration",
-              "zh/quantization/internals"
+              "zh/quantization/overview"
             ]
           },
           {
             "group": "部署",
             "pages": [
+              "zh/deployment/server-gateway",
               "zh/deployment/parallel-serving"
             ]
           },

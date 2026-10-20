@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as image_transforms
+
+from phyai_utils_tools.models.cosmos3.positions_cosmos3 import (
+    compute_mrope_position_ids_vision,
+)
 
 from phyai_utils_tools.processing.base_processor import BaseModelProcessor
 from phyai_utils_tools.processing.pipeline import ProcessorPipeline
@@ -33,6 +43,7 @@ from phyai_utils_tools.models.cosmos3.steps_cosmos3 import (
     Cosmos3TextTokenizeStep,
     cosmos3_default_negative_prompt,
     cosmos3_generation_caption,
+    find_closest_target_size,
     resolve_domain_id,
     resolve_raw_action_dim,
 )
@@ -40,6 +51,61 @@ from phyai_utils_tools.processing.transition import PIXEL_VALUES
 
 
 COSMOS3_VISION_START_TOKEN = "<|vision_start|>"
+
+
+def _resolve_sample_asset(value: str, sample_path: Path) -> Path:
+    """Resolve a local asset relative to its sample JSON."""
+    if "://" in value:
+        raise ValueError(
+            "Download sample assets first and replace URLs with local paths: " + value
+        )
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = sample_path.parent / path
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def _read_sample_frames(path: Path, maximum: int) -> torch.Tensor:
+    """Read RGB uint8 frames as [C,T,H,W], without temporal resampling."""
+    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+        with Image.open(path) as source:
+            frames = [np.array(source.convert("RGB"))]
+    else:
+        import av
+
+        frames = []
+        with av.open(str(path)) as container:
+            for frame in container.decode(video=0):
+                frames.append(frame.to_ndarray(format="rgb24"))
+                if len(frames) == maximum:
+                    break
+    if not frames:
+        raise ValueError(f"No video frames found in {path}")
+    return torch.from_numpy(np.stack(frames)).permute(3, 0, 1, 2).contiguous()
+
+
+def _resize_sample_frames(
+    frames: torch.Tensor, resolution: str
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Apply Framework's uint8 bicubic resize and bottom/right padding."""
+    height, width = frames.shape[-2:]
+    target_w, target_h = find_closest_target_size(height, width, resolution)
+    scale = min(target_w / width, target_h / height, 1.0)
+    crop_h, crop_w = int(height * scale + 0.5), int(width * scale + 0.5)
+    if (crop_h, crop_w) != (height, width):
+        frames = image_transforms.resize(
+            frames,
+            [crop_h, crop_w],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+    pad_h, pad_w = target_h - crop_h, target_w - crop_w
+    if pad_h or pad_w:
+        mode = "edge" if pad_h >= crop_h or pad_w >= crop_w else "reflect"
+        frames = image_transforms.pad(frames, [0, 0, pad_w, pad_h], padding_mode=mode)
+    return frames, (crop_h, crop_w)
 
 
 def _flatten_chat_ids(out) -> list[int]:
@@ -323,6 +389,31 @@ class Cosmos3PolicyProcessedInputs:
     cond_frame_indexes: tuple[int, ...] | None = None
 
 
+@dataclass
+class Cosmos3PolicySample:
+    """CPU inputs and sampling settings for one action/video chunk."""
+
+    text_ids: torch.Tensor
+    text_mask: torch.Tensor
+    pixels: tuple[torch.Tensor, ...]
+    action: torch.Tensor
+    fps: float
+    num_steps: int
+    flow_shift: float
+    guidance_scale: float
+    seed: int
+    prompt: str
+    raw_action_dim: int
+    mode: str
+    domain_id: int
+    action_chunk_size: int
+    num_frames: int
+    crop_size: tuple[int, int]
+    latent_crop_size: tuple[int, int]
+    source: Path
+    condition_frame_indexes: tuple[int, ...]
+
+
 class Cosmos3PolicyProcessor(BaseModelProcessor):
     """Cosmos3 action/policy pre/post processor.
 
@@ -387,6 +478,276 @@ class Cosmos3PolicyProcessor(BaseModelProcessor):
         if action_stats_path is not None:
             self._load_action_stats(action_stats_path)
         super().__init__()
+
+    @classmethod
+    def preprocess_sample(
+        cls, sample_path: str | Path, checkpoint: str | Path, *, chunk_index: int = 0
+    ) -> Cosmos3PolicySample:
+        """Load a local Framework action sample and preprocess one chunk.
+
+        Image/video and action paths are relative to the sample JSON. Released
+        AgiBot ``action_chunks`` files support selection with ``chunk_index``.
+        Conditioning actions are already in the model's normalized coordinates.
+        """
+        sample_path, checkpoint = Path(sample_path), Path(checkpoint)
+        sample = json.loads(sample_path.read_text())
+        if not isinstance(sample, dict):
+            raise ValueError("The Framework sample must be a JSON object")
+        action_data = None
+        if sample.get("action_path"):
+            action_path = _resolve_sample_asset(str(sample["action_path"]), sample_path)
+            action_data = json.loads(action_path.read_text())
+            if isinstance(action_data, dict):
+                metadata = action_data
+                chunks = metadata.get("action_chunks")
+                if not isinstance(chunks, list) or not 0 <= chunk_index < len(chunks):
+                    raise ValueError("Invalid action_chunks JSON or chunk_index")
+                action_data = chunks[chunk_index]
+                sample = {**metadata, **sample}
+            elif chunk_index != 0:
+                raise ValueError("chunk_index requires an action_chunks JSON file")
+        elif chunk_index != 0:
+            raise ValueError("chunk_index requires an action_chunks JSON file")
+
+        mode = str(sample.get("model_mode", "wam"))
+        mode = "policy" if mode == "wam" else mode
+        if mode not in {"policy", "forward_dynamics", "inverse_dynamics"}:
+            raise ValueError(f"Unsupported Framework action mode: {mode}")
+        if sample.get("native_prompt_upsampling", False) or sample.get(
+            "prompt_upsampling", False
+        ):
+            raise ValueError("Samples require a final prompt without upsampling")
+        if sample.get("enable_sound", False) or sample.get("autoregressive", False):
+            raise ValueError("Samples support single-chunk video/action generation")
+        if int(sample.get("num_outputs", 1)) != 1:
+            raise ValueError("Samples support one output per request")
+        if sample.get("condition_video_keep", "first") != "first":
+            raise ValueError("Samples use the first observation frames")
+        chunk_size = int(sample.get("action_chunk_size", 16))
+        if chunk_size <= 0 or chunk_size % 4:
+            raise ValueError("action_chunk_size must be positive and divisible by four")
+        transformer_config = json.loads(
+            (checkpoint / "transformer/config.json").read_text()
+        )
+        action_dim = int(transformer_config["action_dim"])
+        vae_config = json.loads((checkpoint / "vae/config.json").read_text())
+        spatial_factor = int(vae_config.get("scale_factor_spatial", 16))
+        raw_dim = sample.get("raw_action_dim")
+        if mode == "forward_dynamics":
+            if action_data is None:
+                raise ValueError("forward_dynamics requires an action_path")
+            actions = np.asarray(action_data, dtype=np.float32)
+            if actions.ndim != 2 or actions.shape[0] != chunk_size:
+                raise ValueError(
+                    "Conditioning actions must have shape [action_chunk_size,D]"
+                )
+            if not np.isfinite(actions).all() or not 0 < actions.shape[1] <= action_dim:
+                raise ValueError(
+                    "Conditioning actions must be finite with a valid width"
+                )
+            if raw_dim is not None and int(raw_dim) != actions.shape[1]:
+                raise ValueError("raw_action_dim does not match the action file")
+            raw_dim = actions.shape[1]
+            action_data = actions.tolist()
+
+        num_frames = chunk_size + 1
+        frames = _read_sample_frames(
+            _resolve_sample_asset(str(sample["vision_path"]), sample_path), num_frames
+        )
+        # Framework's action entry passes image_size as its resolution bucket.
+        resolution = str(sample.get("image_size", 256))
+        frames, crop_size = _resize_sample_frames(frames, resolution)
+        height, width = frames.shape[-2:]
+        if frames.shape[1] < num_frames:
+            frames = torch.cat(
+                (
+                    frames,
+                    frames[:, -1:].expand(-1, num_frames - frames.shape[1], -1, -1),
+                ),
+                dim=1,
+            )
+        latent_frames = (num_frames - 1) // 4 + 1
+        clean = sample.get("condition_frame_indexes_vision")
+        if clean is None:
+            clean = list(range(latent_frames)) if mode == "inverse_dynamics" else [0]
+        if (
+            not isinstance(clean, list)
+            or not clean
+            or any(
+                not isinstance(index, int) or not 0 <= index < latent_frames
+                for index in clean
+            )
+        ):
+            raise ValueError(
+                "condition_frame_indexes_vision contains invalid latent indexes"
+            )
+        # The causal VAE only needs the prefix ending at the last clean latent.
+        frames = frames[:, : 1 + 4 * max(clean)]
+        fps = float(sample.get("fps", 24.0))
+        if fps <= 0 or not np.isfinite(fps):
+            raise ValueError("fps must be positive and finite")
+        prompt = str(sample.get("prompt", ""))
+        processor = cls(
+            tokenizer_name_or_path=str(checkpoint / "text_tokenizer"),
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            mode=mode,
+            domain_name=sample["domain_name"],
+            action_chunk_size=chunk_size,
+            raw_action_dim=None if raw_dim is None else int(raw_dim),
+            action_dim=action_dim,
+            fps=fps,
+            prompt_format="json",
+            view_point=str(sample.get("view_point", "ego_view")),
+            negative_prompt=str(sample.get("negative_prompt", "")),
+        )
+        # Reuse the text/action/domain steps with already resized tensor pixels.
+        pipeline = ProcessorPipeline(
+            steps=processor.preprocessor.steps[1:],
+            to_output=processor.preprocessor.to_output,
+        )
+        processed = pipeline(
+            {
+                PIXEL_VALUES: (frames.float() / 127.5 - 1.0).unsqueeze(0),
+                VIDEO_SHAPE: (frames.shape[1], height, width),
+                TASK: prompt,
+                COND_ACTION: action_data if mode == "forward_dynamics" else None,
+                DOMAIN_ID: sample["domain_name"],
+                MODE: mode,
+            }
+        )
+        tokenizer = get_tokenizer(str(checkpoint / "text_tokenizer"))
+        if tokenizer.bos_token_id is not None:
+            bos = torch.full((1, 1), tokenizer.bos_token_id, dtype=torch.long)
+            processed.text_ids = torch.cat((bos, processed.text_ids), dim=1)
+            processed.text_mask = torch.ones_like(processed.text_ids)
+        action = processed.cond_action
+        if action is None:
+            action = torch.zeros((1, chunk_size, action_dim), dtype=torch.float32)
+        return Cosmos3PolicySample(
+            text_ids=processed.text_ids,
+            text_mask=processed.text_mask,
+            pixels=(processed.pixel_values,),
+            action=action,
+            fps=fps,
+            num_steps=int(sample.get("num_steps", 30)),
+            flow_shift=float(sample.get("shift", 10.0)),
+            guidance_scale=float(sample.get("guidance", 1.0)),
+            seed=int(sample.get("seed", 0)),
+            prompt=prompt,
+            raw_action_dim=processed.raw_action_dim,
+            mode=mode,
+            domain_id=processed.domain_id,
+            action_chunk_size=chunk_size,
+            num_frames=num_frames,
+            crop_size=crop_size,
+            latent_crop_size=tuple(
+                max(size // spatial_factor, 1) for size in crop_size
+            ),
+            source=sample_path,
+            condition_frame_indexes=tuple(clean),
+        )
+
+    @staticmethod
+    def prepare_denoise_inputs(
+        sample: Cosmos3PolicySample,
+        encoded: tuple[torch.Tensor, ...],
+        *,
+        model_config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Prepare latents, masks and positions from a completed VAE encode.
+
+        ``model_config`` contains the canonical transformer configuration fields.
+        The returned dictionary contains model inputs; the caller supplies
+        inference settings when constructing its request.
+        """
+        if sample.guidance_scale != 1.0:
+            raise ValueError("Sample denoising currently requires guidance=1")
+        if len(encoded) != 1:
+            raise ValueError("Framework action samples require one encoded video")
+        observed = encoded[0]
+        if observed.ndim != 5 or observed.shape[0] != 1:
+            raise ValueError("Encoded video must have shape [1,C,T,H,W]")
+        # Framework crops encoder padding in latent space before GEN packing.
+        crop_h, crop_w = sample.latent_crop_size
+        observed = observed[..., :crop_h, :crop_w].contiguous()
+        _, channels, observed_frames, height, width = observed.shape
+        temporal_factor = model_config["temporal_compression_factor"]
+        frames = (sample.num_frames - 1) // temporal_factor + 1
+        if channels != model_config["latent_channel"]:
+            raise ValueError("Encoded channel count does not match the transformer")
+        if max(sample.condition_frame_indexes) >= observed_frames:
+            raise ValueError("The encoded video is missing a conditioning frame")
+        vision = observed.new_zeros((1, channels, frames, height, width))
+        video_noisy = torch.ones((1, frames), dtype=torch.bool)
+        for index in sample.condition_frame_indexes:
+            vision[:, :, index] = observed[:, :, index]
+            video_noisy[:, index] = False
+
+        patch = model_config["latent_patch_size"]
+        offset = sample.text_ids.shape[1] + model_config["temporal_modality_margin"]
+        video_positions, _ = compute_mrope_position_ids_vision(
+            frames,
+            (height + patch - 1) // patch,
+            (width + patch - 1) // patch,
+            temporal_offset=offset,
+            fps=sample.fps,
+            base_fps=model_config["base_fps"],
+            temporal_compression_factor=temporal_factor,
+            enable_fps_modulation=model_config["enable_fps_modulation"],
+        )
+        action_positions, _ = compute_mrope_position_ids_vision(
+            sample.action_chunk_size,
+            1,
+            1,
+            temporal_offset=offset,
+            fps=sample.fps,
+            base_fps=model_config["base_fps"],
+            temporal_compression_factor=1,
+            base_temporal_compression_factor=temporal_factor,
+            enable_fps_modulation=model_config["enable_fps_modulation"],
+            start_frame_offset=1,
+        )
+        action = sample.action.to(dtype=torch.float32)
+        if action.shape[-1] != model_config["action_dim"]:
+            raise ValueError("Sample action padding does not match the transformer")
+        action_valid = torch.zeros_like(action, dtype=torch.bool)
+        action_valid[..., : sample.raw_action_dim] = True
+        action_noisy = torch.full(
+            (1, sample.action_chunk_size),
+            sample.mode != "forward_dynamics",
+            dtype=torch.bool,
+        )
+        return {
+            "vision": (vision,),
+            "video_noisy_masks": (video_noisy,),
+            "gen_position_ids": torch.cat((video_positions, action_positions), dim=1)
+            .to(dtype=torch.float32)
+            .unsqueeze(1),
+            "action": action,
+            "action_noisy_mask": action_noisy,
+            "action_valid_mask": action_valid,
+            "domain_id": sample.domain_id,
+        }
+
+    @staticmethod
+    def postprocess_sample(
+        output: dict[str, Any], sample: Cosmos3PolicySample
+    ) -> dict[str, Any]:
+        """Crop decoded pixels, slice normalized actions and move tensors to CPU."""
+        result = dict(output)
+        if isinstance(result.get("action"), torch.Tensor):
+            result["action"] = (
+                result["action"][..., : sample.raw_action_dim].detach().cpu()
+            )
+        height, width = sample.crop_size
+        for key in ("video", "pixels"):
+            if isinstance(result.get(key), torch.Tensor):
+                result[key] = (
+                    result[key][..., :height, :width].detach().cpu().contiguous()
+                )
+        return result
 
     def _resolve_raw_action_dim(
         self, raw_action_dim: int | None, domain_name: str | int
@@ -560,6 +921,7 @@ __all__ = [
     "Cosmos3GenerationPostProcessor",
     "Cosmos3PolicyProcessedInputs",
     "Cosmos3PolicyProcessor",
+    "Cosmos3PolicySample",
     "Cosmos3Processor",
     "Cosmos3TokenizedPrompt",
     "COSMOS3_VISION_START_TOKEN",

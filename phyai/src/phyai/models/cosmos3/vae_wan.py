@@ -12,8 +12,8 @@ import torch.distributed as dist
 
 from phyai.utils.cuda import current_device
 from phyai.layers.conv import Conv2d, Conv3d
+from phyai.layers.channel_l2_norm import ChannelL2Norm
 from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3WanVAEConfig
-from phyai.weights.shards import replicated
 
 
 CACHE_T = 2
@@ -112,38 +112,36 @@ class WanCausalConv3d(nn.Module):
         return self.conv(x)
 
 
-class WanRMSNorm(nn.Module):
-    """Channel dim L2 normalize then scale: no eps/variance, not normal RMSNorm.
-
-    ``F.normalize(x, dim=1) * sqrt(C) * gamma (+ bias)`` over the channel axis of
-    ``[B, C, T, H, W]`` (``images=False``) or ``[B*T, C, H, W]`` (``images=True``).
-
-    TODO(wch): This kernel can be fused in the future, but not critical right now.
-    """
+class WanRMSNorm(ChannelL2Norm):
+    """Channel L2 normalization with the native low-precision rounding."""
 
     def __init__(
         self, dim: int, images: bool = True, bias: bool = False, prefix: str = ""
     ) -> None:
-        super().__init__()
-        broadcast = (1, 1) if images else (1, 1, 1)
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.ones(dim, *broadcast))
-        self.bias = nn.Parameter(torch.zeros(dim, *broadcast)) if bias else 0.0
-        if prefix:
-            self.gamma.hf_keys = [(f"{prefix}.gamma", None)]
-            self.gamma.weight_loader = replicated()
-            if isinstance(self.bias, nn.Parameter):
-                self.bias.hf_keys = [(f"{prefix}.bias", None)]
-                self.bias.weight_loader = replicated()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(x, dim=1) * self.scale * self.gamma + self.bias
+        super().__init__(
+            dim,
+            spatial_dims=2 if images else 3,
+            bias=bias,
+            dtype=torch.get_default_dtype(),
+            device=torch.get_default_device(),
+            compute_dtype=None,
+            prefix=prefix,
+        )
+        if not bias:
+            # Preserve the native final +0 inside the fused affine epilogue.
+            # This replaces a plain None attribute, not a learned parameter.
+            # The zero buffer is nonpersistent so checkpoint keys stay unchanged.
+            del self.bias
+            self.register_buffer("bias", torch.zeros_like(self.gamma), persistent=False)
+            self._call.static_attrs["bias"] = True
 
 
 class WanUpsample(nn.Upsample):
-    """nearest exact upsample done in fp32, cast back to input dtype."""
+    """Nearest-exact interpolation without casts for the model's floating dtypes."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 
@@ -513,7 +511,7 @@ class WanResidualUpBlock(nn.Module):
         feat_idx: list | None = None,
         first_chunk: bool = False,
     ) -> torch.Tensor:
-        x_copy = x.clone()
+        x_copy = x
         for resnet in self.resnets:
             x = resnet(x, feat_cache, feat_idx)
         if self.upsampler is not None:
@@ -589,7 +587,7 @@ class WanResidualDownBlock(nn.Module):
         feat_cache: list | None = None,
         feat_idx: list | None = None,
     ) -> torch.Tensor:
-        x_copy = x.clone()
+        x_copy = x
         for resnet in self.resnets:
             x = resnet(x, feat_cache, feat_idx)
         if self.downsampler is not None:

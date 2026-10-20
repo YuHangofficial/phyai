@@ -16,9 +16,7 @@ class CountingLinear(nn.Module):
 
     def forward(self, x):
         self.calls += 1
-        return torch.nn.functional.linear(
-            x, self.weight, self.bias
-        ), None
+        return torch.nn.functional.linear(x, self.weight, self.bias), None
 
 
 def test_ada_norm_modulation_reuse():

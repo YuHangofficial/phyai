@@ -21,12 +21,18 @@
 It is designed first for latency critical workloads, such as policy and action
 models that run in interactive systems.
 
+https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
+
 <p align="center">
   <img src="assets/phyai-demo.gif" alt="PhyAI and OpenPI deployment comparison" width="100%">
 </p>
 
 ## News
 
+- [2026/10] Support [MolmoAct2](https://phyai.mintlify.app/models/molmoact2/inference).
+- [2026/10] Support [PhyAI gateway](https://phyai.mintlify.app/deployment/server-gateway) for multi-host serving and LeRobot clients.
+- [2026/09] 🚀 Support Qwen-Image 2.1! [doc](https://phyai.mintlify.app/models/qwen-image/generation).
+- [2026/09] 🤗 Support PI0.5 RL rollout for PPO. RLinf integration is in progress via [RLinf PR #1587](https://github.com/RLinf/RLinf/pull/1587).
 - [2026/07] 🚀 Day 0 support for MiniCPM-Robotic [blog](https://mingti-org.github.io/phyai-blog/blogs/260719-day-0-minicpm-robotic/).
 - [2026/07] 👏 Introducing PhyAI, a latency-first serving engine for Physical AI. [Read the Blog](https://mingti-org.github.io/phyai-blog/blogs/260718-phyai/).
 - [2026/07] Support [PI0](https://phyai.mintlify.app/models/pi0/ws1).
@@ -39,7 +45,7 @@ models that run in interactive systems.
 - 🚀 Runs on NVIDIA Jetson edge devices
 - 🚀 Scales to GPU clusters with DP, TP, and CFG parallelism
 - 🚀 Uses high-performance kernels from FlashInfer and Humming
-- 🤗 Supports W4A8 (NVFP4, MXFP4, INT4), W8A8, and W8A16 quantization (PR under review)
+- 🤗 Supports INT4, INT8, FP8, MXFP4, and NVFP4 quantization through [kernel policies](#quantization) (PR under review)
 
 ## Supported Models
 
@@ -49,9 +55,10 @@ models that run in interactive systems.
       <th align="center" width="22%">VLA</th>
       <td align="center">
         <a href="https://phyai.mintlify.app/models/pi0/ws1"><strong>&pi;0</strong></a>,
-        <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>(w/ DP),
+        <a href="https://phyai.mintlify.app/models/pi05/ws1"><strong>&pi;0.5</strong></a>,
         <a href="https://phyai.mintlify.app/models/gr00t/ws1"><strong>GR00T N1.7</strong></a>,
-        <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>
+        <a href="examples/minicpm_gr00t/README.md"><strong>MiniCPM-Robot</strong></a>,
+        <a href="https://phyai.mintlify.app/models/molmoact2/inference"><strong>MolmoAct2</strong></a>
       </td>
     </tr>
     <tr>
@@ -66,11 +73,15 @@ models that run in interactive systems.
         <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Nano</strong></a>(w/ TP, CFG Parallel),
         <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Super</strong></a>(w/ TP, CFG Parallel),
         <a href="phyai/src/phyai/models/qwen3_5"><strong>Qwen3.5</strong></a>,
-        <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>
+        <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>,
+        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>
       </td>
     </tr>
   </tbody>
 </table>
+
+All supported models can scale through data-parallel (DP) replicas using the
+shared scheduler. See [parallel serving](https://phyai.mintlify.app/deployment/parallel-serving#serving-replicas).
 
 ## Performance Comparison
 
@@ -98,6 +109,64 @@ uv pip install phyai phyai-ext \
   --extra-index-url https://mingti-org.github.io/phyai/simple/ \
   --prerelease=allow
 ```
+
+## Quantization
+
+PhyAI supports post-training quantization (PTQ) when loading an unquantized
+checkpoint. One **kernel policy YAML** controls which layers are quantized,
+their weight and activation precision, and the execution kernels. Humming is
+included in the standard installation.
+
+For example, run PI0.5 with INT4 weights and BF16 activations (**W4A16**, NVIDIA
+SM80+) from the repository root, with your PhyAI Python environment activated:
+
+```bash
+PHYAI_KERNEL_CONFIG=examples/pi05/kernel_policies/humming_w4a16.yaml \
+python examples/pi05/run_pi05.py --checkpoint /path/to/pi05_base
+```
+
+This preset quantizes the language model and action expert's attention/MLP
+linear projections with group size 128. Vision and input/output heads keep their
+original precision. Point `--checkpoint` to your original, unquantized weights.
+
+Choose another [PI0.5 preset](examples/pi05/kernel_policies), or copy one and edit
+its `quantization` and kernel `rules`. See the
+[quantization guide](https://phyai.mintlify.app/quantization/overview) for matching
+layers, changing precision, and selecting kernels.
+
+## Multi-host serving
+
+You can run model servers on separate machines and connect them through
+`phyai-gateway`. On each model host, prepare `pi05.yaml` with that host's
+checkpoint, tokenizer, and robot settings. You can start from the
+[PI0.5 example](examples/pi05/server.yaml), which serves `pi05` on port `50063`.
+Check the configuration, then start the server:
+
+```bash
+phyai server pi05.yaml
+```
+
+On the gateway host, register both servers at startup. Replace the IP addresses
+below with your server hosts; `pi05` must match `server.model_name` in their YAML
+files. Repeat `--backend MODEL HOST:PORT` to add more servers:
+
+```bash
+phyai-gateway \
+  --backend pi05 10.0.0.11:50063 \
+  --backend pi05 10.0.0.12:50063
+```
+
+In another terminal on the gateway host, check that the backends report
+`healthy: true`:
+
+```bash
+curl http://127.0.0.1:30000/v1/backends
+```
+
+Clients use the gateway host's HTTP port `30000` or gRPC port `50111`. The gateway
+distributes stateless requests across healthy replicas. See the
+[server and gateway setup guide](https://phyai.mintlify.app/deployment/server-gateway) for client
+configuration and adding or removing servers while the gateway is running.
 
 ## Contribution Guidelines
 

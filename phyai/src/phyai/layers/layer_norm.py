@@ -39,20 +39,20 @@ fused-add path today (encoder paths don't need one). AdaRMSNorm's
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union, Optional
 
 import torch
 import torch.nn as nn
 
-from phyai.engine_config import get_engine_config
 from phyai.kernel.call import (
     CallSite,
-    backend_preference,
-    param_dtypes,
     token_shape,
     torch_dtype,
+    param_dtypes,
+    backend_preference,
 )
 from phyai.kernel.types import dtype_name
+from phyai.engine_config import get_engine_config
 from phyai.layers.linear import ReplicatedLinear
 from phyai.weights.shards import replicated
 
@@ -73,6 +73,9 @@ class RMSNorm(nn.Module):
     backend:
         ``"flashinfer"`` (default) or ``"phyai-kernel"``. Underscore,
         hyphen, and case are normalized.
+    elementwise_affine:
+        Whether to register a weight parameter. If False, use a fixed identity
+        weight buffer that is excluded from checkpoints.
     dtype:
         Optional weight dtype. Defaults to the global default dtype.
         **flashinfer caveat**: the CUDA RMSNorm / GemmaRMSNorm /
@@ -84,6 +87,11 @@ class RMSNorm(nn.Module):
         tensor that will be normalized (typically ``torch.bfloat16``);
         do *not* leave it as the fp32 default. The ``"phyai-kernel"``
         Triton path accepts any floating dtype.
+    cast_before_affine:
+        Round normalized values to the activation dtype before multiplying
+        gamma. This matches checkpoints whose reference uses a separate
+        low-precision affine multiply; weight and activation dtypes must match.
+        Has no effect when ``elementwise_affine=False``.
 
     The forward signature is ``forward(x, residual=None)``:
 
@@ -92,8 +100,12 @@ class RMSNorm(nn.Module):
       are written in place by the kernel and the same objects come back.
 
     On the no-residual path, higher-rank inputs are flattened to 2-D for
-    the kernel and reshaped back. The residual path expects 2-D contiguous
-    inputs (the kernels themselves don't know how to reshape).
+    the kernel and reshaped back. ``preserve_3d_layout=True`` instead passes
+    a 3-D input with unit last-dimension stride to the selected kernel.
+    FlashInfer RMSNorm can normalize these rows directly; Gemma and fallback
+    implementations may materialize a contiguous input internally. The option
+    is explicit so existing callers retain their original kernel and rounding behavior.
+    It cannot be combined with the in-place residual path.
     """
 
     def __init__(
@@ -102,10 +114,12 @@ class RMSNorm(nn.Module):
         eps: float = 1e-6,
         backend: str | None = None,
         *,
+        elementwise_affine: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
         kernel_role: str = "norm",
+        cast_before_affine: bool = False,
     ) -> None:
         super().__init__()
         self.backend = backend
@@ -113,6 +127,10 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.prefix = prefix
         self.kernel_role = kernel_role
+        self.elementwise_affine = elementwise_affine
+        self.cast_before_affine = cast_before_affine and elementwise_affine
+        if self.cast_before_affine and self.variant != "rms":
+            raise ValueError("cast_before_affine applies to standard RMSNorm only")
         if device is None:
             device = get_engine_config().device.target
         # Validates the hint against the catalog and records the kernel ids to
@@ -134,10 +152,16 @@ class RMSNorm(nn.Module):
             prefer=self._prefer_fused,
             dims={"hidden": hidden_size},
         )
-        self.weight = nn.Parameter(
-            self._initial_weight(hidden_size, dtype, device), requires_grad=False
-        )
-        if prefix:
+        weight = self._initial_weight(hidden_size, dtype, device)
+        if elementwise_affine:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+        else:
+            self.register_buffer("weight", weight, persistent=False)
+        if self.cast_before_affine:
+            self.register_buffer(
+                "_unit_weight", torch.ones_like(self.weight), persistent=False
+            )
+        if prefix and elementwise_affine:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()
 
@@ -160,10 +184,24 @@ class RMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        *,
+        preserve_3d_layout: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if preserve_3d_layout and (
+            residual is not None or x.dim() != 3 or x.stride(-1) != 1
+        ):
+            raise ValueError(
+                "preserve_3d_layout requires a 3-D input with unit last stride "
+                "and no residual"
+            )
+        if self.cast_before_affine and self.weight.dtype != x.dtype:
+            raise ValueError(
+                "cast_before_affine requires matching activation and weight dtypes"
+            )
+        weight = self._unit_weight if self.cast_before_affine else self.weight
         dtypes: dict[str, object] = {
             "input": x.dtype,
-            "weight": self.weight.dtype,
+            "weight": weight.dtype,
             "output": x.dtype,
         }
 
@@ -179,9 +217,12 @@ class RMSNorm(nn.Module):
                 attrs={"variant": self.variant},
             )
             if x.dim() == 2:
-                return handle.execute(
-                    x, residual, self.weight.data, self.variance_epsilon
+                out, res = handle.execute(
+                    x, residual, weight.data, self.variance_epsilon
                 )
+                if self.cast_before_affine:
+                    out.mul_(self.weight)
+                return out, res
             # Fused kernels operate on (tokens, hidden). For contiguous inputs
             # the reshape is a view, so the kernels' in-place writes still land
             # in the caller's buffers.
@@ -189,27 +230,37 @@ class RMSNorm(nn.Module):
             out, res = handle.execute(
                 x.reshape(-1, orig_shape[-1]),
                 residual.reshape(-1, orig_shape[-1]),
-                self.weight.data,
+                weight.data,
                 self.variance_epsilon,
             )
+            if self.cast_before_affine:
+                out.mul_(self.weight)
             return out.reshape(orig_shape), res.reshape(orig_shape)
 
         handle = self._plain_call.select(
             device=x.device,
             dtype=dtypes,
             dims=token_shape(x),
-            attrs={"variant": self.variant},
+            attrs={"variant": self.variant, "rank": 3 if preserve_3d_layout else 2},
         )
+        if preserve_3d_layout:
+            out = handle.execute(x, weight.data, self.variance_epsilon)
+            if self.cast_before_affine:
+                out = out * self.weight
+            return out
         needs_reshape = x.dim() != 2
         if needs_reshape:
             orig_shape = x.shape
             x = x.contiguous().reshape(-1, orig_shape[-1])
-        out = handle.execute(x, self.weight.data, self.variance_epsilon)
+        out = handle.execute(x, weight.data, self.variance_epsilon)
+        if self.cast_before_affine:
+            out = out * self.weight
         return out.reshape(orig_shape) if needs_reshape else out
 
     def extra_repr(self) -> str:
         return (
-            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}"
+            f"{self.hidden_size}, eps={self.variance_epsilon}, backend={self.backend!r}, "
+            f"elementwise_affine={self.elementwise_affine}"
         )
 
 
@@ -335,6 +386,9 @@ class LayerNorm(nn.Module):
         (the typical encoder configuration). flashinfer's kernel always
         reads ``beta``; when ``bias=False`` the wrapper feeds it a zero
         buffer so the kernel's add becomes a no-op.
+    elementwise_affine:
+        If False, use nonpersistent identity buffers instead of checkpoint
+        parameters. The same selected normalization kernel still runs.
     dtype:
         Optional weight / bias dtype. Defaults to the global default.
         flashinfer's CUDA kernel hard-checks ``gamma`` / ``beta`` in
@@ -361,6 +415,7 @@ class LayerNorm(nn.Module):
         backend: str | None = None,
         *,
         bias: bool = True,
+        elementwise_affine: bool = True,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
         prefix: str = "",
@@ -372,6 +427,8 @@ class LayerNorm(nn.Module):
         self.backend = backend
         self.hidden_size = hidden_size
         self.variance_epsilon = eps
+        self.elementwise_affine = elementwise_affine
+        bias = bias and elementwise_affine
         self.has_bias = bias
         self.prefix = prefix
         self.kernel_role = kernel_role
@@ -417,10 +474,11 @@ class LayerNorm(nn.Module):
         param_dtype = torch_dtype(chosen["weight"])
         beta_dtype = torch_dtype(chosen.get("bias", chosen["weight"]))
 
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=param_dtype, device=device),
-            requires_grad=False,
-        )
+        weight = torch.ones(hidden_size, dtype=param_dtype, device=device)
+        if elementwise_affine:
+            self.weight = nn.Parameter(weight, requires_grad=False)
+        else:
+            self.register_buffer("weight", weight, persistent=False)
         if bias:
             self.bias = nn.Parameter(
                 torch.zeros(hidden_size, dtype=beta_dtype, device=device),
@@ -438,7 +496,7 @@ class LayerNorm(nn.Module):
                 persistent=False,
             )
 
-        if prefix:
+        if prefix and elementwise_affine:
             self.weight.hf_keys = [(f"{prefix}.weight", None)]
             self.weight.weight_loader = replicated()
             if bias:
@@ -467,7 +525,8 @@ class LayerNorm(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"{self.hidden_size}, eps={self.variance_epsilon}, "
-            f"bias={self.has_bias}, backend={self.backend!r}"
+            f"bias={self.has_bias}, elementwise_affine={self.elementwise_affine}, "
+            f"backend={self.backend!r}"
         )
 
 

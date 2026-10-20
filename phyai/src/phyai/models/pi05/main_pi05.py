@@ -14,9 +14,8 @@ Two pieces, both consumed by :class:`~phyai.engine.Engine`:
   :class:`PI05Scheduler`, then forwards :meth:`step` to it.
 
 Importing this module registers ``PI05Entry`` with the engine via
-``@Engine.register`` at class-definition time. The engine's own
-``engine.py`` imports this module at the bottom of its file, so the
-plugin is available the moment the engine module is loaded.
+``@Engine.register`` at class-definition time. The engine loads this module
+on demand when the ``pi05`` plugin is selected.
 
 ``device`` / ``params_dtype`` / ``*_backend`` / ``use_cuda_graph`` are
 *not* fields on :class:`PI05Args`; they live on
@@ -38,7 +37,7 @@ import torch
 
 from phyai.engine import Engine, Entry, EntryArgs
 from phyai.engine_config import get_engine_config
-from phyai.layers.quant.active import load_quant_plan, use_quant_plan
+from phyai.layers.quant.active import resolve_quant_plan, use_quant_plan
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.modeling_pi05 import PI05Model
 from phyai.models.pi05.scheduler_pi05 import (
@@ -183,7 +182,7 @@ class PI05Entry(Entry):
         else:
             config = PI05Config()
 
-        with use_quant_plan(load_quant_plan(args.checkpoint_dir)):
+        with use_quant_plan(resolve_quant_plan(args.checkpoint_dir)):
             self.model = PI05Model(
                 config,
                 vision_params_dtype=args.vision_params_dtype,

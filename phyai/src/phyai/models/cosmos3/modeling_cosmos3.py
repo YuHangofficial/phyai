@@ -6,24 +6,42 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from phyai.engine_config import get_engine_config, resolve_params_dtype
-from phyai.layers.attention.nocache.layer import Attention
-from phyai.layers.layer_norm import RMSNorm
 from phyai.layers.linear import (
-    QKVParallelLinear,
     ReplicatedLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
-from phyai.layers.mlp.dense_mlp import DenseMLP
-from phyai.layers.rotary_embedding import InterleavedMRotaryEmbedding, rotate_half
-from phyai.layers.vocab_embedding import VocabParallelEmbedding
-from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3Config
 from phyai.weights.shards import replicated
+from phyai.layers.layer_norm import RMSNorm
+from phyai.layers.mlp.dense_mlp import DenseMLP
+from phyai.layers.vocab_embedding import VocabParallelEmbedding
+from phyai.layers.rotary_embedding import InterleavedMRotaryEmbedding, rotate_half
+from phyai.layers.attention.nocache.base import AttnCtx
+from phyai.layers.attention.nocache.layer import Attention
+from phyai.models.cosmos3.configuration_cosmos3 import Cosmos3Config
+from phyai_utils_tools.models.cosmos3.positions_cosmos3 import (
+    compute_mrope_position_ids_vision as compute_mrope_position_ids_vision,
+)
+
+Cosmos3AttentionPreparation = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
 
 
 def compute_mrope_position_ids_text(
@@ -35,71 +53,6 @@ def compute_mrope_position_ids_text(
     return mrope_ids, temporal_offset + num_tokens
 
 
-def compute_mrope_position_ids_vision(
-    grid_t: int,
-    grid_h: int,
-    grid_w: int,
-    temporal_offset: int | float,
-    fps: float | None = None,
-    base_fps: float = 24.0,
-    temporal_compression_factor: int = 4,
-    base_temporal_compression_factor: int | None = None,
-    enable_fps_modulation: bool = True,
-    start_frame_offset: int = 0,
-) -> tuple[torch.Tensor, int | float]:
-    """3-D (t, h, w) ids for vision tokens; spatial ids reset per frame.
-
-    With fps modulation, the temporal axis is rescaled by
-    ``base_fps/base_tcf`` over ``fps/tcf`` so videos at different frame rates
-    share a comparable temporal coordinate. Flattened t-major.
-    """
-    fps_modulation = enable_fps_modulation and fps is not None
-    if fps_modulation:
-        tps = fps / temporal_compression_factor
-        effective_base_tcf = (
-            base_temporal_compression_factor
-            if base_temporal_compression_factor is not None
-            else temporal_compression_factor
-        )
-        base_tps = base_fps / effective_base_tcf
-        frame_indices = torch.arange(grid_t, dtype=torch.float32)
-        t_index = (
-            ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
-            .view(-1, 1)
-            .expand(-1, grid_h * grid_w)
-            .flatten()
-        )
-    else:
-        t_index = (
-            torch.arange(grid_t, dtype=torch.long)
-            .view(-1, 1)
-            .expand(-1, grid_h * grid_w)
-            .flatten()
-            + int(temporal_offset)
-            + start_frame_offset
-        )
-    h_index = (
-        torch.arange(grid_h, dtype=torch.long)
-        .view(1, -1, 1)
-        .expand(grid_t, -1, grid_w)
-        .flatten()
-    )
-    w_index = (
-        torch.arange(grid_w, dtype=torch.long)
-        .view(1, 1, -1)
-        .expand(grid_t, grid_h, -1)
-        .flatten()
-    )
-    if fps_modulation:
-        mrope_ids = torch.stack(
-            [t_index, h_index.to(torch.float32), w_index.to(torch.float32)], dim=0
-        )
-    else:
-        mrope_ids = torch.stack([t_index, h_index, w_index], dim=0)
-    next_offset = math.floor(mrope_ids.max().item()) + 1
-    return mrope_ids, next_offset
-
-
 def _apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -107,6 +60,20 @@ def _apply_rotary_pos_emb(
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def prepare_cosmos3_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_und: torch.Tensor,
+    v_und: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply GEN RoPE and prepend the immutable UND keys and values."""
+    q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+    return q, torch.cat((k_und, k), dim=1), torch.cat((v_und, v), dim=1)
 
 
 def local_head_counts(
@@ -392,6 +359,8 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        attention_context: AttnCtx | None = None,
+        attention_preparation: Cosmos3AttentionPreparation | None = None,
     ) -> torch.Tensor:
         B, S_gen, _ = hidden_states.shape
         qkv, _ = self.qkv_proj(hidden_states)
@@ -399,12 +368,17 @@ class Cosmos3CrossAttention(nn.Module):
         q = q.view(B, S_gen, self.num_local_heads, self.head_dim)
         k = k.view(B, S_gen, self.num_local_kv_heads, self.head_dim)
         v = v.view(B, S_gen, self.num_local_kv_heads, self.head_dim)
-        q = self.norm_q(q)
-        k = self.norm_k(k)
-        q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
-        k_all = torch.cat([k_und, k], dim=1)
-        v_all = torch.cat([v_und, v], dim=1)
-        out = self.attn(q, k_all, v_all)  # [B, S_gen, H, D]
+        q = self.norm_q(
+            q.view(B * S_gen, self.num_local_heads, self.head_dim),
+            preserve_3d_layout=True,
+        ).view_as(q)
+        k = self.norm_k(
+            k.view(B * S_gen, self.num_local_kv_heads, self.head_dim),
+            preserve_3d_layout=True,
+        ).view_as(k)
+        prepare_attention = attention_preparation or prepare_cosmos3_attention
+        q, k_all, v_all = prepare_attention(q, k, v, freqs_cos, freqs_sin, k_und, v_und)
+        out = self.attn(q, k_all, v_all, attention_context)  # [B, S_gen, H, D]
         out = out.reshape(B, S_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -527,11 +501,19 @@ class Cosmos3GenDecoderLayer(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        attention_context: AttnCtx | None = None,
+        attention_preparation: Cosmos3AttentionPreparation | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.cross_attention(
-            hidden_states, k_und, v_und, freqs_cos, freqs_sin
+            hidden_states,
+            k_und,
+            v_und,
+            freqs_cos,
+            freqs_sin,
+            attention_context,
+            attention_preparation,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -612,6 +594,8 @@ class Cosmos3Condition:
     video_shape: tuple[int, int, int]
     action_len: int = 0
     sound_len: int = 0
+    attention_contexts: tuple[AttnCtx, ...] | None = None
+    attention_preparation: Cosmos3AttentionPreparation | None = None
 
 
 class Cosmos3Transformer(nn.Module):
@@ -1035,10 +1019,23 @@ class Cosmos3Transformer(nn.Module):
 
         # GEN pathway: cross-attend to the precomputed UND K/V at the GEN positions.
         freqs_cos, freqs_sin = condition.freqs_gen
-        for layer, (k_und, v_und) in zip(
-            self.gen_layers, condition.cached_kv, strict=True
+        for index, (layer, (k_und, v_und)) in enumerate(
+            zip(self.gen_layers, condition.cached_kv, strict=True)
         ):
-            hidden_gen = layer(hidden_gen, k_und, v_und, freqs_cos, freqs_sin)
+            context = (
+                condition.attention_contexts[index]
+                if condition.attention_contexts is not None
+                else None
+            )
+            hidden_gen = layer(
+                hidden_gen,
+                k_und,
+                v_und,
+                freqs_cos,
+                freqs_sin,
+                context,
+                condition.attention_preparation,
+            )
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
         video_out, _ = self.proj_out(hidden_gen[:, :s_video])

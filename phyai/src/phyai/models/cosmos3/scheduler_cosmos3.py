@@ -2,27 +2,25 @@
 
 from __future__ import annotations
 
-
 import numpy as np
 import torch
 
 import phyai.parallel as P
-from phyai.models.cosmos3.avae_sound import Cosmos3AVAESoundDecoder
-from phyai.models.cosmos3.guidance import combine_cfg
-from phyai.models.cosmos3.model_runner_cosmos3 import Cosmos3T2VRunner
-from phyai.models.cosmos3.model_runner_vae_cosmos3 import (
-    Cosmos3SoundVAERunner,
-    Cosmos3VAERunner,
-)
-from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Transformer
-from phyai.models.cosmos3.parallel_cosmos3 import group_rank_size
-from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
-from phyai.models.cosmos3.requests_cosmos3 import Cosmos3T2VRequest
-from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
-from phyai.runtime.schedule import Scheduler
 from phyai.utils import get_logger
 from phyai.utils.profile import event_scope
-
+from phyai.runtime.schedule import Scheduler
+from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE
+from phyai.models.cosmos3.guidance import combine_cfg
+from phyai.models.cosmos3.avae_sound import Cosmos3AVAESoundDecoder
+from phyai.models.cosmos3.sampler_unipc import UniPCMultistepSampler
+from phyai.models.cosmos3.modeling_cosmos3 import Cosmos3Transformer
+from phyai.models.cosmos3.parallel_cosmos3 import group_rank_size
+from phyai.models.cosmos3.requests_cosmos3 import Cosmos3T2VRequest
+from phyai.models.cosmos3.model_runner_cosmos3 import Cosmos3T2VRunner
+from phyai.models.cosmos3.model_runner_vae_cosmos3 import (
+    Cosmos3VAERunner,
+    Cosmos3SoundVAERunner,
+)
 
 logger = get_logger(__name__)
 
@@ -39,6 +37,7 @@ class Cosmos3T2VScheduler(Scheduler):
         device: torch.device | str | None = None,
         flow_shift: float = 10.0,
         use_karras_sigmas: bool = False,
+        use_cuda_graph: bool = False,
         torch_compile: bool = False,
         compile_kwargs: dict | None = None,
     ) -> None:
@@ -62,6 +61,7 @@ class Cosmos3T2VScheduler(Scheduler):
         self.runner = Cosmos3T2VRunner(
             transformer,
             device=self.device,
+            use_cuda_graph=use_cuda_graph,
             torch_compile=torch_compile,
             compile_kwargs=compile_kwargs,
         )
@@ -79,7 +79,7 @@ class Cosmos3T2VScheduler(Scheduler):
         self.unipc: UniPCMultistepSampler | None = None
 
     def setup(self) -> None:
-        """Build the UniPC sampler (no graph capture; plain Python loop)."""
+        """Prepare the model runners and UniPC sampler."""
         self.runner.setup()
         if self.vae_runner is not None:
             self.vae_runner.setup()
@@ -93,6 +93,14 @@ class Cosmos3T2VScheduler(Scheduler):
             self.tp_size,
             self.cfg_size,
         )
+
+    def close(self) -> None:
+        self.runner.close()
+        if self.vae_runner is not None:
+            self.vae_runner.close()
+        if self.sound_runner is not None:
+            self.sound_runner.close()
+        self.unipc = None
 
     @torch.no_grad()
     def step(

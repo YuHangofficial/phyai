@@ -480,9 +480,9 @@ class LingBotV2WS1Scheduler(Scheduler):
                 batch_index, :language_length
             ]
             fake_ids[batch_index, cursor : cursor + language_length] = (
-                request.input_ids[batch_index, :language_length].to(
-                    device=self.device, dtype=torch.int64
-                )
+                request.input_ids[
+                    batch_index, :language_length
+                ].to(device=self.device, dtype=torch.int64)
             )
             cursor += language_length
             packed[

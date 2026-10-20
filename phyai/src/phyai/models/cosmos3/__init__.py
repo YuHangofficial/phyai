@@ -30,7 +30,23 @@ from phyai.models.cosmos3.requests_cosmos3 import (
 from phyai.models.cosmos3.requests_cosmos3_policy import Cosmos3ActionRequest
 from phyai.models.cosmos3.scheduler_cosmos3 import Cosmos3T2VScheduler
 from phyai.models.cosmos3.scheduler_cosmos3_policy import Cosmos3PolicyScheduler
+from phyai.models.cosmos3.requests_staged_cosmos3 import (
+    Cosmos3DecodeRequest,
+    Cosmos3DenoiseRequest,
+    Cosmos3EncodeRequest,
+    Cosmos3VLMRequest,
+)
+from phyai.models.cosmos3.model_runner_staged_cosmos3 import (
+    Cosmos3DiTRunner,
+    Cosmos3VLMRunner,
+    Cosmos3StagedVAERunner,
+)
+from phyai.models.cosmos3.scheduler_staged_cosmos3 import Cosmos3StagedScheduler
 from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
+from phyai.models.cosmos3.main_cosmos3_staged import (
+    Cosmos3StagedArgs,
+    Cosmos3StagedEntry,
+)
 
 
 __all__ = [
@@ -54,4 +70,14 @@ __all__ = [
     "Cosmos3T2VRequest",
     "Cosmos3ActionRequest",
     "pixel_to_latent_shape",
+    "Cosmos3VLMRequest",
+    "Cosmos3EncodeRequest",
+    "Cosmos3DenoiseRequest",
+    "Cosmos3DecodeRequest",
+    "Cosmos3VLMRunner",
+    "Cosmos3DiTRunner",
+    "Cosmos3StagedVAERunner",
+    "Cosmos3StagedScheduler",
+    "Cosmos3StagedArgs",
+    "Cosmos3StagedEntry",
 ]

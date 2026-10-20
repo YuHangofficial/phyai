@@ -1429,9 +1429,7 @@ class LingBotV2ExpertLayer(nn.Module):
         """Apply joint diffusion attention, normalization, and the MLP path."""
 
         residual = hidden_states
-        normed = self.input_layernorm(
-            hidden_states, cond, modulation=input_modulation
-        )
+        normed = self.input_layernorm(hidden_states, cond, modulation=input_modulation)
         fused, _ = self.qkv_proj(normed)
         q, k, v = self._split_qkv(fused, hidden_states.shape[:-1])
         # Official joint attention promotes every stream's Q/K/V before MRoPE.

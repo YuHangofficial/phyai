@@ -2,36 +2,35 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 from typing import ClassVar
+from pathlib import Path
+from dataclasses import dataclass
 
 import torch
 
-from phyai.engine import Engine, Entry, EntryArgs
+from phyai.utils import get_logger, load_config
+from phyai.engine import Entry, Engine, EntryArgs
+from phyai.weights import load_pretrained
 from phyai.engine_config import ParallelConfig, get_engine_config
-from phyai.layers.quant.active import load_quant_plan, use_quant_plan
+from phyai.layers.quant.active import use_quant_plan, resolve_quant_plan
+from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
 from phyai.models.cosmos3.avae_sound import (
     Cosmos3AVAESoundDecoder,
     cosmos3_avae_weight_remap,
 )
-from phyai.models.cosmos3.configuration_cosmos3 import (
-    Cosmos3AVAESoundConfig,
-    Cosmos3Config,
-    Cosmos3WanVAEConfig,
-)
+from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
 from phyai.models.cosmos3.modeling_cosmos3 import (
     Cosmos3Transformer,
     cosmos3_weight_remap,
 )
 from phyai.models.cosmos3.parallel_cosmos3 import validate_cosmos3_parallel
 from phyai.models.cosmos3.requests_cosmos3 import Cosmos3T2VRequest
-from phyai.models.cosmos3.sampler_unipc import resolve_use_karras_sigmas
 from phyai.models.cosmos3.scheduler_cosmos3 import Cosmos3T2VScheduler
-from phyai.models.cosmos3.vae_wan import Cosmos3WanVAE, cosmos3_vae_weight_remap
-from phyai.utils import get_logger, load_config
-from phyai.weights import load_pretrained
-
+from phyai.models.cosmos3.configuration_cosmos3 import (
+    Cosmos3Config,
+    Cosmos3WanVAEConfig,
+    Cosmos3AVAESoundConfig,
+)
 
 logger = get_logger(__name__)
 
@@ -108,7 +107,7 @@ class Cosmos3Entry(Entry):
 
         # The engine already initialized the mesh and process kernel selector, so
         # the model constructors below need no standalone register_mesh shim.
-        with use_quant_plan(load_quant_plan(ckpt / "transformer")):
+        with use_quant_plan(resolve_quant_plan(ckpt / "transformer")):
             self.transformer = Cosmos3Transformer(
                 config, params_dtype=dtype, device=device
             ).eval()
@@ -148,6 +147,7 @@ class Cosmos3Entry(Entry):
             device=device,
             flow_shift=args.flow_shift,
             use_karras_sigmas=use_karras,
+            use_cuda_graph=eng.runtime.use_cuda_graph,
             torch_compile=args.torch_compile,
             compile_kwargs=args.compile_kwargs,
         )
