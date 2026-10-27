@@ -256,6 +256,7 @@ class LingBotV2RoboTwinPolicy:
                         params_dtype=torch.bfloat16,
                     ),
                     runtime=RuntimeConfig(
+                        allow_tf32=True,
                         use_cuda_graph=use_cuda_graph,
                     ),
                 ),

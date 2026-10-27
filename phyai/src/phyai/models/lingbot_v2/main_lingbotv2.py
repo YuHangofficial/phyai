@@ -35,15 +35,23 @@ class _MatmulPrecisionManager:
         self._lock = Lock()
         self._active_entries = 0
         self._previous_precision: str | None = None
+        self._active_precision: str | None = None
 
-    def acquire(self) -> None:
-        """Acquire the process-wide high-precision matmul policy."""
+    def acquire(self, precision: str = "high") -> None:
+        """Acquire a compatible process-wide matmul policy lease."""
 
+        if precision not in {"high", "highest"}:
+            raise ValueError(f"Unsupported LingBot matmul precision: {precision!r}.")
         with self._lock:
+            if self._active_entries and self._active_precision != precision:
+                raise RuntimeError(
+                    "Overlapping LingBot entries require the same matmul precision."
+                )
             if self._active_entries == 0:
                 previous = torch.get_float32_matmul_precision()
-                torch.set_float32_matmul_precision("high")
+                torch.set_float32_matmul_precision(precision)
                 self._previous_precision = previous
+                self._active_precision = precision
             self._active_entries += 1
 
     def release(self) -> None:
@@ -62,6 +70,7 @@ class _MatmulPrecisionManager:
             torch.set_float32_matmul_precision(previous)
             self._active_entries = 0
             self._previous_precision = None
+            self._active_precision = None
 
 
 _MATMUL_PRECISION_MANAGER = _MatmulPrecisionManager()
@@ -163,10 +172,10 @@ class LingBotV2Entry(Entry):
         ):
             raise RuntimeError("LingBotV2Entry.setup may only be called once.")
 
-        # The released FP32 router uses PyTorch matmul precision "high". Keep
-        # this process-wide policy active until the last overlapping entry
-        # closes, then restore the policy that preceded the first entry.
-        _MATMUL_PRECISION_MANAGER.acquire()
+        # Honor the runtime policy. The released model's entrypoints explicitly
+        # enable TF32 to retain their validated "high" matmul behavior.
+        precision = "high" if get_engine_config().runtime.allow_tf32 else "highest"
+        _MATMUL_PRECISION_MANAGER.acquire(precision)
         self._owns_matmul_precision = True
         try:
             self._setup(args)
