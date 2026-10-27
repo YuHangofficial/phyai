@@ -3,6 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from phyai_kernel import jit_utils
+from phyai_kernel.cuda.jit.t5_gelu import t5_gelu
 from phyai_kernel.jit_utils import jit
 from phyai_kernel.triton import (
     adarmsnorm,
@@ -18,6 +19,7 @@ from phyai_kernel.triton import (
     rmsnorm,
     rmsnorm_hf,
     rmsnorm_silu_mul,
+    situ_and_mul,
 )
 
 try:
@@ -42,4 +44,6 @@ __all__ = [
     "rmsnorm",
     "rmsnorm_hf",
     "rmsnorm_silu_mul",
+    "t5_gelu",
+    "situ_and_mul",
 ]

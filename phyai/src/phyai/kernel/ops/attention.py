@@ -32,6 +32,7 @@ ATTENTION = OpSpec(
         "mask_kind",
         "masked",
         "kv_tokens",
+        "has_attn_bias",
     ),
     signature="(runner=None, **kwargs) -> AttentionBackend",
     returns=returns_instance(object, constructed_with=("runner",)),
@@ -74,6 +75,7 @@ FLASHINFER_ATTENTION = all_of(
     dtype.input.in_(HALF_FLOATS),
     dtype.key.in_(HALF_FLOATS),
     dtype.value.in_(HALF_FLOATS),
+    attrs.has_attn_bias != True,
     attrs.mask_kind != "segments",
     # Spelled as an implication, not a negated conjunction: mask_kind is an
     # optional fact, and a missing optional evaluates vacuously true — under

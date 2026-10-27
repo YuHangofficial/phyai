@@ -29,6 +29,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
 
 ## News
 
+- [2026/10] Support [DreamZero](https://phyai.mintlify.app/models/dreamzero/ws1).
+- [2026/10] Support [Xiaomi Robotics U0](https://phyai.mintlify.app/models/xiaomi-u0/text-to-image) text-to-image generation.
 - [2026/10] Support [MolmoAct2](https://phyai.mintlify.app/models/molmoact2/inference).
 - [2026/10] Support [PhyAI gateway](https://phyai.mintlify.app/deployment/server-gateway) for multi-host serving and LeRobot clients.
 - [2026/09] 🚀 Support Qwen-Image 2.1! [doc](https://phyai.mintlify.app/models/qwen-image/generation).
@@ -64,7 +66,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
     <tr>
       <th align="center" width="22%">WAM</th>
       <td align="center">
-        <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel)
+        <a href="https://phyai.mintlify.app/models/cosmos/policy"><strong>Cosmos3-Nano-Policy-DROID</strong></a>(w/ TP, CFG Parallel),
+        <a href="https://phyai.mintlify.app/models/dreamzero/ws1"><strong>DreamZero</strong></a>
       </td>
     </tr>
     <tr>
@@ -74,7 +77,8 @@ https://github.com/user-attachments/assets/bcfe5c0f-1984-4410-a6a9-be20c7895e6f
         <a href="https://phyai.mintlify.app/models/cosmos/generation"><strong>Cosmos3-Super</strong></a>(w/ TP, CFG Parallel),
         <a href="phyai/src/phyai/models/qwen3_5"><strong>Qwen3.5</strong></a>,
         <a href="phyai/src/phyai/models/qwen3_vl"><strong>Qwen3-VL</strong></a>,
-        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>
+        <a href="https://phyai.mintlify.app/models/qwen-image/generation"><strong>Qwen-Image 2.1</strong></a>,
+        <a href="https://phyai.mintlify.app/models/xiaomi-u0/text-to-image"><strong>Xiaomi Robotics U0</strong></a> (T2I)
       </td>
     </tr>
   </tbody>

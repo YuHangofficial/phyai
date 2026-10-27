@@ -48,6 +48,12 @@
                 ]
               },
               {
+                "group": "DreamZero",
+                "pages": [
+                  "models/dreamzero/ws1"
+                ]
+              },
+              {
                 "group": "MolmoAct2",
                 "pages": [
                   "models/molmoact2/inference"
@@ -65,6 +71,18 @@
                 "group": "Qwen-Image",
                 "pages": [
                   "models/qwen-image/generation"
+                ]
+              },
+              {
+                "group": "MOSS-Image",
+                "pages": [
+                  "models/moss-image/generation"
+                ]
+              },
+              {
+                "group": "Xiaomi U0",
+                "pages": [
+                  "models/xiaomi-u0/text-to-image"
                 ]
               }
             ]
@@ -133,6 +151,12 @@
                 ]
               },
               {
+                "group": "DreamZero",
+                "pages": [
+                  "zh/models/dreamzero/ws1"
+                ]
+              },
+              {
                 "group": "MolmoAct2",
                 "pages": [
                   "zh/models/molmoact2/inference"
@@ -150,6 +174,18 @@
                 "group": "Qwen-Image",
                 "pages": [
                   "zh/models/qwen-image/generation"
+                ]
+              },
+              {
+                "group": "MOSS-Image",
+                "pages": [
+                  "zh/models/moss-image/generation"
+                ]
+              },
+              {
+                "group": "Xiaomi U0",
+                "pages": [
+                  "zh/models/xiaomi-u0/text-to-image"
                 ]
               }
             ]

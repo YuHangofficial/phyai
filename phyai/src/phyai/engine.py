@@ -55,6 +55,7 @@ _BUILTIN_PLUGIN_MODULES: dict[str, str] = {
     "qwen_image_21": "phyai.models.qwen_image_21.main_qwen_image_21",
     "minicpm_gr00t": "phyai.models.minicpm_gr00t.main_minicpm_gr00t",
     "lingbot_v2": "phyai.models.lingbot_v2.main_lingbotv2",
+    "dreamzero": "phyai.models.dreamzero.main_dreamzero",
 }
 
 
@@ -349,7 +350,9 @@ class EngineCore:
         # 4. Initialize CUDA and cuBLAS.
         with self._stage("cuda"):
             init_cuda(self.config.device.target, self.config.device.params_dtype)
-            init_cublas()
+            init_cublas(allow_tf32=self.config.runtime.allow_tf32)
+            if self.config.runtime.allow_cudnn_tf32 is not None:
+                torch.backends.cudnn.allow_tf32 = self.config.runtime.allow_cudnn_tf32
 
         # 5. Initialize the distributed process group.
         with self._stage("dist"):

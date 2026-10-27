@@ -10,6 +10,7 @@ dependencies = [
     "opencv-python-headless",
     "pillow",
     "qwen-vl-utils",
+    "tiktoken>=0.7,<1",
     "torch==2.11.0",
     "torchvision==0.26.0",
     "transformers==5.8.1",

@@ -125,7 +125,7 @@ CHANNEL_L2_NORM = OpSpec(
     dims=("tokens", "hidden"),
     dtypes=("input", "weight", "compute"),
     optional_dtypes=("bias",),
-    attributes=("channel_first", "bias", "fused_compatible"),
+    attributes=("channel_first", "bias", "fused_compatible", "restore_input_dtype"),
     params=("weight", "bias"),
     signature="(x, weight, bias, eps, *, channel_first, compute_dtype) -> Tensor",
     doc="Channel L2 normalization with separately rounded scale and affine operations.",
@@ -322,10 +322,14 @@ def _triton_channel_l2_norm(facts, params):
 def _torch_channel_l2_norm(facts, params):
     import torch.nn.functional as F
 
+    restore_input_dtype = facts.lookup("attrs.restore_input_dtype") is not False
+
     def channel_l2_norm(x, weight, bias, eps, *, channel_first, compute_dtype):
         value = x if compute_dtype is None else x.to(compute_dtype)
         dim = 1 if channel_first else -1
-        normalized = F.normalize(value, dim=dim, eps=eps).to(x.dtype)
+        normalized = F.normalize(value, dim=dim, eps=eps)
+        if restore_input_dtype:
+            normalized = normalized.to(x.dtype)
         output = normalized * weight.numel() ** 0.5 * weight
         return output if bias is None else output + bias
 

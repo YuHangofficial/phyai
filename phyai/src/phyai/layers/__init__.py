@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from phyai.layers.activation import SiLU, Snake1d
+from phyai.layers.activation import SiLU, Snake1d, T5GELU
 from phyai.layers.modulation import AffineModulation
 from phyai.layers.layer_norm import (
     AdaRMSNorm,
@@ -32,6 +32,7 @@ __all__ = [
     "RMSNorm",
     "SiLU",
     "Snake1d",
+    "T5GELU",
     "ROPE_INV_FREQ_FNS",
     "InterleavedMRotaryEmbedding",
     "RotaryEmbedding",
