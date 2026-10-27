@@ -2,16 +2,15 @@
 
 import os
 
-import pytest
 import torch
+import pytest
 import torch.nn.functional as F
-
-from phyai.kernel.bootstrap import kernel_selector_scope
 from phyai.kernel.policy import policy_from_mapping
+from phyai.layers.linear import ReplicatedLinear
 from phyai.kernel.registry import build_catalog
 from phyai.kernel.selector import Selector
-from phyai.layers.layer_norm import LayerNorm, RMSNorm
-from phyai.layers.linear import ReplicatedLinear
+from phyai.kernel.bootstrap import kernel_selector_scope
+from phyai.layers.layer_norm import RMSNorm, LayerNorm, GemmaRMSNorm
 
 
 def make_selector(mode, device):
@@ -30,9 +29,7 @@ def make_selector(mode, device):
                 rule["restrict_to"] = f"torch.{op}*"
             elif mode == "reference":
                 rule["restrict_to"] = (
-                    "torch.gemm.fp32_compute"
-                    if op == "gemm"
-                    else f"torch.{op}.explicit_fp32"
+                    "torch.gemm.bf16" if op == "gemm" else f"torch.{op}"
                 )
             else:
                 rule["use" if mode == "strict" else "prefer"] = (
@@ -86,7 +83,7 @@ def test_norm_precision_policy_and_strides(mode, dtype, width):
                     for h in (
                         layer._call if op == "layernorm" else layer._plain_call
                     )._memo.values()
-                } == {f"torch.{op}.explicit_fp32"}
+                } == {f"torch.{op}"}
 
 
 @pytest.mark.parametrize("mode", ["default", "torch", "reference", "flashinfer"])
@@ -109,12 +106,11 @@ def test_router_reference_real_layer(mode, shape, dtype, fake_mesh):
             bias=True,
             params_dtype=torch.bfloat16,
             device=device,
-            fp32_compute=True,
         )
         layer.weight.data.normal_()
         layer.bias.data.normal_()
         x = torch.randn(*shape[:-1], 126, dtype=dtype, device=device)[..., ::2]
-        output, bias = layer(x)
+        output, bias = layer(x.float())
         torch.testing.assert_close(
             output,
             F.linear(x.float(), layer.weight.float(), layer.bias.float()),
@@ -123,7 +119,7 @@ def test_router_reference_real_layer(mode, shape, dtype, fake_mesh):
         )
         assert bias is None and output.dtype == torch.float32
         assert {h.kernel_id for h in layer.gemm_call._memo.values()} == {
-            "torch.gemm.fp32_compute"
+            "torch.gemm.bf16"
         }
 
 
@@ -164,3 +160,116 @@ def test_reference_does_not_override_explicit_failure_policy(mode):
             op, device="cpu", dtype=dtype, attrs=attrs, shape=shape, quant=quant
         )
         assert selector.explain(query).selected is None
+
+
+@pytest.mark.parametrize("mode", ["default", "torch", "reference", "flashinfer"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_gemma_explicit_math_uses_existing_reference(mode, dtype):
+    device = os.environ.get("AUDIT_DEVICE", "cuda")
+    torch.manual_seed(72)
+    with kernel_selector_scope(make_selector(mode, device)):
+        norm = GemmaRMSNorm(63, dtype=dtype, device=device, explicit_fp32_math=True)
+        x = torch.randn(3, 126, dtype=dtype, device=device)[:, ::2]
+        for random_affine in (False, True):
+            if random_affine:
+                norm.weight.data.normal_()
+            promoted = x.float()
+            expected = (
+                promoted
+                * torch.rsqrt(
+                    promoted.square().mean(-1, keepdim=True) + norm.variance_epsilon
+                )
+                * (1 + norm.weight.float())
+            ).to(dtype)
+            torch.testing.assert_close(norm(x), expected, atol=0, rtol=0)
+        assert {h.kernel_id for h in norm._plain_call._memo.values()} == {
+            "torch.rmsnorm"
+        }
+
+
+@pytest.mark.parametrize("variant", ["rms", "gemma"])
+@pytest.mark.parametrize("rounding", ["omitted", None, False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_rmsnorm_optional_rounding_fact(variant, rounding, explicit):
+    from phyai.kernel.types import KernelQuery
+
+    selector = make_selector("default", "cpu")
+    attrs = {"variant": variant}
+    if explicit:
+        attrs["math"] = "explicit_fp32"
+    if rounding != "omitted":
+        attrs["cast_before_affine"] = rounding
+    query = KernelQuery.build(
+        "rmsnorm",
+        device="cpu",
+        dtype={"input": "fp32", "weight": "fp32"},
+        attrs=attrs,
+        shape={"tokens": 3, "hidden": 63},
+    )
+    expected = None if variant == "gemma" and rounding is True else "torch.rmsnorm"
+    assert selector.explain(query).selected == expected
+
+
+@pytest.mark.parametrize("amp", [False, True])
+@pytest.mark.parametrize("tf32", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+def test_dense_policy_load_amp_and_weight_reload(tmp_path, fake_mesh, amp, tf32, bias):
+    from phyai.kernel.policy import load_policy
+
+    fake_mesh()
+    policy_path = tmp_path / "kernel.yaml"
+    policy_path.write_text(
+        "schema: phyai.kernel/v1\n"
+        "overrides:\n"
+        "- id: router-reference\n"
+        "  match: {op: gemm, role: router}\n"
+        "  use: torch.gemm.bf16\n"
+    )
+    catalog = build_catalog()
+    selector = Selector(catalog, load_policy(policy_path, catalog), device="cuda")
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+        with kernel_selector_scope(selector):
+            layers = [
+                ReplicatedLinear(
+                    63,
+                    37,
+                    bias=bias,
+                    device="cuda",
+                    params_dtype=torch.bfloat16,
+                    prefix=f"gate{i}",
+                    kernel_role="router",
+                )
+                for i in range(2)
+            ]
+            torch.manual_seed(72)
+            x = torch.randn(2, 3, 126, device="cuda")[:, :, ::2]
+            for _ in range(2):
+                for layer in layers:
+                    parameter = layer.weight
+                    loaded = torch.randn_like(parameter)
+                    parameter.weight_loader(parameter, loaded, None)
+                    if bias:
+                        layer.bias.weight_loader(
+                            layer.bias, torch.randn_like(layer.bias), None
+                        )
+                    layer.post_load()
+                    with torch.amp.autocast("cuda", enabled=False):
+                        expected = F.linear(
+                            x,
+                            layer.weight.float(),
+                            layer.bias.float() if bias else None,
+                        )
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+                        actual, _ = layer(x)
+                    assert (
+                        parameter is layer.weight and parameter.dtype == torch.bfloat16
+                    )
+                    assert actual.dtype == torch.float32
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    assert {h.kernel_id for h in layer.gemm_call._memo.values()} == {
+                        "torch.gemm.bf16"
+                    }
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32

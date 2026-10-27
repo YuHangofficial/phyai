@@ -8,22 +8,21 @@ block-scale expansion).
 
 from __future__ import annotations
 
-import pytest
 import torch
-import torch.nn as nn
+import pytest
 import torch.nn.functional as F
-
+from torch import nn
+from phyai.layers.quant import AllocationRequest
+from phyai.layers.linear.spec import Fp8Spec, Bf16Spec, Nvfp4Spec
 from phyai.layers.linear.backend import Granularity
 from phyai.layers.linear.backends.torch import (
-    _expand_block_scale,
     _unpack_e2m1,
     gemm_fp8_block,
-    gemm_fp8_per_channel,
+    _expand_block_scale,
     gemm_fp8_per_tensor,
+    gemm_fp8_per_channel,
     gemm_nvfp4_reference,
 )
-from phyai.layers.linear.spec import Bf16Spec, Fp8Spec, Nvfp4Spec
-from phyai.layers.quant import AllocationRequest
 
 
 def _sm() -> int:
@@ -72,8 +71,8 @@ def _build_layer(spec, *, N, K, device, dtype=torch.bfloat16, bias=False):
 def _gemm_eligible(signature: dict, *, device: str, N: int = 128, K: int = 128):
     """Kernel ids the catalog considers eligible for one GEMM call."""
 
-    from phyai.kernel.bootstrap import get_kernel_selector
     from phyai.kernel.types import KernelQuery, PhysicalSignature
+    from phyai.kernel.bootstrap import get_kernel_selector
 
     selector = get_kernel_selector()
     spec = selector.catalog.op("gemm")
@@ -112,9 +111,9 @@ def test_torch_serves_bf16_on_any_device():
     assert "torch.gemm.bf16" in _gemm_eligible(BF16, device="nvidia:SM100")
 
 
-def test_bf16_dense_row_rejects_fp32_router_input():
-    from phyai.kernel.bootstrap import get_kernel_selector
+def test_dense_row_accepts_fp32_router_but_flashinfer_does_not():
     from phyai.kernel.types import KernelQuery, PhysicalSignature
+    from phyai.kernel.bootstrap import get_kernel_selector
 
     selector = get_kernel_selector()
     query = selector.normalize(
@@ -129,15 +128,15 @@ def test_bf16_dense_row_rejects_fp32_router_input():
     facts = selector.facts_for(query, selector.catalog.op("gemm"))
     eligible, _ = selector.assess(selector.catalog.op("gemm"), facts, query.mode)
     kernel_ids = {item.kernel_id for item in eligible}
-    assert "torch.gemm.fp32_compute" in kernel_ids
-    assert "torch.gemm.bf16" not in kernel_ids
+    assert "torch.gemm.bf16" in kernel_ids
+    assert "flashinfer.gemm.bf16" not in kernel_ids
 
 
 def test_force_torch_policy_selects_fp32_router_backend():
+    from phyai.kernel.types import KernelQuery
     from phyai.kernel.policy import policy_from_mapping
     from phyai.kernel.registry import build_catalog
     from phyai.kernel.selector import Selector
-    from phyai.kernel.types import KernelQuery
 
     catalog = build_catalog()
     policy = policy_from_mapping(
@@ -167,7 +166,7 @@ def test_force_torch_policy_selects_fp32_router_backend():
         quant={"format": "bf16"},
         shape={"M": 50, "N": 37, "K": 64},
     )
-    assert selector.explain(router).selected == "torch.gemm.fp32_compute"
+    assert selector.explain(router).selected == "torch.gemm.bf16"
     assert selector.explain(ordinary).selected == "torch.gemm.bf16"
 
 

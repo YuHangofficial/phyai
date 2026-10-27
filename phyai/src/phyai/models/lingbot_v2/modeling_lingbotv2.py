@@ -17,11 +17,6 @@ from torch import nn
 
 import phyai.parallel as P
 from phyai.layers.mlp import DenseMLP
-from phyai.layers.backbones.qwen3_vl.modeling import (
-    Qwen3VLVisionRotaryEmbedding,
-    apply_rotary_pos_emb_vision,
-)
-from phyai.layers.layer_norm import LayerNorm, RMSNorm
 from phyai.kernel.call import CallSite
 from phyai.layers.conv import Conv3d
 from phyai.layers.quant import Bf16Spec
@@ -34,6 +29,7 @@ from phyai.layers.linear import (
 )
 from phyai.parallel.state import resolve_mesh
 from phyai.weights.shards import _Leg, fused, sharded, replicated
+from phyai.layers.layer_norm import RMSNorm, LayerNorm
 from phyai.layers.attention.paged import PagedAttnCtx, PagedAttention
 from phyai.layers.rotary_embedding import (
     InterleavedMRotaryEmbedding,
@@ -41,6 +37,10 @@ from phyai.layers.rotary_embedding import (
 from phyai.layers.transformer_block import TransformerBlock
 from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
 from phyai.layers.attention.nocache.layer import Attention
+from phyai.layers.backbones.qwen3_vl.modeling import (
+    Qwen3VLVisionRotaryEmbedding,
+    apply_rotary_pos_emb_vision,
+)
 from phyai.models.lingbot_v2.configuration_lingbotv2 import (
     LingBotVLA2Config,
     Qwen3VLTextConfig,
@@ -355,7 +355,6 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         *,
         use_postshuffle_norm: bool = False,
         params_dtype: torch.dtype | None = None,
-        norm_backend: str = "flashinfer",
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -373,7 +372,6 @@ class Qwen3VLVisionPatchMerger(nn.Module):
             prefix=f"{prefix}.norm" if prefix else "",
             explicit_fp32_math=True,
         )
-        del norm_backend
         self.linear_fc1 = ColumnParallelLinear(
             self.merged_dim,
             self.merged_dim,
@@ -520,7 +518,6 @@ class Qwen3VLVisionBlock(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         attn_backend: str = "flashinfer",
-        norm_backend: str = "flashinfer",
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -543,7 +540,6 @@ class Qwen3VLVisionBlock(nn.Module):
             prefix=f"{prefix}.norm2" if prefix else "",
             explicit_fp32_math=True,
         )
-        del norm_backend
         self.attn = Qwen3VLVisionAttention(
             config,
             params_dtype=params_dtype,
@@ -582,7 +578,6 @@ class Qwen3VLVisionModel(nn.Module):
         *,
         params_dtype: torch.dtype | None = None,
         attn_backend: str | None = None,
-        norm_backend: str | None = None,
         patch_embed_backend: str = "conv3d",
         device: torch.device | str | None = None,
         prefix: str = "visual",
@@ -631,7 +626,6 @@ class Qwen3VLVisionModel(nn.Module):
                     config,
                     params_dtype=params_dtype,
                     attn_backend=attn_backend,
-                    norm_backend=norm_backend,
                     prefix=f"{prefix}.blocks.{i}" if prefix else "",
                 )
                 for i in range(config.depth)
@@ -641,7 +635,6 @@ class Qwen3VLVisionModel(nn.Module):
             config,
             use_postshuffle_norm=False,
             params_dtype=params_dtype,
-            norm_backend=norm_backend,
             prefix=f"{prefix}.merger" if prefix else "",
         )
         self.deepstack_merger_list = nn.ModuleList(
@@ -650,7 +643,6 @@ class Qwen3VLVisionModel(nn.Module):
                     config,
                     use_postshuffle_norm=True,
                     params_dtype=params_dtype,
-                    norm_backend=norm_backend,
                     prefix=f"{prefix}.deepstack_merger_list.{j}" if prefix else "",
                 )
                 for j in range(len(self.deepstack_visual_indexes))
@@ -938,7 +930,6 @@ class LingBotV2AdaRMSNorm(nn.Module):
         *,
         eps: float,
         params_dtype: torch.dtype,
-        norm_backend: str,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -950,7 +941,6 @@ class LingBotV2AdaRMSNorm(nn.Module):
         )
         self.weight.hf_keys = [(f"{prefix}.weight", None)]
         self.weight.weight_loader = replicated()
-        del norm_backend
         self.gamma = ReplicatedLinear(
             cond_dim,
             hidden_size,
@@ -1053,7 +1043,6 @@ class LingBotV2TokenMoE(nn.Module):
             device=device,
             prefix=f"{prefix}.gate",
             kernel_role="router",
-            fp32_compute=True,
         )
         mesh = resolve_mesh("model")
         # `forward` runs the tensor-parallel collective, so the mesh has to
@@ -1156,7 +1145,7 @@ class LingBotV2TokenMoE(nn.Module):
 
         original_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, original_shape[-1])
-        router_logits, _ = self.gate(hidden_flat)
+        router_logits, _ = self.gate(hidden_flat.float())
         routing_weights, selected_experts = _official_topk_router(
             router_logits,
             self.e_score_correction_bias.float(),
@@ -1202,7 +1191,6 @@ class LingBotV2ExpertLayer(nn.Module):
         *,
         params_dtype: torch.dtype,
         attn_backend: str,
-        norm_backend: str,
         device: torch.device | str,
         prefix: str,
     ) -> None:
@@ -1216,7 +1204,6 @@ class LingBotV2ExpertLayer(nn.Module):
             config.adarms_cond_dim,
             eps=config.rms_norm_eps,
             params_dtype=params_dtype,
-            norm_backend=norm_backend,
             prefix=f"{prefix}.input_layernorm",
         )
         self.qkv_proj = QKVParallelLinear(
@@ -1251,7 +1238,6 @@ class LingBotV2ExpertLayer(nn.Module):
             config.adarms_cond_dim,
             eps=config.rms_norm_eps,
             params_dtype=params_dtype,
-            norm_backend=norm_backend,
             prefix=f"{prefix}.post_attention_layernorm",
         )
         if layer_idx in moe_config.layer_indices:
@@ -1338,7 +1324,6 @@ class LingBotV2ExpertStack(nn.Module):
         *,
         params_dtype: torch.dtype,
         attn_backend: str,
-        norm_backend: str,
         device: torch.device | str,
         prefix: str = DEFAULT_PREFIX,
     ) -> None:
@@ -1352,7 +1337,6 @@ class LingBotV2ExpertStack(nn.Module):
                     layer_idx,
                     params_dtype=params_dtype,
                     attn_backend=attn_backend,
-                    norm_backend=norm_backend,
                     device=device,
                     prefix=f"{prefix}.layers.{layer_idx}",
                 )
@@ -1680,7 +1664,6 @@ class LingBotV2Model(nn.Module):
             config.vision,
             params_dtype=vision_dtype,
             attn_backend=attn_backend,
-            norm_backend=norm_backend,
             patch_embed_backend=vision_patch_embed_backend,
             device=device,
             prefix=self.VISION_PREFIX,
@@ -1700,7 +1683,6 @@ class LingBotV2Model(nn.Module):
             config.moe,
             params_dtype=params_dtype,
             attn_backend=attn_backend,
-            norm_backend=norm_backend,
             device=device,
         )
         self.dual_query = LingBotV2DualQuery(

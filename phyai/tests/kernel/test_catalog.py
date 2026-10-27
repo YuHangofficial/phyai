@@ -9,24 +9,22 @@ from inside a layer's forward pass.
 
 from __future__ import annotations
 
+import sys
 import json
 import subprocess
-import sys
 
 import pytest
-
-from phyai.kernel.facts import FactKind, device, dtype
 from phyai.kernel.ops import OP_MODULES
 from phyai.kernel.ops import attention as attention_ops
+from phyai.kernel.facts import FactKind, dtype, device
 from phyai.kernel.opspec import Impl, OpSpec, Priority
-from phyai.kernel.predicate import all_of
 from phyai.kernel.registry import (
     Catalog,
     UnknownKernelError,
     UnknownOperationError,
     build_catalog,
 )
-
+from phyai.kernel.predicate import all_of
 
 #: Operations that genuinely have no CPU implementation. Written down so a
 #: further operation cannot join the set unnoticed.
@@ -75,7 +73,6 @@ def test_implementations_are_ordered_best_first_whatever_the_registration_order(
         "flashinfer.rmsnorm",
         "phyai_kernel.rmsnorm",
         "torch.rmsnorm",
-        "torch.rmsnorm.explicit_fp32",
     ]
     priorities = [item.priority for item in rows]
     assert priorities == sorted(priorities, reverse=True)
@@ -263,7 +260,11 @@ def test_building_the_catalog_imports_neither_layers_nor_flashinfer():
         "print('flashinfer' in sys.modules)\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.split("\n")[:2] == ["[]", "False"], result.stdout

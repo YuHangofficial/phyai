@@ -10,17 +10,16 @@ never match.
 from __future__ import annotations
 
 import pytest
-
 from phyai.kernel.facts import facts_from_query
+from phyai.kernel.types import KernelQuery
 from phyai.kernel.policy import (
     Policy,
     PolicyError,
-    compile_matcher,
     load_policy,
+    compile_matcher,
     policy_from_mapping,
 )
 from phyai.kernel.registry import build_catalog
-from phyai.kernel.types import KernelQuery
 
 
 @pytest.fixture(scope="module")
@@ -35,12 +34,12 @@ def facts_for(catalog, op: str, **kwargs):
 
 
 def gemm_facts(catalog, **overrides):
-    base = dict(
-        device="nvidia:SM100",
-        dtype={"input": "bf16", "output": "bf16"},
-        quant={"format": "nvfp4", "layout": "128x4", "block_shape": (1, 16)},
-        shape={"M": 8, "N": 4096, "K": 4096},
-    )
+    base = {
+        "device": "nvidia:SM100",
+        "dtype": {"input": "bf16", "output": "bf16"},
+        "quant": {"format": "nvfp4", "layout": "128x4", "block_shape": (1, 16)},
+        "shape": {"M": 8, "N": 4096, "K": 4096},
+    }
     base.update(overrides)
     return facts_for(catalog, "gemm", **base)
 
@@ -276,7 +275,6 @@ def test_overrides_are_strict_and_restrict_to_expands_a_family(catalog):
     )
     assert set(family.decide(gemm_facts(catalog), catalog).candidates) == {
         "torch.gemm.bf16",
-        "torch.gemm.fp32_compute",
         "torch.gemm.fp8_block",
         "torch.gemm.fp8_per_channel",
         "torch.gemm.fp8_per_tensor",
@@ -353,12 +351,12 @@ def test_a_rule_can_narrow_to_a_backend_family_or_to_one_role(catalog):
         ),
         catalog,
     )
-    bf16 = dict(
-        device="nvidia:SM100",
-        dtype={"input": "bf16", "output": "bf16"},
-        quant={"format": "bf16"},
-        shape={"M": 512, "N": 4096, "K": 4096},
-    )
+    bf16 = {
+        "device": "nvidia:SM100",
+        "dtype": {"input": "bf16", "output": "bf16"},
+        "quant": {"format": "bf16"},
+        "shape": {"M": 512, "N": 4096, "K": 4096},
+    }
     targeted = facts_for(catalog, "gemm", role="mlp.down", **bf16)
     assert role.decide(targeted, catalog).candidates[0] == "torch.gemm.bf16"
     other = facts_for(catalog, "gemm", role="qkv_proj", **bf16)

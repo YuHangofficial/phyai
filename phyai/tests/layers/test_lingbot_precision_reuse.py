@@ -1,16 +1,15 @@
 """Contracts for the shared Layer and GEMM paths used by LingBot V2."""
 
-import pytest
 import torch
+import pytest
 import torch.nn.functional as F
-
+from phyai.layers.quant import Bf16Spec
+from phyai.layers.linear import ReplicatedLinear
+from phyai.layers.layer_norm import RMSNorm, LayerNorm
 from phyai.layers.backbones.qwen3_vl.modeling import (
     Qwen3VLVisionRotaryEmbedding,
     apply_rotary_pos_emb_vision,
 )
-from phyai.layers.layer_norm import LayerNorm, RMSNorm
-from phyai.layers.linear import ReplicatedLinear
-from phyai.layers.quant import Bf16Spec
 
 
 @pytest.mark.parametrize("width", [64, 128])
@@ -68,7 +67,6 @@ def test_router_shared_linear_preserves_fp32_math(fake_mesh, bias, tokens):
         spec=Bf16Spec(),
         device="cuda",
         prefix="moe.gate",
-        fp32_compute=True,
     )
     layer.weight.data.normal_()
     if bias:
@@ -80,7 +78,7 @@ def test_router_shared_linear_preserves_fp32_math(fake_mesh, bias, tokens):
             layer.weight.float(),
             None if layer.bias is None else layer.bias.float(),
         )
-    actual, deferred_bias = layer(x)
+    actual, deferred_bias = layer(x.float())
     assert deferred_bias is None
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -115,7 +113,6 @@ def test_explicit_fp32_paths_recompute_on_stream_and_graph(fake_mesh):
         params_dtype=torch.bfloat16,
         spec=Bf16Spec(),
         device="cuda",
-        fp32_compute=True,
     )
     layer.weight.data.normal_()
     norm = RMSNorm(
@@ -131,12 +128,12 @@ def test_explicit_fp32_paths_recompute_on_stream_and_graph(fake_mesh):
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            norm(layer(x)[0].to(torch.bfloat16))
+            norm(layer(x.float())[0].to(torch.bfloat16))
     torch.cuda.current_stream().wait_stream(stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        output = norm(layer(x)[0].to(torch.bfloat16))
+        output = norm(layer(x.float())[0].to(torch.bfloat16))
     for seed in (7, 13):
         torch.manual_seed(seed)
         x.copy_(torch.randn_like(x))
