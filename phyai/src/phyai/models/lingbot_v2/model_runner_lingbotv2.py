@@ -100,10 +100,22 @@ def _diffusion_attn_proto(
     return attention
 
 
-def _close_backend(backend: object) -> None:
-    close = getattr(backend, "close", None)
-    if callable(close):
-        close()
+def _close_backend(*backends: object) -> None:
+    first_error = None
+    for backend in backends:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+                else:
+                    first_error.add_note(
+                        f"Additional backend cleanup failure: {error!r}"
+                    )
+    if first_error is not None:
+        raise first_error
 
 
 @dataclass(frozen=True)
@@ -1254,8 +1266,7 @@ class LingBotV2ExpertRunner(ModelRunner):
         self._euler_graphs.clear()
         self._failed_graph_keys.clear()
 
-        _close_backend(self.state_backend)
-        _close_backend(self.action_backend)
+        _close_backend(self.state_backend, self.action_backend)
 
 
 __all__ = [

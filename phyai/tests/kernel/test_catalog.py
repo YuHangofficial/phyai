@@ -75,6 +75,7 @@ def test_implementations_are_ordered_best_first_whatever_the_registration_order(
         "flashinfer.rmsnorm",
         "phyai_kernel.rmsnorm",
         "torch.rmsnorm",
+        "torch.rmsnorm.explicit_fp32",
     ]
     priorities = [item.priority for item in rows]
     assert priorities == sorted(priorities, reverse=True)

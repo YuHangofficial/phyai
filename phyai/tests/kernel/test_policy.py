@@ -276,6 +276,7 @@ def test_overrides_are_strict_and_restrict_to_expands_a_family(catalog):
     )
     assert set(family.decide(gemm_facts(catalog), catalog).candidates) == {
         "torch.gemm.bf16",
+        "torch.gemm.fp32_compute",
         "torch.gemm.fp8_block",
         "torch.gemm.fp8_per_channel",
         "torch.gemm.fp8_per_tensor",

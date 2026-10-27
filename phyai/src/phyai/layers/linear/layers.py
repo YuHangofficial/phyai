@@ -67,7 +67,7 @@ def _resolve_linear_kernel(
         device=x.device,
         dtype={
             "input": x.dtype,
-            "output": layer.params_dtype,
+            "output": getattr(layer, "output_dtype", layer.params_dtype),
             "weight": layer.weight.dtype,
         },
         quant=layer.spec.physical_signature,
@@ -187,6 +187,7 @@ class ReplicatedLinear(LinearBase):
         device: torch.device | str | None = None,
         prefix: str = "",
         kernel_role: str | None = None,
+        fp32_compute: bool = False,
     ) -> None:
         super().__init__(
             in_features,
@@ -200,6 +201,10 @@ class ReplicatedLinear(LinearBase):
             prefix=prefix,
             kernel_role=kernel_role,
         )
+        self.fp32_compute = fp32_compute
+        self.output_dtype = torch.float32 if fp32_compute else self.params_dtype
+        if fp32_compute and self.params_dtype != torch.bfloat16:
+            raise ValueError("fp32_compute requires bfloat16 stored weights")
         self.spec.allocate(
             self,
             AllocationRequest(
@@ -210,6 +215,8 @@ class ReplicatedLinear(LinearBase):
                 device=self.device,
             ),
         )
+        if fp32_compute and self.weight.dtype != torch.bfloat16:
+            raise ValueError("fp32_compute requires bfloat16 physical weights")
         self.input_size_per_partition = in_features
         self.output_size_per_partition = out_features
         self.input_size_global = in_features
@@ -235,6 +242,8 @@ class ReplicatedLinear(LinearBase):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.fp32_compute:
+            x = x.float()
         kernel = _resolve_linear_kernel(
             self,
             x,

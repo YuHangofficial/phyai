@@ -91,7 +91,7 @@ RMSNORM = OpSpec(
     dims=("tokens", "hidden"),
     dtypes=("input", "weight"),
     attributes=("variant",),
-    optional_attributes=("rank",),
+    optional_attributes=("rank", "math", "cast_before_affine"),
     params=("weight",),
     signature="(x, weight, eps) -> Tensor",
     bench_args=_bench_rmsnorm,
@@ -114,6 +114,7 @@ LAYERNORM = OpSpec(
     dtypes=("input", "weight"),
     optional_dtypes=("bias",),
     attributes=("bias",),
+    optional_attributes=("math",),
     params=("weight", "bias"),
     signature="(x, weight, bias, eps) -> Tensor",
     bench_args=_bench_layernorm,
@@ -242,6 +243,23 @@ def _torch_rmsnorm(facts, params):
     return _torch_rmsnorm_fn(_gemma(facts))
 
 
+def _torch_rmsnorm_explicit_fp32(facts, params):
+    import torch
+
+    cast_before_affine = facts.lookup("attrs.cast_before_affine") is True
+
+    def rmsnorm(x, weight, eps):
+        promoted = x.float()
+        normalized = promoted * torch.rsqrt(
+            promoted.square().mean(-1, keepdim=True) + eps
+        )
+        if cast_before_affine:
+            return weight * normalized.to(x.dtype)
+        return (normalized * weight.float()).to(x.dtype)
+
+    return rmsnorm
+
+
 def _torch_rmsnorm_add(facts, params):
     inner = _torch_rmsnorm_fn(_gemma(facts))
 
@@ -274,6 +292,23 @@ def _torch_layernorm(facts, params):
         if bias is not None and bias.dtype != x.dtype:
             bias = bias.to(dtype=x.dtype)
         return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+
+    return layernorm
+
+
+def _torch_layernorm_explicit_fp32(facts, params):
+    import torch
+
+    def layernorm(x, weight, bias, eps):
+        promoted = x.float()
+        centered = promoted - promoted.mean(-1, keepdim=True)
+        normalized = centered * torch.rsqrt(
+            centered.square().mean(-1, keepdim=True) + eps
+        )
+        output = normalized * weight.float()
+        if bias is not None:
+            output = output + bias.float()
+        return output.to(x.dtype)
 
     return layernorm
 
@@ -355,7 +390,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="flashinfer.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED + 2,
-                when=all_of(FLASHINFER_RMSNORM, RMSNORM_LAYOUT),
+                when=all_of(FLASHINFER_RMSNORM, RMSNORM_LAYOUT, attrs.math.is_none()),
                 prepare=_flashinfer_rmsnorm,
                 # Allocate gamma in the activation dtype.
                 params={"weight": matches_activation()},
@@ -364,7 +399,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.rmsnorm",
                 op="rmsnorm",
                 priority=Priority.OPTIMIZED,
-                when=all_of(TRITON_NORM, RMSNORM_LAYOUT),
+                when=all_of(TRITON_NORM, RMSNORM_LAYOUT, attrs.math.is_none()),
                 prepare=_triton_rmsnorm,
                 params={"weight": any_float()},
             ),
@@ -373,8 +408,22 @@ def register(catalog: Catalog) -> None:
                 op="rmsnorm",
                 priority=Priority.REFERENCE,
                 reference=True,
-                when=all_of(dtype.input.is_set(), RMSNORM_LAYOUT),
+                when=all_of(dtype.input.is_set(), RMSNORM_LAYOUT, attrs.math.is_none()),
                 prepare=_torch_rmsnorm,
+                params={"weight": any_float()},
+            ),
+            Impl(
+                kernel_id="torch.rmsnorm.explicit_fp32",
+                op="rmsnorm",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(
+                    dtype.input.is_set(),
+                    RMSNORM_LAYOUT,
+                    attrs.variant == "rms",
+                    attrs.math == "explicit_fp32",
+                ),
+                prepare=_torch_rmsnorm_explicit_fp32,
                 params={"weight": any_float()},
             ),
             # Fused RMSNorm and residual add.
@@ -408,7 +457,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="flashinfer.layernorm",
                 op="layernorm",
                 priority=Priority.OPTIMIZED + 2,
-                when=FLASHINFER_LAYERNORM,
+                when=all_of(FLASHINFER_LAYERNORM, attrs.math.is_none()),
                 prepare=_flashinfer_layernorm,
                 params={"weight": fixed("fp32"), "bias": fixed("fp32")},
             ),
@@ -416,7 +465,7 @@ def register(catalog: Catalog) -> None:
                 kernel_id="phyai_kernel.layernorm",
                 op="layernorm",
                 priority=Priority.OPTIMIZED,
-                when=TRITON_NORM,
+                when=all_of(TRITON_NORM, attrs.math.is_none()),
                 prepare=_triton_layernorm,
                 params={"weight": any_float(), "bias": any_float()},
             ),
@@ -425,9 +474,18 @@ def register(catalog: Catalog) -> None:
                 op="layernorm",
                 priority=Priority.REFERENCE,
                 reference=True,
-                when=dtype.input.is_set(),
+                when=all_of(dtype.input.is_set(), attrs.math.is_none()),
                 prepare=_torch_layernorm,
                 # The reference path accepts any floating affine dtype.
+                params={"weight": any_float(), "bias": any_float()},
+            ),
+            Impl(
+                kernel_id="torch.layernorm.explicit_fp32",
+                op="layernorm",
+                priority=Priority.REFERENCE,
+                reference=True,
+                when=all_of(dtype.input.is_set(), attrs.math == "explicit_fp32"),
+                prepare=_torch_layernorm_explicit_fp32,
                 params={"weight": any_float(), "bias": any_float()},
             ),
             # Channel L2 normalization.

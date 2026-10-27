@@ -54,6 +54,7 @@ import torch
 from PIL import Image
 
 from phyai.engine import Engine, EngineArgs
+from phyai.kernel.config import KernelConfig
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.lingbot_v2 import (
     LingBotV2Args,
@@ -303,6 +304,23 @@ def main() -> None:
                 vision_patch_embed_backend=args.patch_embed_backend,
             ),
             config=EngineConfig(
+                kernel=KernelConfig(
+                    policy_config={
+                        "schema": "phyai.kernel/v1",
+                        "defaults": {"fallback": "reference"},
+                        "rules": [
+                            {
+                                "id": "linear-backend",
+                                "match": {"op": "gemm"},
+                                **(
+                                    {"restrict_to": "torch.gemm.*"}
+                                    if args.linear_kernel == "torch"
+                                    else {"prefer": ["flashinfer.gemm.bf16"]}
+                                ),
+                            }
+                        ],
+                    }
+                ),
                 device=DeviceConfig(
                     target=str(device),
                     params_dtype=torch.bfloat16,

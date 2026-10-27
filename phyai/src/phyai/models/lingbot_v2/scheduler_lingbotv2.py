@@ -272,9 +272,21 @@ class LingBotV2WS1Scheduler(Scheduler):
     def close(self) -> None:
         """Release runner-owned attention plans, backends, and condition caches."""
 
-        self.expert_runner.close()
-        self.prefix_runner.close()
-        self.vision_runner.close()
+        first_error = None
+        for name in ("expert_runner", "prefix_runner", "vision_runner"):
+            runner = getattr(self, name, None)
+            # Detach ownership before cleanup so repeated close is safe.
+            setattr(self, name, None)
+            if runner is not None:
+                try:
+                    runner.close()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                    else:
+                        first_error.add_note(f"Additional cleanup failure: {error!r}")
+        if first_error is not None:
+            raise first_error
 
     @torch.no_grad()
     def step(self, request: LingBotV2Request) -> torch.Tensor:

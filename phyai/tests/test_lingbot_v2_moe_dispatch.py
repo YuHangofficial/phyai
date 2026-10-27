@@ -44,6 +44,13 @@ class _Gate:
         self.weight = weight
         self.bias = bias
 
+    def __call__(self, x):
+        return torch.nn.functional.linear(
+            x.float(),
+            self.weight.float(),
+            None if self.bias is None else self.bias.float(),
+        ), None
+
 
 class _SharedExpert:
     """Constant contributor, so the shared path stays separable."""

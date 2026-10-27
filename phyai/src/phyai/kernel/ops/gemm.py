@@ -29,7 +29,13 @@ def _bench_args(facts, device):
         raise NotImplementedError("benchmark needs the M, N and K dimensions")
     dt = torch_dtype(str(facts.lookup("dtype.input")))
     x = torch.randn(int(m), int(k), device=device, dtype=dt)
-    weight = torch.randn(int(n), int(k), device=device, dtype=dt)
+    weight_dtype = facts.lookup("dtype.weight")
+    weight = torch.randn(
+        int(n),
+        int(k),
+        device=device,
+        dtype=dt if weight_dtype in (MISSING, None) else torch_dtype(str(weight_dtype)),
+    )
     return (SimpleNamespace(weight=weight), x, None)
 
 
@@ -117,6 +123,23 @@ def _torch_dense(facts, params):
 
     def dense(layer, x, bias):
         return F.linear(x, layer.weight, bias)
+
+    return dense
+
+
+def _torch_fp32_compute(facts, params):
+    """FP32 GEMM with low-precision stored weights and FP32 output."""
+
+    import torch
+    import torch.nn.functional as F
+
+    def dense(layer, x, bias):
+        with torch.amp.autocast(x.device.type, enabled=False):
+            return F.linear(
+                x.float(),
+                layer.weight.float(),
+                None if bias is None else bias.float(),
+            )
 
     return dense
 
@@ -251,11 +274,29 @@ def register(catalog: Catalog) -> None:
         ),
         # Torch.
         Impl(
+            kernel_id="torch.gemm.fp32_compute",
+            op="gemm",
+            priority=Priority.GENERAL,
+            reference=True,
+            when=all_of(
+                quant.format == "bf16",
+                dtype.input == "fp32",
+                dtype.weight == "bf16",
+                dtype.output == "fp32",
+            ),
+            prepare=_torch_fp32_compute,
+            metadata={"package": "torch", "note": "FP32 compute from BF16 storage"},
+        ),
+        Impl(
             kernel_id="torch.gemm.bf16",
             op="gemm",
             priority=Priority.REFERENCE,
             reference=True,
-            when=quant.format.in_({"bf16", "fp16"}),
+            when=all_of(
+                quant.format.in_({"bf16", "fp16"}),
+                dtype.input == dtype.weight,
+                dtype.output == dtype.input,
+            ),
             prepare=_torch_dense,
             metadata={"package": "torch", "note": "F.linear"},
         ),

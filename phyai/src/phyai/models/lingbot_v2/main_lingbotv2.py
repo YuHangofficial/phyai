@@ -170,8 +170,13 @@ class LingBotV2Entry(Entry):
         self._owns_matmul_precision = True
         try:
             self._setup(args)
-        except BaseException:
-            self._restore_matmul_precision()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    f"Cleanup after setup failure also failed: {cleanup_error!r}"
+                )
             raise
 
     def _setup(self, args: LingBotV2Args) -> None:
@@ -209,9 +214,9 @@ class LingBotV2Entry(Entry):
             device=engine_config.device.target,
             use_cuda_graph=engine_config.runtime.use_cuda_graph,
         )
-        scheduler.setup()
         self.model = model
         self.scheduler = scheduler
+        scheduler.setup()
 
     def step(self, request: LingBotV2Request) -> torch.Tensor:
         """Run one request and return ``(B, chunk_size, action_dim)`` actions."""

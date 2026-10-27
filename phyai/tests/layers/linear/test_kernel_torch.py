@@ -112,6 +112,65 @@ def test_torch_serves_bf16_on_any_device():
     assert "torch.gemm.bf16" in _gemm_eligible(BF16, device="nvidia:SM100")
 
 
+def test_bf16_dense_row_rejects_fp32_router_input():
+    from phyai.kernel.bootstrap import get_kernel_selector
+    from phyai.kernel.types import KernelQuery, PhysicalSignature
+
+    selector = get_kernel_selector()
+    query = selector.normalize(
+        KernelQuery.build(
+            "gemm",
+            device="nvidia:SM110",
+            dtype={"input": "fp32", "output": "fp32", "weight": "bf16"},
+            quant=PhysicalSignature(format="bf16"),
+            shape={"M": 50, "N": 37, "K": 64},
+        )
+    )
+    facts = selector.facts_for(query, selector.catalog.op("gemm"))
+    eligible, _ = selector.assess(selector.catalog.op("gemm"), facts, query.mode)
+    kernel_ids = {item.kernel_id for item in eligible}
+    assert "torch.gemm.fp32_compute" in kernel_ids
+    assert "torch.gemm.bf16" not in kernel_ids
+
+
+def test_force_torch_policy_selects_fp32_router_backend():
+    from phyai.kernel.policy import policy_from_mapping
+    from phyai.kernel.registry import build_catalog
+    from phyai.kernel.selector import Selector
+    from phyai.kernel.types import KernelQuery
+
+    catalog = build_catalog()
+    policy = policy_from_mapping(
+        {
+            "schema": "phyai.kernel/v1",
+            "rules": [
+                {
+                    "id": "force-torch-gemm",
+                    "match": {"op": "gemm"},
+                    "restrict_to": "torch.gemm.*",
+                }
+            ],
+        },
+        catalog,
+    )
+    selector = Selector(catalog, policy, device="nvidia:SM110")
+    router = KernelQuery.build(
+        "gemm",
+        role="router",
+        dtype={"input": "fp32", "output": "fp32", "weight": "bf16"},
+        quant={"format": "bf16"},
+        shape={"M": 50, "N": 37, "K": 64},
+    )
+    ordinary = KernelQuery.build(
+        "gemm",
+        dtype={"input": "bf16", "output": "bf16", "weight": "bf16"},
+        quant={"format": "bf16"},
+        shape={"M": 50, "N": 37, "K": 64},
+    )
+    assert selector.explain(router).selected == "torch.gemm.fp32_compute"
+    assert selector.explain(ordinary).selected == "torch.gemm.bf16"
+
+
 def test_torch_fp8_needs_sm89():
     assert "torch.gemm.fp8_per_tensor" not in _gemm_eligible(
         FP8_PER_TENSOR, device="nvidia:SM80"

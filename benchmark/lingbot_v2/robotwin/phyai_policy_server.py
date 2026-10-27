@@ -18,6 +18,7 @@ import yaml
 from torchvision.transforms.v2 import Resize
 
 from phyai.engine import Engine, EngineArgs
+from phyai.kernel.config import KernelConfig
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.lingbot_v2 import (
     LingBotV2Args,
@@ -182,6 +183,8 @@ class LingBotV2RoboTwinPolicy:
         use_cuda_graph: bool,
         seed: int,
     ) -> None:
+        if linear_kernel not in {"torch", "flashinfer"}:
+            raise ValueError(f"Unsupported linear kernel: {linear_kernel!r}")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required for LingBot V2 RoboTwin inference.")
         if use_length <= 0:
@@ -231,13 +234,29 @@ class LingBotV2RoboTwinPolicy:
                     vision_patch_embed_backend=patch_embed_backend,
                 ),
                 config=EngineConfig(
+                    kernel=KernelConfig(
+                        policy_config={
+                            "schema": "phyai.kernel/v1",
+                            "defaults": {"fallback": "reference"},
+                            "rules": [
+                                {
+                                    "id": "linear-backend",
+                                    "match": {"op": "gemm"},
+                                    **(
+                                        {"restrict_to": "torch.gemm.*"}
+                                        if linear_kernel == "torch"
+                                        else {"prefer": ["flashinfer.gemm.bf16"]}
+                                    ),
+                                }
+                            ],
+                        }
+                    ),
                     device=DeviceConfig(
                         target=str(self.device),
                         params_dtype=torch.bfloat16,
                     ),
                     runtime=RuntimeConfig(
                         use_cuda_graph=use_cuda_graph,
-                        force_linear_kernel=linear_kernel,
                     ),
                 ),
             )

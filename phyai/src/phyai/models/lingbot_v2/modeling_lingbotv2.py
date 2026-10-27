@@ -17,6 +17,11 @@ from torch import nn
 
 import phyai.parallel as P
 from phyai.layers.mlp import DenseMLP
+from phyai.layers.backbones.qwen3_vl.modeling import (
+    Qwen3VLVisionRotaryEmbedding,
+    apply_rotary_pos_emb_vision,
+)
+from phyai.layers.layer_norm import LayerNorm, RMSNorm
 from phyai.kernel.call import CallSite
 from phyai.layers.conv import Conv3d
 from phyai.layers.quant import Bf16Spec
@@ -32,7 +37,6 @@ from phyai.weights.shards import _Leg, fused, sharded, replicated
 from phyai.layers.attention.paged import PagedAttnCtx, PagedAttention
 from phyai.layers.rotary_embedding import (
     InterleavedMRotaryEmbedding,
-    apply_rotary_pos_emb,
 )
 from phyai.layers.transformer_block import TransformerBlock
 from phyai.layers.vocab_embedding.layers import VocabParallelEmbedding
@@ -48,20 +52,6 @@ from phyai.models.lingbot_v2.configuration_lingbotv2 import (
 
 if TYPE_CHECKING:
     from phyai.layers.attention import PagedAttnCtx
-
-
-def _fp32_router_linear(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    """Match the official LingBot FP32 router linear exactly."""
-    with torch.amp.autocast(hidden_states.device.type, enabled=False):
-        return F.linear(
-            hidden_states.float(),
-            weight.float(),
-            None if bias is None else bias.float(),
-        )
 
 
 def _official_topk_router(
@@ -217,120 +207,6 @@ def get_vision_bilinear_indices_and_weights(
     bilinear_indices = torch.stack([torch.cat(p) for p in idx_parts])
     bilinear_weights = torch.stack([torch.cat(p) for p in weight_parts])
     return bilinear_indices, bilinear_weights
-
-
-class Qwen3VLVisionRotaryEmbedding(nn.Module):
-    """Axial 2-D vision RoPE. ``inv_freq`` over ``dim`` (= head_dim // 2)."""
-
-    def __init__(
-        self,
-        dim: int,
-        theta: float = 10000.0,
-        *,
-        dtype: torch.dtype | None = None,
-        device: torch.device | str | None = None,
-    ) -> None:
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer(
-            "inv_freq",
-            inv_freq.to(dtype=dtype, device=device),
-            persistent=False,
-        )
-
-    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
-        """Return axial rotary frequencies for the supplied patch positions."""
-
-        # position_ids: (num_patches, 2) -> freqs (num_patches, 2 * (dim//2)).
-        freqs = position_ids.unsqueeze(-1) * self.inv_freq.to(position_ids.device)
-        return freqs.flatten(1)
-
-
-def apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate-half RoPE for the vision tower. q/k: ``(seq, heads, dim)``."""
-    orig_q_dtype, orig_k_dtype = q.dtype, k.dtype
-    q_embed, k_embed = apply_rotary_pos_emb(
-        q.float(),
-        k.float(),
-        cos.float(),
-        sin.float(),
-        unsqueeze_dim=-2,
-    )
-    return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
-
-
-class LingBotV2VisionLayerNorm(nn.Module):
-    """BF16-stored Qwen vision LayerNorm with FP32 normalization math."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        *,
-        eps: float,
-        dtype: torch.dtype,
-        device: torch.device | str,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        self.variance_epsilon = eps
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=dtype, device=device),
-            requires_grad=False,
-        )
-        self.bias = nn.Parameter(
-            torch.zeros(hidden_size, dtype=dtype, device=device),
-            requires_grad=False,
-        )
-        if prefix:
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = replicated()
-            self.bias.hf_keys = [(f"{prefix}.bias", None)]
-            self.bias.weight_loader = replicated()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalize vision activations using FP32 statistics."""
-
-        input_dtype = hidden_states.dtype
-        hidden_states_fp32 = hidden_states.float()
-        mean = hidden_states_fp32.mean(dim=-1, keepdim=True)
-        centered = hidden_states_fp32 - mean
-        variance = centered.square().mean(dim=-1, keepdim=True)
-        normalized = centered * torch.rsqrt(variance + self.variance_epsilon)
-        return (normalized * self.weight.float() + self.bias.float()).to(input_dtype)
-
-
-class LingBotV2RMSNorm(nn.Module):
-    """Official Qwen RMSNorm: FP32 variance, BF16 affine and output."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        *,
-        eps: float,
-        dtype: torch.dtype,
-        device: torch.device | str,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        self.variance_epsilon = eps
-        self.weight = nn.Parameter(
-            torch.ones(hidden_size, dtype=dtype, device=device),
-            requires_grad=False,
-        )
-        if prefix:
-            self.weight.hf_keys = [(f"{prefix}.weight", None)]
-            self.weight.weight_loader = replicated()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Normalize activations with the checkpoint's RMSNorm convention."""
-
-        input_dtype = hidden_states.dtype
-        hidden_states_fp32 = hidden_states.float()
-        variance = hidden_states_fp32.square().mean(dim=-1, keepdim=True)
-        normalized = hidden_states_fp32 * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * normalized.to(input_dtype)
 
 
 def _attach_fused_qkv_loaders(
@@ -489,12 +365,13 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         if params_dtype is None:
             params_dtype = get_engine_config().device.params_dtype
         device = get_engine_config().device.target
-        self.norm = LingBotV2VisionLayerNorm(
+        self.norm = LayerNorm(
             norm_dim,
             eps=1e-6,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.norm" if prefix else "",
+            explicit_fp32_math=True,
         )
         del norm_backend
         self.linear_fc1 = ColumnParallelLinear(
@@ -650,19 +527,21 @@ class Qwen3VLVisionBlock(nn.Module):
         if params_dtype is None:
             params_dtype = get_engine_config().device.params_dtype
         device = get_engine_config().device.target
-        self.norm1 = LingBotV2VisionLayerNorm(
+        self.norm1 = LayerNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.norm1" if prefix else "",
+            explicit_fp32_math=True,
         )
-        self.norm2 = LingBotV2VisionLayerNorm(
+        self.norm2 = LayerNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.norm2" if prefix else "",
+            explicit_fp32_math=True,
         )
         del norm_backend
         self.attn = Qwen3VLVisionAttention(
@@ -839,34 +718,42 @@ class Qwen3VLTextBlock(TransformerBlock):
         if params_dtype is None:
             params_dtype = get_engine_config().device.params_dtype
         device = get_engine_config().device.target
-        self.input_norm = LingBotV2RMSNorm(
+        self.input_norm = RMSNorm(
             self.hidden_size,
             eps=norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.input_layernorm",
+            cast_before_affine=True,
+            explicit_fp32_math=True,
         )
-        self.pre_ff_norm = LingBotV2RMSNorm(
+        self.pre_ff_norm = RMSNorm(
             self.hidden_size,
             eps=norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.post_attention_layernorm",
+            cast_before_affine=True,
+            explicit_fp32_math=True,
         )
         if self.attn_qk_norm_enabled:
-            self.q_norm = LingBotV2RMSNorm(
+            self.q_norm = RMSNorm(
                 self.head_dim,
                 eps=norm_eps,
                 dtype=params_dtype,
                 device=device,
                 prefix=f"{prefix}.self_attn.q_norm",
+                cast_before_affine=True,
+                explicit_fp32_math=True,
             )
-            self.k_norm = LingBotV2RMSNorm(
+            self.k_norm = RMSNorm(
                 self.head_dim,
                 eps=norm_eps,
                 dtype=params_dtype,
                 device=device,
                 prefix=f"{prefix}.self_attn.k_norm",
+                cast_before_affine=True,
+                explicit_fp32_math=True,
             )
 
     def forward(
@@ -982,12 +869,14 @@ class Qwen3VLTextModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LingBotV2RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.norm" if prefix else "",
+            cast_before_affine=True,
+            explicit_fp32_math=True,
         )
 
     @staticmethod
@@ -1118,28 +1007,6 @@ class LingBotV2AdaRMSNorm(nn.Module):
         return ((1.0 + gamma.float()) * normed + beta.float()).to(input_dtype)
 
 
-class LingBotV2ExpertMLP(DenseMLP):
-    """One TP-aware SwiGLU expert using PHYAI/FlashInfer operators."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        *,
-        params_dtype: torch.dtype,
-        prefix: str,
-    ) -> None:
-        super().__init__(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation="silu",
-            gated=True,
-            bias=False,
-            params_dtype=params_dtype,
-            prefix=prefix,
-        )
-
-
 class LingBotV2TokenMoE(nn.Module):
     """LingBot MoE with FP32 routing math and BF16-stored parameters."""
 
@@ -1185,6 +1052,8 @@ class LingBotV2TokenMoE(nn.Module):
             spec=Bf16Spec(),
             device=device,
             prefix=f"{prefix}.gate",
+            kernel_role="router",
+            fp32_compute=True,
         )
         mesh = resolve_mesh("model")
         # `forward` runs the tensor-parallel collective, so the mesh has to
@@ -1272,9 +1141,12 @@ class LingBotV2TokenMoE(nn.Module):
         ]
         self.e_score_correction_bias.weight_loader = replicated()
 
-        self.shared_expert = LingBotV2ExpertMLP(
+        self.shared_expert = DenseMLP(
             hidden_size,
             config.shared_expert_intermediate_size,
+            activation="silu",
+            gated=True,
+            bias=False,
             params_dtype=params_dtype,
             prefix=f"{prefix}.shared_expert",
         )
@@ -1284,11 +1156,7 @@ class LingBotV2TokenMoE(nn.Module):
 
         original_shape = hidden_states.shape
         hidden_flat = hidden_states.reshape(-1, original_shape[-1])
-        router_logits = _fp32_router_linear(
-            hidden_flat,
-            self.gate.weight,
-            self.gate.bias,
-        )
+        router_logits, _ = self.gate(hidden_flat)
         routing_weights, selected_experts = _official_topk_router(
             router_logits,
             self.e_score_correction_bias.float(),
@@ -1395,9 +1263,12 @@ class LingBotV2ExpertLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         else:
-            self.mlp = LingBotV2ExpertMLP(
+            self.mlp = DenseMLP(
                 config.hidden_size,
                 config.intermediate_size,
+                activation="silu",
+                gated=True,
+                bias=False,
                 params_dtype=params_dtype,
                 prefix=f"{prefix}.mlp",
             )
@@ -1488,12 +1359,14 @@ class LingBotV2ExpertStack(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = LingBotV2RMSNorm(
+        self.norm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=params_dtype,
             device=device,
             prefix=f"{prefix}.norm",
+            cast_before_affine=True,
+            explicit_fp32_math=True,
         )
 
 
@@ -1888,7 +1761,6 @@ __all__ = [
     "LingBotV2AdaRMSNorm",
     "LingBotV2DualQuery",
     "LingBotV2ExpertLayer",
-    "LingBotV2ExpertMLP",
     "LingBotV2ExpertStack",
     "LingBotV2Model",
     "LingBotV2TokenMoE",
